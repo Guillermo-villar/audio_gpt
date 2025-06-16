@@ -1,0 +1,7 @@
+sounddevice
+soundfile
+numpy
+PyQt5
+openai
+comtypes
+pycaw
