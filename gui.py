@@ -1,18 +1,19 @@
 import sys
 import os
 import time
+import queue
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout, 
     QWidget, QLabel, QSpinBox, QTextEdit, QLineEdit, QComboBox,
     QProgressBar, QFileDialog, QMessageBox, QGroupBox, QStatusBar,
     QDialog, QDialogButtonBox, QFrame, QSplitter
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QMutex
 from PyQt5.QtGui import QPainter, QColor, QPen, QIcon, QFont
 
 # Importar módulos propios
 import recorder
-from api_client import ApiKeyManager, TranscriptionThread, WhisperService
+from api_client import ApiKeyManager, TranscriptionThread, WhisperService, GptQueryThread
 
 import sounddevice as sd
 import numpy as np
@@ -274,18 +275,52 @@ class AudioDeviceSetupDialog(QDialog):
             self.monitor_button.setText("Iniciar Monitoreo")
     
     def closeEvent(self, event):
-        """Limpiar recursos al cerrar"""
-        if self.monitor_thread:
-            self.monitor_thread.stop()
-            self.monitor_thread = None
+        """Limpia recursos y archivos temporales al cerrar la aplicación"""
+        try:
+            # Detener hilos activos primero
+            if hasattr(self, 'continuous_recorder') and self.continuous_recorder:
+                self.continuous_recorder.stop()
+            
+            if hasattr(self, 'transcription_worker') and self.transcription_worker:
+                self.transcription_worker.stop()
+            
+            # Ruta a la carpeta de archivos temporales
+            temp_dir = os.path.join(os.getcwd(), "temp_audio")
+            
+            # Si la carpeta existe, eliminar todos los archivos dentro
+            if os.path.exists(temp_dir):
+                self.status_bar.showMessage("Limpiando archivos temporales...")
+                
+                # Contar archivos eliminados para informar
+                total_files = 0
+                failed_files = 0
+                
+                for filename in os.listdir(temp_dir):
+                    file_path = os.path.join(temp_dir, filename)
+                    try:
+                        if os.path.isfile(file_path):
+                            os.unlink(file_path)
+                            total_files += 1
+                    except Exception as e:
+                        print(f"Error al eliminar {file_path}: {e}")
+                        failed_files += 1
+                
+                # Intentar eliminar la carpeta si está vacía
+                try:
+                    if not os.listdir(temp_dir):
+                        os.rmdir(temp_dir)
+                        print(f"Carpeta temporal eliminada: {temp_dir}")
+                except Exception as e:
+                    print(f"No se pudo eliminar la carpeta temporal: {e}")
+                
+                print(f"Limpieza completada: {total_files} archivos temporales eliminados")
+                if failed_files > 0:
+                    print(f"No se pudieron eliminar {failed_files} archivos")
+        except Exception as e:
+            print(f"Error durante la limpieza de archivos temporales: {e}")
+        
+        # Continuar con el cierre normal
         super().closeEvent(event)
-    
-    def get_selected_devices(self):
-        """Retorna los dispositivos seleccionados"""
-        return {
-            'input': self.input_devices.currentData(),
-            'output': self.output_devices.currentData()
-        }
 
 class AudioRecordTranscribeThread(QThread):
     update_progress = pyqtSignal(int)
@@ -612,6 +647,256 @@ class ContinuousRecordTranscribeThread(QThread):
         """Detiene la grabación continua"""
         self.running = False
 
+class ContinuousAudioRecorder(QThread):
+    """Hilo dedicado a grabar audio continuamente sin interrupciones"""
+    update_level = pyqtSignal(float)
+    chunk_ready = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, device_index, chunk_duration=3):
+        super().__init__()
+        self.device_index = device_index
+        self.running = False
+        self.samplerate = 48000
+        self.channels = 2
+        self.chunk_duration = chunk_duration  # segundos por fragmento
+        self.temp_dir = os.path.join(os.getcwd(), "temp_audio")
+        
+        # Crear directorio temporal si no existe
+        if not os.path.exists(self.temp_dir):
+            os.makedirs(self.temp_dir)
+            
+    def run(self):
+        try:
+            self.running = True
+            
+            # Configurar stream
+            chunk_frames = int(self.chunk_duration * self.samplerate)
+            stream = sd.InputStream(
+                device=self.device_index, 
+                channels=self.channels, 
+                samplerate=self.samplerate
+            )
+            stream.start()
+            
+            audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
+            frames_collected = 0
+            
+            while self.running:
+                # Determinar tamaño de chunk
+                chunk_size = min(int(self.samplerate * 0.1), chunk_frames - frames_collected)
+                
+                # Leer chunk
+                chunk, overflowed = stream.read(chunk_size)
+                audio_buffer = np.concatenate((audio_buffer, chunk))
+                frames_collected += chunk_size
+                
+                # Calcular nivel de audio y emitir señal
+                level = np.linalg.norm(chunk) / np.sqrt(chunk_size)
+                self.update_level.emit(level)
+                
+                # Cuando hemos acumulado los frames para un chunk completo
+                if frames_collected >= chunk_frames:
+                    # Generar nombre de archivo único
+                    temp_file = os.path.join(self.temp_dir, f"chunk_{uuid.uuid4()}.wav")
+                    
+                    # Guardar chunk
+                    sf.write(temp_file, audio_buffer, self.samplerate)
+                    
+                    # Emitir señal con el archivo listo
+                    self.chunk_ready.emit(temp_file)
+                    
+                    # Reiniciar buffer y contador
+                    audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
+                    frames_collected = 0
+                
+                # No sobrecargar la CPU
+                time.sleep(0.01)
+            
+            # Cerrar stream cuando se detiene
+            stream.stop()
+            stream.close()
+            
+        except Exception as e:
+            self.running = False
+            self.error_occurred.emit(f"Error en grabación continua: {str(e)}")
+    
+    def stop(self):
+        """Detiene la grabación continua"""
+        self.running = False
+
+class AudioTranscriptionWorker(QThread):
+    """Hilo dedicado a transcribir los fragmentos de audio"""
+    update_transcription = pyqtSignal(str)
+    status_update = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, api_key, language_code):
+        super().__init__()
+        self.api_key = api_key
+        self.language_code = language_code
+        self.running = False
+        self.file_queue = queue.Queue()
+        self.full_transcription = ""
+        self.mutex = QMutex()  # Para proteger acceso a full_transcription
+    
+    def enqueue_file(self, filename):
+        """Añade un archivo a la cola para ser transcrito"""
+        self.file_queue.put(filename)
+    
+    def run(self):
+        self.running = True
+        self.status_update.emit("Transcriptor iniciado y esperando archivos de audio")
+        
+        while self.running:
+            try:
+                # Intentar obtener un archivo de la cola (con timeout para poder comprobar running)
+                try:
+                    filename = self.file_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                
+                # Verificar si hay audio real
+                if not recorder.verificar_audio(filename):
+                    self.status_update.emit("Fragmento con poco audio detectado, ignorando")
+                    # Eliminar archivo temporal
+                    try:
+                        os.remove(filename)
+                    except:
+                        pass
+                    continue
+                
+                # Transcribir fragmento
+                self.status_update.emit(f"Transcribiendo fragmento: {os.path.basename(filename)}")
+                
+                try:
+                    from api_client import WhisperService
+                    transcription = WhisperService.transcribe_file(
+                        self.api_key, filename, self.language_code
+                    )
+                    
+                    if transcription and transcription != "[Error" and len(transcription) > 0:
+                        # Añadir a la transcripción completa (protegido por mutex)
+                        self.mutex.lock()
+                        if self.full_transcription:
+                            self.full_transcription += " " + transcription
+                        else:
+                            self.full_transcription = transcription
+                        current_transcription = self.full_transcription
+                        self.mutex.unlock()
+                        
+                        # Emitir la transcripción completa
+                        self.update_transcription.emit(current_transcription)
+                        self.status_update.emit(f"Transcripción actualizada (+{len(transcription)} caracteres)")
+                    else:
+                        self.status_update.emit("No se detectó texto en el fragmento")
+                    
+                except Exception as e:
+                    self.error_occurred.emit(f"Error al transcribir: {str(e)}")
+                
+                # Eliminar archivo temporal después de procesarlo
+                try:
+                    os.remove(filename)
+                except:
+                    pass
+                
+            except Exception as e:
+                self.error_occurred.emit(f"Error en el transcriptor: {str(e)}")
+                time.sleep(1)  # Evitar bucle rápido en caso de error
+        
+        self.status_update.emit("Transcriptor detenido")
+    
+    def stop(self):
+        """Detiene el procesamiento de transcripción"""
+        self.running = False
+
+class GptResponseDialog(QDialog):
+    """Diálogo para mostrar la respuesta de GPT"""
+    
+    def __init__(self, parent=None, transcription="", gpt_response=""):
+        super().__init__(parent)
+        self.setWindowTitle("Respuesta de GPT")
+        self.resize(800, 600)
+        
+        layout = QVBoxLayout(self)
+        
+        # Sección de transcripción
+        transcription_group = QGroupBox("Transcripción")
+        transcription_layout = QVBoxLayout(transcription_group)
+        
+        self.transcription_text = QTextEdit()
+        self.transcription_text.setReadOnly(True)
+        self.transcription_text.setPlainText(transcription)
+        transcription_layout.addWidget(self.transcription_text)
+        
+        # Sección de respuesta
+        response_group = QGroupBox("Respuesta de GPT")
+        response_layout = QVBoxLayout(response_group)
+        
+        self.response_text = QTextEdit()
+        self.response_text.setReadOnly(True)
+        self.response_text.setPlainText(gpt_response)
+        response_layout.addWidget(self.response_text)
+        
+        # Agregar secciones al layout principal
+        splitter = QSplitter(Qt.Vertical)
+        transcription_widget = QWidget()
+        transcription_widget.setLayout(QVBoxLayout())
+        transcription_widget.layout().addWidget(transcription_group)
+        
+        response_widget = QWidget()
+        response_widget.setLayout(QVBoxLayout())
+        response_widget.layout().addWidget(response_group)
+        
+        splitter.addWidget(transcription_widget)
+        splitter.addWidget(response_widget)
+        layout.addWidget(splitter)
+        
+        # Botones inferiores
+        button_layout = QHBoxLayout()
+        
+        self.copy_button = QPushButton("Copiar Respuesta")
+        self.copy_button.clicked.connect(self.copy_response)
+        
+        self.save_button = QPushButton("Guardar Respuesta")
+        self.save_button.clicked.connect(self.save_response)
+        
+        self.close_button = QPushButton("Cerrar")
+        self.close_button.clicked.connect(self.accept)
+        
+        button_layout.addWidget(self.copy_button)
+        button_layout.addWidget(self.save_button)
+        button_layout.addStretch()
+        button_layout.addWidget(self.close_button)
+        
+        layout.addLayout(button_layout)
+    
+    def copy_response(self):
+        """Copia la respuesta al portapapeles"""
+        response = self.response_text.toPlainText()
+        if response:
+            QApplication.clipboard().setText(response)
+            QMessageBox.information(self, "Información", "Respuesta copiada al portapapeles")
+    
+    def save_response(self):
+        """Guarda la respuesta en un archivo de texto"""
+        response = self.response_text.toPlainText()
+        if not response:
+            QMessageBox.warning(self, "Advertencia", "No hay respuesta para guardar")
+            return
+        
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Guardar respuesta", "", "Archivos de texto (*.txt);;Todos los archivos (*)"
+        )
+        
+        if filename:
+            try:
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(response)
+                QMessageBox.information(self, "Éxito", f"Respuesta guardada en {filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error al guardar el archivo: {e}")
+
 class WhisperApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -622,7 +907,10 @@ class WhisperApp(QMainWindow):
         self.selected_input_device = None
         self.selected_output_device = None
         self.audio_level_monitor = None
-        self.continuous_thread = None
+        
+        # Hilos para modo continuo
+        self.continuous_recorder = None
+        self.transcription_worker = None
         self.is_continuous_mode = False
         
         # Verificar y obtener API key antes de inicializar la UI
@@ -784,9 +1072,19 @@ class WhisperApp(QMainWindow):
         self.copy_button = QPushButton("Copiar")
         self.save_button = QPushButton("Guardar")
         self.clear_button = QPushButton("Limpiar")
+        
+        # Añadir botón para enviar a GPT
+        self.send_to_gpt_button = QPushButton("Enviar a GPT")
+        self.send_to_gpt_button.setStyleSheet(
+            "QPushButton { background-color: #6a0dad; color: white; }"
+            "QPushButton:hover { background-color: #8a2be2; }"
+        )
+        self.send_to_gpt_button.setMinimumHeight(30)
+        
         text_button_layout.addWidget(self.copy_button)
         text_button_layout.addWidget(self.save_button)
         text_button_layout.addWidget(self.clear_button)
+        text_button_layout.addWidget(self.send_to_gpt_button)
         result_layout.addLayout(text_button_layout)
         
         bottom_layout.addWidget(result_group)
@@ -813,6 +1111,7 @@ class WhisperApp(QMainWindow):
         self.copy_button.clicked.connect(self.copy_text)
         self.save_button.clicked.connect(self.save_text)
         self.clear_button.clicked.connect(self.clear_text)
+        self.send_to_gpt_button.clicked.connect(self.send_to_gpt)
     
     def toggle_continuous_mode(self):
         """Alterna entre iniciar y detener la transcripción continua"""
@@ -877,28 +1176,37 @@ class WhisperApp(QMainWindow):
         # Limpiar transcripción anterior
         self.transcription_output.clear()
         
-        # Crear y configurar el hilo de transcripción continua
-        self.continuous_thread = ContinuousRecordTranscribeThread(
-            self.api_key, device_idx, selected_language
-        )
+        # Crear y configurar el hilo de grabación continua
+        self.continuous_recorder = ContinuousAudioRecorder(device_idx, chunk_duration=3)
+        self.continuous_recorder.update_level.connect(self.update_audio_level)
+        self.continuous_recorder.error_occurred.connect(self.handle_continuous_error)
         
-        # Conectar señales
-        self.continuous_thread.update_level.connect(self.update_audio_level)
-        self.continuous_thread.update_transcription.connect(self.update_continuous_transcription)
-        self.continuous_thread.status_update.connect(self.status_bar.showMessage)
-        self.continuous_thread.error_occurred.connect(self.handle_continuous_error)
+        # Crear y configurar el hilo de transcripción
+        self.transcription_worker = AudioTranscriptionWorker(self.api_key, selected_language)
+        self.transcription_worker.update_transcription.connect(self.update_continuous_transcription)
+        self.transcription_worker.status_update.connect(self.status_bar.showMessage)
+        self.transcription_worker.error_occurred.connect(self.handle_continuous_error)
         
-        # Iniciar hilo
-        self.continuous_thread.start()
+        # Conectar la señal de chunk_ready del grabador al worker de transcripción
+        self.continuous_recorder.chunk_ready.connect(self.transcription_worker.enqueue_file)
+        
+        # Iniciar ambos hilos
+        self.transcription_worker.start()
+        self.continuous_recorder.start()
+        
         self.is_continuous_mode = True
-        
         self.status_bar.showMessage("Transcripción continua iniciada")
     
     def stop_continuous_mode(self):
         """Detiene la grabación y transcripción continua"""
-        if self.continuous_thread:
-            self.continuous_thread.stop()
-            self.continuous_thread = None
+        # Detener hilos en orden correcto
+        if self.continuous_recorder:
+            self.continuous_recorder.stop()
+            self.continuous_recorder = None
+            
+        if self.transcription_worker:
+            self.transcription_worker.stop()
+            self.transcription_worker = None
         
         # Restaurar interfaz
         self.record_button.setEnabled(True)
@@ -1082,6 +1390,118 @@ class WhisperApp(QMainWindow):
         if api_key:
             ApiKeyManager.save_api_key(api_key)
 
+    def send_to_gpt(self):
+        """Envía la transcripción actual a GPT y muestra la respuesta"""
+        transcription = self.transcription_output.toPlainText()
+        
+        if not transcription:
+            QMessageBox.warning(self, "Advertencia", "No hay texto para enviar a GPT")
+            return
+        
+        if not self.api_key:
+            QMessageBox.warning(self, "Error", "No hay API key configurada")
+            return
+        
+        # Mostrar diálogo de espera
+        wait_dialog = QMessageBox(self)
+        wait_dialog.setWindowTitle("Procesando")
+        wait_dialog.setText("Enviando texto a GPT. Por favor, espera...")
+        wait_dialog.setStandardButtons(QMessageBox.NoButton)
+        wait_dialog.setIcon(QMessageBox.Information)
+        
+        # Iniciar en un hilo para no bloquear la interfaz
+        self.gpt_thread = GptQueryThread(self.api_key, transcription)
+        self.gpt_thread.query_complete.connect(lambda success, result: self.handle_gpt_response(success, result, wait_dialog, transcription))
+        
+        # Mostrar diálogo y empezar proceso
+        wait_dialog.show()
+        self.gpt_thread.start()
+    
+    def handle_gpt_response(self, success, result, wait_dialog, transcription):
+        """Maneja la respuesta del hilo de GPT"""
+        # Cerrar diálogo de espera
+        wait_dialog.accept()
+        
+        if success:
+            # Mostrar diálogo con la respuesta
+            dialog = GptResponseDialog(self, transcription, result)
+            dialog.exec_()
+        else:
+            QMessageBox.critical(self, "Error", f"Error al obtener respuesta de GPT: {result}")
+    
+        # Procesar otros eventos de teclado normalmente
+        super().keyPressEvent(event)
+    
+    def closeEvent(self, event):
+        """Limpia recursos y archivos temporales al cerrar la aplicación"""
+        try:
+            # Detener hilos activos primero
+            if hasattr(self, 'continuous_recorder') and self.continuous_recorder:
+                self.continuous_recorder.stop()
+            
+            if hasattr(self, 'transcription_worker') and self.transcription_worker:
+                self.transcription_worker.stop()
+            
+            # Ruta a la carpeta de archivos temporales
+            temp_dir = os.path.join(os.getcwd(), "temp_audio")
+            
+            # Si la carpeta existe, eliminar todos los archivos dentro
+            if os.path.exists(temp_dir):
+                self.status_bar.showMessage("Limpiando archivos temporales...")
+                
+                # Contar archivos eliminados para informar
+                total_files = 0
+                failed_files = 0
+                
+                for filename in os.listdir(temp_dir):
+                    file_path = os.path.join(temp_dir, filename)
+                    try:
+                        if os.path.isfile(file_path):
+                            os.unlink(file_path)
+                            total_files += 1
+                    except Exception as e:
+                        print(f"Error al eliminar {file_path}: {e}")
+                        failed_files += 1
+                
+                # Intentar eliminar la carpeta si está vacía
+                try:
+                    if not os.listdir(temp_dir):
+                        os.rmdir(temp_dir)
+                        print(f"Carpeta temporal eliminada: {temp_dir}")
+                except Exception as e:
+                    print(f"No se pudo eliminar la carpeta temporal: {e}")
+                
+                print(f"Limpieza completada: {total_files} archivos temporales eliminados")
+                if failed_files > 0:
+                    print(f"No se pudieron eliminar {failed_files} archivos")
+        except Exception as e:
+            print(f"Error durante la limpieza de archivos temporales: {e}")
+        
+        # Continuar con el cierre normal
+        super().closeEvent(event)
+        wait_dialog.setStandardButtons(QMessageBox.NoButton)
+        wait_dialog.setIcon(QMessageBox.Information)
+        
+        # Iniciar en un hilo para no bloquear la interfaz
+        self.gpt_thread = GptQueryThread(self.api_key, transcription)
+        self.gpt_thread.query_complete.connect(lambda success, result: self.handle_gpt_response(success, result, wait_dialog, transcription))
+        
+        # Mostrar diálogo y empezar proceso
+        wait_dialog.show()
+        self.gpt_thread.start()
+    
+    def handle_gpt_response(self, success, result, wait_dialog, transcription):
+        """Maneja la respuesta del hilo de GPT"""
+        # Cerrar diálogo de espera
+        wait_dialog.accept()
+        
+        if success:
+            # Mostrar diálogo con la respuesta
+            dialog = GptResponseDialog(self, transcription, result)
+            dialog.exec_()
+        else:
+            QMessageBox.critical(self, "Error", f"Error al obtener respuesta de GPT: {result}")
+    
 def main():
     app = QApplication(sys.argv)
     window = WhisperApp()

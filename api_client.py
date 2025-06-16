@@ -1,4 +1,5 @@
 import os
+import json
 from openai import OpenAI
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -107,3 +108,79 @@ class WhisperService:
                 return transcript.text
         except Exception as e:
             return f"[Error: {str(e)}]"
+
+class GptClient:
+    """Cliente para comunicarse con la API de GPT"""
+    
+    @staticmethod
+    def load_config():
+        """Carga la configuración del modelo GPT desde el archivo JSON"""
+        config_path = os.path.join(os.path.dirname(__file__), "gpt_config.json")
+        
+        if not os.path.exists(config_path):
+            # Si no existe el archivo, crear uno con configuración predeterminada
+            default_config = {
+                "model": "gpt-3.5-turbo",
+                "system_prompt": "Eres un asistente virtual experto que ayuda a los usuarios a comprender y procesar información. Tu tarea es analizar el texto proporcionado (que viene de una transcripción de audio) y ofrecer respuestas claras, útiles y bien estructuradas. Trata de buscar preguntas en la transcripción, y da de la manera más concisa posible la respuesta a esas preguntas. El texto puede incluir carácteres de otros idiomas por fallo de la transcripción, pero ignora texto que no esté en inglés o español.",
+                "temperature": 0.6,
+                "max_tokens": 1000,
+                "top_p": 1,
+                "frequency_penalty": 0,
+                "presence_penalty": 0
+            }
+            
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(default_config, f, indent=2)
+            
+            return default_config
+        
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error al cargar la configuración GPT: {e}")
+            return None
+    
+    @staticmethod
+    def send_to_gpt(api_key, transcription):
+        """Envía la transcripción a GPT y devuelve la respuesta"""
+        try:
+            config = GptClient.load_config()
+            if not config:
+                return False, "Error al cargar la configuración de GPT"
+            
+            client = OpenAI(api_key=api_key)
+            
+            # Formatear la transcripción para que comience con "Transcription: "
+            formatted_transcription = f"Transcription: {transcription}"
+            
+            response = client.chat.completions.create(
+                model=config.get("model", "gpt-3.5-turbo"),
+                messages=[
+                    {"role": "system", "content": config.get("system_prompt", "Eres un asistente útil.")},
+                    {"role": "user", "content": formatted_transcription}
+                ],
+                temperature=config.get("temperature", 0.6),
+                max_tokens=config.get("max_tokens", 1000),
+                top_p=config.get("top_p", 1),
+                frequency_penalty=config.get("frequency_penalty", 0),
+                presence_penalty=config.get("presence_penalty", 0)
+            )
+            
+            return True, response.choices[0].message.content
+        except Exception as e:
+            return False, f"Error al comunicarse con GPT: {str(e)}"
+
+
+class GptQueryThread(QThread):
+    """Hilo para enviar consultas a GPT sin bloquear la interfaz"""
+    query_complete = pyqtSignal(bool, str)
+    
+    def __init__(self, api_key, transcription):
+        super().__init__()
+        self.api_key = api_key
+        self.transcription = transcription
+    
+    def run(self):
+        success, result = GptClient.send_to_gpt(self.api_key, self.transcription)
+        self.query_complete.emit(success, result)
