@@ -1,4 +1,4 @@
-# 🎙️ audio_gpt
+# 🎙️ audio_gpt con PyQT
 
 **audio_gpt** es una aplicación discreta para **Windows 11** que captura el **audio interno del sistema** (como conferencias, vídeos o llamadas), lo transcribe en segundo plano utilizando la **API Whisper de OpenAI**, y gestiona el flujo de trabajo mediante un sistema **productor-consumidor** basado en colas.
 
