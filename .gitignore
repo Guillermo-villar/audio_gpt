@@ -8,3 +8,5 @@ temp_audio/
 recording.wav
 virtual_audio.wav
 .env
+_test_drive.py
+speech_en.wav
