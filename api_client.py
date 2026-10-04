@@ -113,7 +113,7 @@ class WhisperService:
 
 
 DEFAULT_GPT_CONFIG = {
-    "model": "gpt-5.4-mini",   # mejor equilibrio velocidad/razonamiento (EXA 2026)
+    "model": "gpt-6-luna",   # ~7x más barato que 5.4-mini; effort dial: low->hard
     "system_prompt": (
         "Eres un asistente virtual experto que ayuda a los usuarios a responder "
         "preguntas sobre conceptos técnicos y resolver problemas de programación "
