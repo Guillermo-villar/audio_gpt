@@ -1,7 +1,12 @@
 sounddevice
 soundfile
 numpy
-PyQt5
-openai
+PySide6
+openai>=1.99
 comtypes
 pycaw
+soundcard          # loopback WASAPI: graba el audio del sistema sin VB-Cable
+webrtcvad-wheels   # detección de voz para segmentar por turnos de habla
+websocket-client   # sesiones de transcripción de la Realtime API
+python-dotenv
+# faster-whisper   # opcional: transcripción local gratuita (pip install faster-whisper)

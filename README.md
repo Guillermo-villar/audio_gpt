@@ -1,143 +1,78 @@
-# 🎙️ audio_gpt con PyQT
+# 🎙️ audio_gpt
 
-**audio_gpt** es una aplicación discreta para **Windows 11** que captura el **audio interno del sistema** (como conferencias, vídeos o llamadas), lo transcribe en segundo plano utilizando la **API Whisper de OpenAI**, y gestiona el flujo de trabajo mediante un sistema **productor-consumidor** basado en colas.
+Aplicación de escritorio para **Windows** que graba el **audio del sistema** (reuniones, vídeos, llamadas) o el micrófono, lo **transcribe en directo** y, opcionalmente, envía cada fragmento a un **LLM** para obtener respuestas automáticas — pensada como copiloto para entrevistas técnicas, clases y reuniones.
 
-> ⚠️ Este proyecto **solo funciona en Windows 11**, ya que depende de dispositivos de grabación internos como *Stereo Mix*.
+## ✨ Qué hay de nuevo (v2)
 
----
+- **Sin VB-Cable**: captura el audio del sistema por **loopback WASAPI** nativo (con `soundcard`). VB-Cable sigue disponible como respaldo.
+- **VAD real**: segmenta por turnos de habla con `webrtcvad` en lugar de cortes fijos — no corta palabras y no gasta API en silencio.
+- **Modelos actuales**: `whisper-1` → `gpt-4o-transcribe` (o `gpt-4o-mini-transcribe`, más barato, o `gpt-4o-transcribe-diarize` con **etiquetas de hablante**).
+- **Streaming real**: proveedor *OpenAI Realtime* — WebSocket a la Realtime API con VAD en servidor; la transcripción llega por turnos casi en directo.
+- **Alternativas gratis/baratas**: *Groq* (`whisper-large-v3-turbo`, ~$0.04/h) y *local* con `faster-whisper` (offline, privado, sin coste).
+- **GPT moderno**: la respuesta usa la **Responses API** con `gpt-6-luna` por defecto (edítalo en `gpt_config.json`; alternativas: `gpt-5-mini`, `gpt-6.1-sol`). Los modelos de razonamiento no aceptan `temperature`, así que esa opción se ignora de forma segura.
+- **Respuestas automáticas**: marca «Responder con GPT automáticamente» y cada segmento transcrito se envía a GPT (paneles separados para transcripción y respuestas).
+- Migrado de **PyQt5 a PySide6** (Qt6: mejor soporte de HiDPI y licencia LGPL).
 
-## 🚀 Características
+## 🚀 Requisitos
 
-- ✅ Captura el audio interno del sistema (no del micrófono).
-- 🧠 Transcribe automáticamente usando la API de Whisper (OpenAI).
-- 🔁 Usa un sistema **asíncrono de productor-consumidor** para grabar y procesar en paralelo.
-- 🪟 Aplicación discreta, pensada para ejecutarse en segundo plano en Windows.
-- 💬 Transcripciones listas para ser usadas con modelos de lenguaje como GPT-4.
-
----
-
-## 🖥️ Requisitos
-
-- Windows 11
-- Python 3.9 o superior
-- Acceso a la API de OpenAI con créditos o plan activo
-- Dispositivo de grabación tipo **Stereo Mix** (activado en el sistema)
-
----
+- Windows 10/11
+- Python 3.9+ (probado con 3.13)
+- Una API key según el proveedor elegido:
+  - **OpenAI**: <https://platform.openai.com/api-keys> — pago por uso (~$0.003–0.006/min de transcripción). *Nota: la suscripción ChatGPT Plus/Pro no incluye uso de API; son productos separados.*
+  - **Groq**: <https://console.groq.com/keys> — casi gratis.
+  - **Local**: sin clave; instala `faster-whisper` y el modelo se descarga solo (~1.6 GB para `large-v3-turbo`).
 
 ## 📦 Instalación
 
-1. Clona el repositorio:
-
 ```bash
-git clone https://github.com/tu-usuario/audio_gpt.git
+git clone https://github.com/Guillermo-villar/audio_gpt.git
 cd audio_gpt
-```
-
-2. Crea y activa un entorno virtual:
-
-```bash
 python -m venv venv
 venv\Scripts\activate
-```
-
-3. Instala las dependencias:
-
-```bash
 pip install -r requirements.txt
+# opcional, para transcripción local gratuita:
+pip install faster-whisper
 ```
 
-4. Crea un archivo `.env` con tu clave de OpenAI:
+Crea un `.env` con tu clave (o déjalo y la app te la pedirá la primera vez):
 
 ```env
-OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_API_KEY=sk-...
+GROQ_API_KEY=gsk_...        # solo si usas Groq
 ```
 
----
-
-## 🧠 ¿Cómo funciona?
-
-El sistema se basa en dos componentes principales:
-
-### 🎤 Productor
-
-- Graba fragmentos de audio del sistema cada `X` segundos.
-- Coloca los fragmentos en una cola para ser transcritos.
-- Funciona en segundo plano continuamente.
-
-### 🧾 Consumidor
-
-- Toma fragmentos de audio desde la cola.
-- Llama a la **API de Whisper** de OpenAI.
-- Devuelve texto limpio, listo para ser mostrado, almacenado o enviado a otro modelo (GPT, etc).
-
----
-
-## 🛠️ Uso
-
-Lanza la aplicación principal:
+## ▶️ Uso
 
 ```bash
 python main.py
 ```
 
-Puedes configurar la duración de grabación, modelo Whisper (`whisper-1`, etc.), y otros parámetros desde `config.py` o como variables de entorno.
+1. **Fuente**: «Audio del sistema (loopback WASAPI)» — graba lo que suena sin tocar la configuración de Windows. Alternativas: micrófono o VB-Cable.
+2. **Proveedor/modelo**: OpenAI `gpt-4o-transcribe` recomendado; `…-diarize` para reuniones con varios hablantes; *Realtime* para latencia mínima; *Groq* o *local* para gastar (casi) nada.
+3. Pulsa **INICIAR TRANSCRIPCIÓN CONTINUA**. La VAD detecta la voz y cada fragmento se transcribe y aparece en pantalla.
+4. Activa **«Responder con GPT automáticamente»** para que cada fragmento pase por GPT y las respuestas aparezcan en el panel inferior.
+5. **Grabar** (duración fija) + **Transcribir grabación** sigue disponible para uso puntual.
 
----
-
-## 📁 Estructura del proyecto
+## 📁 Estructura
 
 ```
 audio_gpt/
-├── main.py                  # Arranque del sistema productor-consumidor
-├── audio_capture.py         # Grabación de audio del sistema
-├── transcriber.py           # Conexión con la API de OpenAI (Whisper)
-├── queue_worker.py          # Gestión de la cola de tareas
-├── utils.py                 # Funciones auxiliares
-├── config.py                # Configuración del sistema
-├── .env                     # Tu clave API (no subir)
-├── requirements.txt         # Dependencias del proyecto
-└── README.md                # Este documento
+├── main.py           # Punto de entrada
+├── gui.py            # Interfaz PySide6 + hilos de captura/transcripción
+├── capture.py        # Loopback WASAPI (soundcard) y dispositivos (sounddevice)
+├── vad.py            # Segmentación por voz (webrtcvad)
+├── transcriber.py    # Motores: OpenAI, Realtime WS, Groq, faster-whisper local
+├── api_client.py     # API keys, Responses API (GPT), compatibilidad
+├── recorder.py       # Diagnóstico de audio por línea de comandos
+├── gpt_config.json   # Modelo GPT, prompt de sistema, esfuerzo de razonamiento
+└── settings.json     # Última configuración elegida (autogenerado)
 ```
 
----
+## 🔐 Notas
 
-## 🧪 Ejemplo de resultado
-
-Transcripción generada desde un vídeo de conferencia:
-
-```
-"Buenos días a todos. Vamos a comenzar la presentación sobre inteligencia artificial aplicada a medicina..."
-```
-
----
-
-## 🔐 Seguridad
-
-- Usa `api_key.txt` para almacenar tu clave API de OpenAI de forma segura.
-- Asegúrate de que `api_key.txt` esté incluido en `.gitignore`!! Sino cualquiera tendrá acceso a tu clave de OpenAI.
-- Nunca subas tu clave a GitHub o compartas públicamente tu entorno.
-
----
-
-## 🧩 Ideas futuras
-
-- Transcripción en tiempo real (streaming).
-- Clasificación automática de fragmentos con GPT.
-- Exportación de texto a TXT, DOCX o PDF.
-- Interfaz gráfica opcional con PyQt para controlar grabación y procesamiento.
-
----
-
-## 🤝 Contribuciones
-
-¡Pull requests y sugerencias son bienvenidas!  
-Este proyecto está en desarrollo activo, así que cualquier mejora, refactorización o integración es bienvenida.
-
----
+- Las claves se guardan en `api_key.txt` / `<proveedor>_api_key.txt` (en `.gitignore`) o vía variables de entorno.
+- `gpt_config.json` controla el modelo y el prompt; `"reasoning_effort": "low"` da respuestas rápidas y baratas — súbelo a `"medium"` si necesitas más calidad.
 
 ## 📄 Licencia
 
-Este proyecto está licenciado bajo la [MIT License](LICENSE).
-
----
+MIT.

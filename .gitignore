@@ -1,2 +1,10 @@
+__pycache__/
+venv/
+*.pyc
 api_key.txt
-temp_audio
+*_api_key.txt
+settings.json
+temp_audio/
+recording.wav
+virtual_audio.wav
+.env

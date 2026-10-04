@@ -1,1293 +1,888 @@
-import sys
+"""audio_gpt — grabación del audio del sistema, transcripción y respuestas GPT.
+
+Pipeline continuo:
+    captura (loopback WASAPI / micrófono / VB-Cable)
+      -> VAD (segmentos de habla reales)
+      -> transcripción (OpenAI / Groq / local / realtime WebSocket)
+      -> GPT opcional por segmento (respuestas automáticas)
+
+Se migra de PyQt5 a PySide6 (Qt6) y se elimina la dependencia de VB-Cable.
+"""
+
 import os
+import sys
 import time
 import queue
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout, 
+import uuid
+import json
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout,
     QWidget, QLabel, QSpinBox, QTextEdit, QLineEdit, QComboBox,
     QProgressBar, QFileDialog, QMessageBox, QGroupBox, QStatusBar,
-    QDialog, QDialogButtonBox, QFrame, QSplitter
+    QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QMutex
-from PyQt5.QtGui import QPainter, QColor, QPen, QIcon, QFont
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex
+from PySide6.QtGui import QPainter, QColor, QPen, QFont
 
-# Importar módulos propios
-import recorder
-from api_client import ApiKeyManager, TranscriptionThread, WhisperService, GptQueryThread
-
-import sounddevice as sd
 import numpy as np
+import sounddevice as sd
 import soundfile as sf
-import uuid
+
+import capture
+import transcriber
+import vad
+from api_client import (
+    ApiKeyManager, TranscriptionThread, WhisperService, GptQueryThread,
+)
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_settings(settings):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        print(f"No se pudo guardar settings.json: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Widgets auxiliares
+# ---------------------------------------------------------------------------
 
 class AudioLevelMonitor(QThread):
-    """Hilo para monitorear niveles de audio en tiempo real"""
-    level_updated = pyqtSignal(float)
-    
+    """Hilo para monitorear niveles de audio en tiempo real."""
+
+    level_updated = Signal(float)
+
     def __init__(self, device_index):
         super().__init__()
         self.device_index = device_index
         self.running = False
         self.samplerate = 44100
-    
+
     def run(self):
         self.running = True
-        
-        def callback(indata, frames, time, status):
+
+        def callback(indata, frames, time_, status):
             if self.running:
-                volume_norm = np.linalg.norm(indata) / np.sqrt(frames)
-                self.level_updated.emit(volume_norm)
-        
+                self.level_updated.emit(float(np.linalg.norm(indata) / np.sqrt(frames)))
+
         try:
-            with sd.InputStream(device=self.device_index, channels=2, callback=callback,
-                              blocksize=int(self.samplerate * 0.1),
-                              samplerate=self.samplerate):
+            with sd.InputStream(device=self.device_index, channels=2,
+                                callback=callback,
+                                blocksize=int(self.samplerate * 0.1),
+                                samplerate=self.samplerate):
                 while self.running:
                     sd.sleep(100)
         except Exception as e:
             print(f"Error en monitoreo de audio: {e}")
-    
+
     def stop(self):
         self.running = False
 
+
 class AudioLevelWidget(QFrame):
-    """Widget para visualizar niveles de audio en tiempo real"""
+    """Barra de nivel de audio."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(30)
         self.setFrameShape(QFrame.StyledPanel)
         self.level = 0.0
-        
+
     def set_level(self, level):
-        self.level = min(level * 5, 1.0)  # Amplificar para mejor visualización
+        self.level = min(level * 5, 1.0)
         self.update()
-        
+
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
-        
-        # Dibujar fondo
         painter.fillRect(self.rect(), QColor(30, 30, 30))
-        
-        # Dibujar barra de nivel
         width = int(self.width() * self.level)
         if self.level < 0.2:
-            color = QColor(0, 180, 0)  # Verde para niveles bajos
+            color = QColor(0, 180, 0)
         elif self.level < 0.6:
-            color = QColor(180, 180, 0)  # Amarillo para niveles medios
+            color = QColor(180, 180, 0)
         else:
-            color = QColor(180, 0, 0)  # Rojo para niveles altos
-            
+            color = QColor(180, 0, 0)
         painter.fillRect(0, 0, width, self.height(), color)
-        
-        # Dibujar marcas de nivel
         pen = QPen(QColor(100, 100, 100))
         painter.setPen(pen)
         for i in range(1, 10):
             x = int(self.width() * i / 10)
             painter.drawLine(x, 0, x, self.height())
 
+
+class ApiKeyDialog(QDialog):
+    """Diálogo para pedir la API key del proveedor seleccionado."""
+
+    def __init__(self, parent=None, provider="openai"):
+        super().__init__(parent)
+        self.provider = provider
+        info = transcriber.PROVIDERS.get(provider, {})
+        self.setWindowTitle(f"Configuración de API Key — {info.get('label', provider)}")
+        self.setModal(True)
+        self.setFixedSize(520, 220)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("Se necesita una API key")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(title)
+
+        urls = {
+            "openai": "https://platform.openai.com/api-keys",
+            "groq": "https://console.groq.com/keys",
+        }
+        url = urls.get(provider, urls["openai"])
+        desc = QLabel(
+            f"Proveedor: {info.get('label', provider)}\n"
+            f"Consigue la clave en: {url}\n\n"
+            "La clave se guardará localmente (o define la variable de entorno "
+            f"{info.get('key_env') or 'OPENAI_API_KEY'})."
+        )
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        key_layout = QHBoxLayout()
+        key_layout.addWidget(QLabel("API Key:"))
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+        self.api_key_input.setPlaceholderText("sk-..." if provider != "groq" else "gsk_...")
+        key_layout.addWidget(self.api_key_input)
+        layout.addLayout(key_layout)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.validate_and_save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.api_key_input.setFocus()
+
+    def validate_and_save(self):
+        api_key = self.api_key_input.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "Error", "Por favor, introduce una API key válida.")
+            return
+        if ApiKeyManager.save_api_key(api_key, self.provider):
+            self.accept()
+        else:
+            QMessageBox.critical(self, "Error", "Error al guardar la API key.")
+
+    def get_api_key(self):
+        return self.api_key_input.text().strip()
+
+
 class AudioDeviceSetupDialog(QDialog):
-    """Diálogo para configurar los dispositivos de audio"""
-    
+    """Diálogo de diagnóstico de dispositivos de audio."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Configuración de Dispositivos de Audio")
-        self.setMinimumWidth(600)
+        self.setWindowTitle("Dispositivos de audio")
+        self.setMinimumWidth(620)
         self.setModal(True)
-        
+
         layout = QVBoxLayout(self)
-        
-        # Dispositivos de entrada
-        input_group = QGroupBox("Dispositivos de Entrada (Grabación)")
-        input_layout = QVBoxLayout(input_group)
-        
+
+        # Estado del loopback WASAPI (la vía principal en Windows)
+        loop_group = QGroupBox("Audio del sistema (loopback WASAPI)")
+        loop_layout = QVBoxLayout(loop_group)
+        loopback = capture.default_loopback()
+        if loopback is not None:
+            self.loop_status = QLabel(f"OK — capturando de: {loopback.name}")
+            self.loop_status.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.loop_status = QLabel(
+                "No disponible. En Windows debería aparecer automáticamente; "
+                "si no, usa VB-Cable o el micrófono."
+            )
+            self.loop_status.setStyleSheet("color: red;")
+        self.loop_status.setWordWrap(True)
+        loop_layout.addWidget(self.loop_status)
+        layout.addWidget(loop_group)
+
+        input_group = QGroupBox("Dispositivos de entrada (grabación)")
+        input_layout = QHBoxLayout(input_group)
         self.input_devices = QComboBox()
-        self.refresh_input_button = QPushButton("Actualizar Lista")
-        
-        input_device_layout = QHBoxLayout()
-        input_device_layout.addWidget(QLabel("Dispositivo:"))
-        input_device_layout.addWidget(self.input_devices)
-        input_device_layout.addWidget(self.refresh_input_button)
-        
-        input_layout.addLayout(input_device_layout)
-        
-        # Dispositivos de salida
-        output_group = QGroupBox("Dispositivos de Salida (Reproducción)")
-        output_layout = QVBoxLayout(output_group)
-        
+        self.refresh_input_button = QPushButton("Actualizar")
+        input_layout.addWidget(QLabel("Dispositivo:"))
+        input_layout.addWidget(self.input_devices, 1)
+        input_layout.addWidget(self.refresh_input_button)
+        layout.addWidget(input_group)
+
+        output_group = QGroupBox("Dispositivos de salida (reproducción)")
+        output_layout = QHBoxLayout(output_group)
         self.output_devices = QComboBox()
-        self.refresh_output_button = QPushButton("Actualizar Lista")
-        
-        output_device_layout = QHBoxLayout()
-        output_device_layout.addWidget(QLabel("Dispositivo:"))
-        output_device_layout.addWidget(self.output_devices)
-        output_device_layout.addWidget(self.refresh_output_button)
-        
-        output_layout.addLayout(output_device_layout)
-        
-        # Virtual Cable
-        vb_group = QGroupBox("Configuración de Virtual Cable")
-        vb_layout = QVBoxLayout(vb_group)
-        
-        self.check_vb_button = QPushButton("Verificar Configuración de Virtual Cable")
-        self.vb_status = QLabel("Estado: No verificado")
-        
-        vb_layout.addWidget(self.check_vb_button)
-        vb_layout.addWidget(self.vb_status)
-        
-        # Monitor de audio
-        monitor_group = QGroupBox("Monitor de Niveles de Audio")
+        self.refresh_output_button = QPushButton("Actualizar")
+        output_layout.addWidget(QLabel("Dispositivo:"))
+        output_layout.addWidget(self.output_devices, 1)
+        output_layout.addWidget(self.refresh_output_button)
+        layout.addWidget(output_group)
+
+        monitor_group = QGroupBox("Monitor de nivel")
         monitor_layout = QVBoxLayout(monitor_group)
-        
         self.level_widget = AudioLevelWidget()
-        self.monitor_button = QPushButton("Iniciar Monitoreo")
-        self.monitor_device = QComboBox()
-        
-        monitor_device_layout = QHBoxLayout()
-        monitor_device_layout.addWidget(QLabel("Dispositivo a monitorear:"))
-        monitor_device_layout.addWidget(self.monitor_device)
-        
-        monitor_layout.addLayout(monitor_device_layout)
+        self.monitor_button = QPushButton("Iniciar monitoreo")
         monitor_layout.addWidget(self.level_widget)
         monitor_layout.addWidget(self.monitor_button)
-        
-        # Agregar grupos al layout principal
-        layout.addWidget(input_group)
-        layout.addWidget(output_group)
-        layout.addWidget(vb_group)
         layout.addWidget(monitor_group)
-        
-        # Botones
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        
-        # Conectar señales
+
         self.refresh_input_button.clicked.connect(self.load_input_devices)
         self.refresh_output_button.clicked.connect(self.load_output_devices)
-        self.check_vb_button.clicked.connect(self.check_virtual_cable)
         self.monitor_button.clicked.connect(self.toggle_monitor)
-        
-        # Cargar dispositivos inicialmente
-        self.load_input_devices()
-        self.load_output_devices()
-        self.load_monitor_devices()
-        
-        # Inicializar monitor
+
         self.monitor_thread = None
         self.monitoring = False
-    
+        self.load_input_devices()
+        self.load_output_devices()
+
     def load_input_devices(self):
-        """Cargar dispositivos de entrada de audio"""
         self.input_devices.clear()
-        devices = sd.query_devices()
-        for i, device in enumerate(devices):
-            if device['max_input_channels'] > 0:
-                self.input_devices.addItem(f"{device['name']}", i)
-    
+        for idx, name, _ch in capture.list_input_devices():
+            self.input_devices.addItem(name, idx)
+
     def load_output_devices(self):
-        """Cargar dispositivos de salida de audio"""
         self.output_devices.clear()
-        devices = sd.query_devices()
-        for i, device in enumerate(devices):
-            if device['max_output_channels'] > 0:
-                self.output_devices.addItem(f"{device['name']}", i)
-    
-    def load_monitor_devices(self):
-        """Cargar dispositivos para monitorear"""
-        self.monitor_device.clear()
-        devices = sd.query_devices()
-        for i, device in enumerate(devices):
-            if device['max_input_channels'] > 0:
-                self.monitor_device.addItem(f"{device['name']}", i)
-    
-    def check_virtual_cable(self):
-        """Verifica la configuración de Virtual Cable"""
-        self.setCursor(Qt.WaitCursor)
-        try:
-            # Comprobar si VB-Cable está instalado
-            cable_input_idx = recorder.find_device_by_name('cable input')
-            cable_output_idx = recorder.find_device_by_name('cable output')
-            
-            if cable_input_idx is None or cable_output_idx is None:
-                self.vb_status.setText("❌ Virtual Cable no encontrado o no instalado correctamente")
-                self.vb_status.setStyleSheet("color: red;")
-                
-                if QMessageBox.question(
-                    self, "Virtual Cable no encontrado", 
-                    "VB-Cable no está instalado o no se detecta.\n¿Deseas visitar el sitio de descarga?",
-                    QMessageBox.Yes | QMessageBox.No
-                ) == QMessageBox.Yes:
-                    import webbrowser
-                    webbrowser.open("https://vb-audio.com/Cable/")
-            else:
-                self.vb_status.setText("✅ Virtual Cable detectado correctamente")
-                self.vb_status.setStyleSheet("color: green;")
-                
-                # Mostrar configuración adicional
-                QMessageBox.information(
-                    self, "Configuración de Virtual Cable", 
-                    "Para usar Virtual Cable correctamente:\n\n"
-                    "1. Configura 'CABLE Input' como dispositivo de salida predeterminado en Windows\n"
-                    "2. Reproduce algún audio en tu sistema mientras grabas\n\n"
-                    "¿Deseas abrir la configuración de audio de Windows?",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                
-                if QMessageBox.Yes:
-                    try:
-                        import subprocess
-                        subprocess.run("start ms-settings:sound", shell=True)
-                    except:
-                        QMessageBox.warning(
-                            self, "Error", 
-                            "No se pudo abrir la configuración automáticamente.\n"
-                            "Por favor, abre manualmente: Panel de control > Sonido > Reproducción"
-                        )
-        except Exception as e:
-            self.vb_status.setText(f"❌ Error al verificar: {e}")
-            self.vb_status.setStyleSheet("color: red;")
-        finally:
-            self.setCursor(Qt.ArrowCursor)
-    
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_output_channels"] > 0:
+                self.output_devices.addItem(d["name"], i)
+
+    def get_selected_devices(self):
+        """Devuelve {'input': idx, 'output': idx} de los combos."""
+        return {
+            "input": self.input_devices.currentData(),
+            "output": self.output_devices.currentData(),
+        }
+
     def toggle_monitor(self):
-        """Inicia o detiene el monitoreo de audio"""
         if not self.monitoring:
-            # Iniciar monitoreo
+            idx = self.input_devices.currentData()
+            if idx is None:
+                return
             try:
-                device_index = self.monitor_device.currentData()
-                if device_index is not None:
-                    self.monitor_thread = AudioLevelMonitor(device_index)
-                    self.monitor_thread.level_updated.connect(self.level_widget.set_level)
-                    self.monitor_thread.start()
-                    self.monitoring = True
-                    self.monitor_button.setText("Detener Monitoreo")
+                self.monitor_thread = AudioLevelMonitor(idx)
+                self.monitor_thread.level_updated.connect(self.level_widget.set_level)
+                self.monitor_thread.start()
+                self.monitoring = True
+                self.monitor_button.setText("Detener monitoreo")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"No se pudo iniciar el monitoreo: {e}")
+                QMessageBox.warning(self, "Error", f"No se pudo monitorizar: {e}")
         else:
-            # Detener monitoreo
             if self.monitor_thread:
                 self.monitor_thread.stop()
                 self.monitor_thread = None
             self.monitoring = False
-            self.monitor_button.setText("Iniciar Monitoreo")
-    
+            self.monitor_button.setText("Iniciar monitoreo")
+
     def closeEvent(self, event):
-        """Limpia recursos y archivos temporales al cerrar la aplicación"""
-        try:
-            # Detener hilos activos primero
-            if hasattr(self, 'continuous_recorder') and self.continuous_recorder:
-                self.continuous_recorder.stop()
-            
-            if hasattr(self, 'transcription_worker') and self.transcription_worker:
-                self.transcription_worker.stop()
-            
-            # Ruta a la carpeta de archivos temporales
-            temp_dir = os.path.join(os.getcwd(), "temp_audio")
-            
-            # Si la carpeta existe, eliminar todos los archivos dentro
-            if os.path.exists(temp_dir):
-                self.status_bar.showMessage("Limpiando archivos temporales...")
-                
-                # Contar archivos eliminados para informar
-                total_files = 0
-                failed_files = 0
-                
-                for filename in os.listdir(temp_dir):
-                    file_path = os.path.join(temp_dir, filename)
-                    try:
-                        if os.path.isfile(file_path):
-                            os.unlink(file_path)
-                            total_files += 1
-                    except Exception as e:
-                        print(f"Error al eliminar {file_path}: {e}")
-                        failed_files += 1
-                
-                # Intentar eliminar la carpeta si está vacía
-                try:
-                    if not os.listdir(temp_dir):
-                        os.rmdir(temp_dir)
-                        print(f"Carpeta temporal eliminada: {temp_dir}")
-                except Exception as e:
-                    print(f"No se pudo eliminar la carpeta temporal: {e}")
-                
-                print(f"Limpieza completada: {total_files} archivos temporales eliminados")
-                if failed_files > 0:
-                    print(f"No se pudieron eliminar {failed_files} archivos")
-        except Exception as e:
-            print(f"Error durante la limpieza de archivos temporales: {e}")
-        
-        # Continuar con el cierre normal
+        if self.monitor_thread:
+            self.monitor_thread.stop()
+            self.monitor_thread = None
         super().closeEvent(event)
 
-class AudioRecordTranscribeThread(QThread):
-    update_progress = pyqtSignal(int)
-    update_partial_transcript = pyqtSignal(str)
-    recording_complete = pyqtSignal(bool, str)
-
-    def __init__(self, filename, duration, device_index, api_key, language_code):
-        super().__init__()
-        self.filename = filename
-        self.duration = duration
-        self.device_index = device_index
-        self.api_key = api_key
-        self.language_code = language_code
-        self.samplerate = 48000
-        self.channels = 2
-        self.chunk_duration = 5  # segundos por fragmento para transcribir
-
-    def run(self):
-        try:
-            total_frames = int(self.duration * self.samplerate)
-            chunk_frames = int(self.chunk_duration * self.samplerate)
-            audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
-            recorded = []
-            start_time = time.time()
-            stream = sd.InputStream(device=self.device_index, channels=self.channels, samplerate=self.samplerate)
-            stream.start()
-            frames_recorded = 0
-            partial_transcript = ""
-            while frames_recorded < total_frames:
-                frames_to_read = min(chunk_frames, total_frames - frames_recorded)
-                chunk = stream.read(frames_to_read)[0]
-                audio_buffer = np.concatenate((audio_buffer, chunk))
-                frames_recorded += frames_to_read
-                # Guardar fragmento temporal para transcripción
-                temp_chunk_file = self.filename + ".chunk.wav"
-                import soundfile as sf
-                sf.write(temp_chunk_file, audio_buffer, self.samplerate)
-                # Llamar a Whisper para transcribir el fragmento
-                try:
-                    from api_client import WhisperService
-                    partial = WhisperService.transcribe_file(self.api_key, temp_chunk_file, self.language_code)
-                    if partial:
-                        partial_transcript = partial
-                        self.update_partial_transcript.emit(partial_transcript)
-                except Exception as e:
-                    self.update_partial_transcript.emit(f"[Error transcribiendo: {e}]")
-                self.update_progress.emit(int(100 * frames_recorded / total_frames))
-            stream.stop()
-            # Guardar audio completo
-            sf.write(self.filename, audio_buffer, self.samplerate)
-            self.recording_complete.emit(True, self.filename)
-        except Exception as e:
-            self.recording_complete.emit(False, str(e))
-
-class ApiKeyDialog(QDialog):
-    """Diálogo para solicitar la API key de OpenAI al iniciar la aplicación"""
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Configuración de API Key")
-        self.setModal(True)
-        self.setFixedSize(500, 200)
-        
-        layout = QVBoxLayout(self)
-        
-        # Título y descripción
-        title_label = QLabel("Configuración inicial requerida")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
-        layout.addWidget(title_label)
-        
-        description_label = QLabel(
-            "Para usar la transcripción de audio, necesitas una API key de OpenAI.\n"
-            "Puedes obtenerla en: https://platform.openai.com/api-keys\n\n"
-            "La API key se guardará localmente para futuros usos."
-        )
-        description_label.setWordWrap(True)
-        layout.addWidget(description_label)
-        
-        # Campo para la API key
-        api_key_layout = QHBoxLayout()
-        api_key_label = QLabel("API Key:")
-        self.api_key_input = QLineEdit()
-        self.api_key_input.setEchoMode(QLineEdit.Password)
-        self.api_key_input.setPlaceholderText("sk-...")
-        api_key_layout.addWidget(api_key_label)
-        api_key_layout.addWidget(self.api_key_input)
-        layout.addLayout(api_key_layout)
-        
-        # Botones
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        
-        # Validar que la API key no esté vacía
-        buttons.button(QDialogButtonBox.Ok).clicked.connect(self.validate_and_save)
-        
-        # Foco en el campo de texto
-        self.api_key_input.setFocus()
-    
-    def validate_and_save(self):
-        """Valida y guarda la API key"""
-        api_key = self.api_key_input.text().strip()
-        
-        if not api_key:
-            QMessageBox.warning(self, "Error", "Por favor, ingresa una API key válida.")
-            return
-        
-        if not api_key.startswith("sk-"):
-            reply = QMessageBox.question(
-                self, "Confirmación", 
-                "La API key no parece tener el formato correcto (debería empezar con 'sk-').\n"
-                "¿Estás seguro de que quieres continuar?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                return
-        
-        # Guardar la API key
-        if ApiKeyManager.save_api_key(api_key):
-            QMessageBox.information(self, "Éxito", "API key guardada correctamente.")
-            self.accept()
-        else:
-            QMessageBox.critical(self, "Error", "Error al guardar la API key.")
-    
-    def get_api_key(self):
-        """Retorna la API key ingresada"""
-        return self.api_key_input.text().strip()
-
-class AudioRecorderThread(QThread):
-    """Hilo para grabar audio sin bloquear la interfaz"""
-    update_progress = pyqtSignal(int)
-    update_level = pyqtSignal(float)
-    recording_complete = pyqtSignal(bool, str)
-    
-    def __init__(self, filename, duration, use_virtual_cable, device_index=None):
-        super().__init__()
-        self.filename = filename
-        self.duration = duration
-        self.use_virtual_cable = use_virtual_cable
-        self.device_index = device_index
-        self.samplerate = 48000
-        self.channels = 2
-    
-    def run(self):
-        try:
-            if self.use_virtual_cable:
-                # Usar cable virtual para grabar audio del sistema
-                cable_output_idx = recorder.find_device_by_name('cable output')
-                if cable_output_idx is not None:
-                    # Configurar para grabar desde CABLE Output
-                    device_idx = cable_output_idx
-                else:
-                    self.recording_complete.emit(False, "No se encontró el dispositivo Virtual Cable")
-                    return
-            else:
-                # Usar el dispositivo seleccionado
-                device_idx = self.device_index
-            
-            # Iniciar grabación
-            total_frames = int(self.duration * self.samplerate)
-            audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
-            
-            # Configurar stream
-            stream = sd.InputStream(device=device_idx, channels=self.channels, samplerate=self.samplerate)
-            stream.start()
-            
-            frames_recorded = 0
-            start_time = time.time()
-            
-            # Grabar en chunks para actualizar progreso
-            while frames_recorded < total_frames:
-                # Determinar tamaño de chunk
-                chunk_size = min(int(self.samplerate * 0.1), total_frames - frames_recorded)
-                
-                # Leer chunk
-                chunk, overflowed = stream.read(chunk_size)
-                audio_buffer = np.concatenate((audio_buffer, chunk))
-                
-                # Calcular nivel de audio y emitir señal
-                level = np.linalg.norm(chunk) / np.sqrt(chunk_size)
-                self.update_level.emit(level)
-                
-                # Actualizar contador y progreso
-                frames_recorded += chunk_size
-                progress = int(100 * frames_recorded / total_frames)
-                self.update_progress.emit(progress)
-                
-                # No sobrecargar la CPU
-                time.sleep(0.01)
-            
-            # Detener stream
-            stream.stop()
-            stream.close()
-            
-            # Guardar archivo
-            import soundfile as sf
-            sf.write(self.filename, audio_buffer, self.samplerate)
-            
-            # Verificar si el audio contiene sonido real
-            if recorder.verificar_audio(self.filename):
-                self.recording_complete.emit(True, self.filename)
-            else:
-                self.recording_complete.emit(False, "La grabación contiene solo silencio. Verifica la configuración.")
-                
-        except Exception as e:
-            self.recording_complete.emit(False, str(e))
-
-class ContinuousRecordTranscribeThread(QThread):
-    """Hilo para grabar y transcribir audio continuamente"""
-    update_level = pyqtSignal(float)
-    update_transcription = pyqtSignal(str)
-    status_update = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-    
-    def __init__(self, api_key, device_index, language_code, chunk_duration=10):
-        super().__init__()
-        self.api_key = api_key
-        self.device_index = device_index
-        self.language_code = language_code
-        self.running = False
-        self.samplerate = 48000
-        self.channels = 2
-        self.chunk_duration = chunk_duration  # segundos por fragmento
-        self.temp_dir = os.path.join(os.getcwd(), "temp_audio")
-        
-        # Crear directorio temporal si no existe
-        if not os.path.exists(self.temp_dir):
-            os.makedirs(self.temp_dir)
-            
-        # Transcripción acumulada
-        self.full_transcription = ""
-    
-    def run(self):
-        try:
-            self.running = True
-            self.status_update.emit("Iniciando grabación continua...")
-            
-            # Configurar stream
-            stream = sd.InputStream(
-                device=self.device_index, 
-                channels=self.channels, 
-                samplerate=self.samplerate
-            )
-            stream.start()
-            
-            chunk_frames = int(self.chunk_duration * self.samplerate)
-            
-            while self.running:
-                # 1. Grabar fragmento
-                self.status_update.emit("Grabando fragmento de audio...")
-                audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
-                
-                for _ in range(0, chunk_frames, 4800):  # Leer en bloques pequeños
-                    if not self.running:
-                        break
-                        
-                    frames_to_read = min(4800, chunk_frames - len(audio_buffer))
-                    if frames_to_read <= 0:
-                        break
-                        
-                    chunk, overflowed = stream.read(frames_to_read)
-                    audio_buffer = np.concatenate((audio_buffer, chunk))
-                    
-                    # Actualizar nivel de audio
-                    level = np.linalg.norm(chunk) / np.sqrt(len(chunk))
-                    self.update_level.emit(level)
-                    
-                    # Pequeña pausa para no sobrecargar la CPU
-                    time.sleep(0.01)
-                
-                if not self.running:
-                    break
-                
-                # 2. Guardar fragmento en archivo temporal
-                temp_file = os.path.join(self.temp_dir, f"chunk_{uuid.uuid4()}.wav")
-                sf.write(temp_file, audio_buffer, self.samplerate)
-                
-                # Verificar si hay audio real
-                if not recorder.verificar_audio(temp_file):
-                    self.status_update.emit("El fragmento contiene solo silencio, continuando...")
-                    continue
-                
-                # 3. Transcribir fragmento
-                self.status_update.emit("Transcribiendo fragmento...")
-                try:
-                    from api_client import WhisperService
-                    transcription = WhisperService.transcribe_file(
-                        self.api_key, temp_file, self.language_code
-                    )
-                    
-                    if transcription and transcription != "[Error" and len(transcription) > 0:
-                        # Añadir a la transcripción completa
-                        if self.full_transcription:
-                            self.full_transcription += " " + transcription
-                        else:
-                            self.full_transcription = transcription
-                            
-                        # Emitir la transcripción completa
-                        self.update_transcription.emit(self.full_transcription)
-                        self.status_update.emit(f"Transcripción actualizada ({len(transcription)} caracteres)")
-                    else:
-                        self.status_update.emit("No se detectó texto en el fragmento")
-                        
-                except Exception as e:
-                    self.error_occurred.emit(f"Error al transcribir: {str(e)}")
-                
-                # Eliminar archivo temporal
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-            
-            # Cerrar stream cuando se detiene
-            stream.stop()
-            stream.close()
-            self.status_update.emit("Grabación continua detenida")
-            
-        except Exception as e:
-            self.running = False
-            self.error_occurred.emit(f"Error en grabación continua: {str(e)}")
-    
-    def stop(self):
-        """Detiene la grabación continua"""
-        self.running = False
-
-class ContinuousAudioRecorder(QThread):
-    """Hilo dedicado a grabar audio continuamente sin interrupciones"""
-    update_level = pyqtSignal(float)
-    chunk_ready = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-    
-    def __init__(self, device_index, chunk_duration=3):
-        super().__init__()
-        self.device_index = device_index
-        self.running = False
-        self.samplerate = 48000
-        self.channels = 2
-        self.chunk_duration = chunk_duration  # segundos por fragmento
-        self.temp_dir = os.path.join(os.getcwd(), "temp_audio")
-        
-        # Crear directorio temporal si no existe
-        if not os.path.exists(self.temp_dir):
-            os.makedirs(self.temp_dir)
-            
-    def run(self):
-        try:
-            self.running = True
-            
-            # Configurar stream
-            chunk_frames = int(self.chunk_duration * self.samplerate)
-            stream = sd.InputStream(
-                device=self.device_index, 
-                channels=self.channels, 
-                samplerate=self.samplerate
-            )
-            stream.start()
-            
-            audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
-            frames_collected = 0
-            
-            while self.running:
-                # Determinar tamaño de chunk
-                chunk_size = min(int(self.samplerate * 0.1), chunk_frames - frames_collected)
-                
-                # Leer chunk
-                chunk, overflowed = stream.read(chunk_size)
-                audio_buffer = np.concatenate((audio_buffer, chunk))
-                frames_collected += chunk_size
-                
-                # Calcular nivel de audio y emitir señal
-                level = np.linalg.norm(chunk) / np.sqrt(chunk_size)
-                self.update_level.emit(level)
-                
-                # Cuando hemos acumulado los frames para un chunk completo
-                if frames_collected >= chunk_frames:
-                    # Generar nombre de archivo único
-                    temp_file = os.path.join(self.temp_dir, f"chunk_{uuid.uuid4()}.wav")
-                    
-                    # Guardar chunk
-                    sf.write(temp_file, audio_buffer, self.samplerate)
-                    
-                    # Emitir señal con el archivo listo
-                    self.chunk_ready.emit(temp_file)
-                    
-                    # Reiniciar buffer y contador
-                    audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
-                    frames_collected = 0
-                
-                # No sobrecargar la CPU
-                time.sleep(0.01)
-            
-            # Cerrar stream cuando se detiene
-            stream.stop()
-            stream.close()
-            
-        except Exception as e:
-            self.running = False
-            self.error_occurred.emit(f"Error en grabación continua: {str(e)}")
-    
-    def stop(self):
-        """Detiene la grabación continua"""
-        self.running = False
-
-class AudioTranscriptionWorker(QThread):
-    """Hilo dedicado a transcribir los fragmentos de audio"""
-    update_transcription = pyqtSignal(str)
-    status_update = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-    
-    def __init__(self, api_key, language_code):
-        super().__init__()
-        self.api_key = api_key
-        self.language_code = language_code
-        self.running = False
-        self.file_queue = queue.Queue()
-        self.full_transcription = ""
-        self.mutex = QMutex()  # Para proteger acceso a full_transcription
-    
-    def enqueue_file(self, filename):
-        """Añade un archivo a la cola para ser transcrito"""
-        self.file_queue.put(filename)
-    
-    def run(self):
-        self.running = True
-        self.status_update.emit("Transcriptor iniciado y esperando archivos de audio")
-        
-        while self.running:
-            try:
-                # Intentar obtener un archivo de la cola (con timeout para poder comprobar running)
-                try:
-                    filename = self.file_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                
-                # Verificar si hay audio real
-                if not recorder.verificar_audio(filename):
-                    self.status_update.emit("Fragmento con poco audio detectado, ignorando")
-                    # Eliminar archivo temporal
-                    try:
-                        os.remove(filename)
-                    except:
-                        pass
-                    continue
-                
-                # Transcribir fragmento
-                self.status_update.emit(f"Transcribiendo fragmento: {os.path.basename(filename)}")
-                
-                try:
-                    from api_client import WhisperService
-                    transcription = WhisperService.transcribe_file(
-                        self.api_key, filename, self.language_code
-                    )
-                    
-                    if transcription and transcription != "[Error" and len(transcription) > 0:
-                        # Añadir a la transcripción completa (protegido por mutex)
-                        self.mutex.lock()
-                        if self.full_transcription:
-                            self.full_transcription += " " + transcription
-                        else:
-                            self.full_transcription = transcription
-                        current_transcription = self.full_transcription
-                        self.mutex.unlock()
-                        
-                        # Emitir la transcripción completa
-                        self.update_transcription.emit(current_transcription)
-                        self.status_update.emit(f"Transcripción actualizada (+{len(transcription)} caracteres)")
-                    else:
-                        self.status_update.emit("No se detectó texto en el fragmento")
-                    
-                except Exception as e:
-                    self.error_occurred.emit(f"Error al transcribir: {str(e)}")
-                
-                # Eliminar archivo temporal después de procesarlo
-                try:
-                    os.remove(filename)
-                except:
-                    pass
-                
-            except Exception as e:
-                self.error_occurred.emit(f"Error en el transcriptor: {str(e)}")
-                time.sleep(1)  # Evitar bucle rápido en caso de error
-        
-        self.status_update.emit("Transcriptor detenido")
-    
-    def stop(self):
-        """Detiene el procesamiento de transcripción"""
-        self.running = False
 
 class GptResponseDialog(QDialog):
-    """Diálogo para mostrar la respuesta de GPT"""
-    
+    """Diálogo con la transcripción y la respuesta de GPT."""
+
     def __init__(self, parent=None, transcription="", gpt_response=""):
         super().__init__(parent)
         self.setWindowTitle("Respuesta de GPT")
         self.resize(800, 600)
-        
+
         layout = QVBoxLayout(self)
-        
-        # Sección de transcripción
+        splitter = QSplitter(Qt.Vertical)
+
         transcription_group = QGroupBox("Transcripción")
-        transcription_layout = QVBoxLayout(transcription_group)
-        
+        t_layout = QVBoxLayout(transcription_group)
         self.transcription_text = QTextEdit()
         self.transcription_text.setReadOnly(True)
         self.transcription_text.setPlainText(transcription)
-        transcription_layout.addWidget(self.transcription_text)
-        
-        # Sección de respuesta
+        t_layout.addWidget(self.transcription_text)
+
         response_group = QGroupBox("Respuesta de GPT")
-        response_layout = QVBoxLayout(response_group)
-        
+        r_layout = QVBoxLayout(response_group)
         self.response_text = QTextEdit()
         self.response_text.setReadOnly(True)
         self.response_text.setPlainText(gpt_response)
-        response_layout.addWidget(self.response_text)
-        
-        # Agregar secciones al layout principal
-        splitter = QSplitter(Qt.Vertical)
-        transcription_widget = QWidget()
-        transcription_widget.setLayout(QVBoxLayout())
-        transcription_widget.layout().addWidget(transcription_group)
-        
-        response_widget = QWidget()
-        response_widget.setLayout(QVBoxLayout())
-        response_widget.layout().addWidget(response_group)
-        
-        splitter.addWidget(transcription_widget)
-        splitter.addWidget(response_widget)
+        r_layout.addWidget(self.response_text)
+
+        splitter.addWidget(transcription_group)
+        splitter.addWidget(response_group)
         layout.addWidget(splitter)
-        
-        # Botones inferiores
+
         button_layout = QHBoxLayout()
-        
-        self.copy_button = QPushButton("Copiar Respuesta")
+        self.copy_button = QPushButton("Copiar respuesta")
         self.copy_button.clicked.connect(self.copy_response)
-        
-        self.save_button = QPushButton("Guardar Respuesta")
+        self.save_button = QPushButton("Guardar respuesta")
         self.save_button.clicked.connect(self.save_response)
-        
         self.close_button = QPushButton("Cerrar")
         self.close_button.clicked.connect(self.accept)
-        
         button_layout.addWidget(self.copy_button)
         button_layout.addWidget(self.save_button)
         button_layout.addStretch()
         button_layout.addWidget(self.close_button)
-        
         layout.addLayout(button_layout)
-    
+
     def copy_response(self):
-        """Copia la respuesta al portapapeles"""
-        response = self.response_text.toPlainText()
-        if response:
-            QApplication.clipboard().setText(response)
+        text = self.response_text.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
             QMessageBox.information(self, "Información", "Respuesta copiada al portapapeles")
-    
+
     def save_response(self):
-        """Guarda la respuesta en un archivo de texto"""
-        response = self.response_text.toPlainText()
-        if not response:
+        text = self.response_text.toPlainText()
+        if not text:
             QMessageBox.warning(self, "Advertencia", "No hay respuesta para guardar")
             return
-        
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Guardar respuesta", "", "Archivos de texto (*.txt);;Todos los archivos (*)"
+            self, "Guardar respuesta", "",
+            "Archivos de texto (*.txt);;Markdown (*.md);;Todos los archivos (*)",
         )
-        
         if filename:
             try:
                 with open(filename, "w", encoding="utf-8") as f:
-                    f.write(response)
+                    f.write(text)
                 QMessageBox.information(self, "Éxito", f"Respuesta guardada en {filename}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Error al guardar el archivo: {e}")
 
+
+# ---------------------------------------------------------------------------
+# Hilos de trabajo
+# ---------------------------------------------------------------------------
+
+class AudioRecorderThread(QThread):
+    """Grabación de duración fija desde la fuente seleccionada."""
+
+    update_progress = Signal(int)
+    update_level = Signal(float)
+    recording_complete = Signal(bool, str)
+
+    SOURCES = ("loopback", "input", "vbcable")
+
+    def __init__(self, filename, duration, source="loopback", device_index=None):
+        super().__init__()
+        self.filename = filename
+        self.duration = duration
+        self.source = source
+        self.device_index = device_index
+        self.samplerate = 48000
+        self.channels = 2
+
+    def _open_stream(self):
+        """Devuelve (read_fn, close_fn). read_fn(n_frames) -> np.float32."""
+        if self.source == "loopback":
+            rec = capture.LoopbackRecorder(samplerate=self.samplerate,
+                                           channels=self.channels, block_ms=100)
+            rec.start()
+            return (lambda n: rec.read(), rec.close)
+        if self.source == "vbcable":
+            idx = capture.find_device_by_name("cable output")
+            if idx is None:
+                raise RuntimeError("No se encontró el dispositivo VB-Cable.")
+        else:
+            idx = self.device_index
+            if idx is None:
+                idx = sd.query_devices(kind="input")["index"]
+
+        stream = sd.InputStream(device=idx, channels=self.channels,
+                                samplerate=self.samplerate)
+        stream.start()
+        return (lambda n: stream.read(n)[0],
+                lambda: (stream.stop(), stream.close()))
+
+    def run(self):
+        try:
+            read, close = self._open_stream()
+            total_frames = int(self.duration * self.samplerate)
+            audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
+            frames_recorded = 0
+
+            while frames_recorded < total_frames:
+                want = min(int(self.samplerate * 0.1), total_frames - frames_recorded)
+                chunk = read(want)
+                chunk = np.asarray(chunk, dtype=np.float32)[:want]
+                if chunk.ndim == 1:
+                    chunk = chunk[:, None]
+                audio_buffer = np.concatenate((audio_buffer, chunk))
+                got = len(chunk)
+                frames_recorded += got
+                level = float(np.linalg.norm(chunk) / np.sqrt(max(got, 1)))
+                self.update_level.emit(level)
+                self.update_progress.emit(int(100 * frames_recorded / total_frames))
+                if got < want:
+                    break
+            close()
+
+            audio, silent = capture.normalize(audio_buffer)
+            if silent:
+                self.recording_complete.emit(
+                    False, "La grabación contiene solo silencio. ¿Suena algo en el sistema?"
+                )
+                return
+            sf.write(self.filename, audio, self.samplerate)
+            self.recording_complete.emit(True, self.filename)
+        except Exception as e:
+            self.recording_complete.emit(False, str(e))
+
+
+class ContinuousCaptureThread(QThread):
+    """Captura continua: emite nivel y segmentos de habla (o alimenta realtime)."""
+
+    update_level = Signal(float)
+    segment_ready = Signal(str)         # path wav a transcribir (modo archivo)
+    status_update = Signal(str)
+    error_occurred = Signal(str)
+
+    def __init__(self, source="loopback", device_index=None, realtime=None):
+        super().__init__()
+        self.source = source
+        self.device_index = device_index
+        self.realtime = realtime        # RealtimeTranscriber o None
+        self.running = False
+        self.samplerate = 48000
+        self.channels = 2
+        self.temp_dir = os.path.join(os.getcwd(), "temp_audio")
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+    def _blocks(self):
+        if self.source == "loopback":
+            rec = capture.LoopbackRecorder(samplerate=self.samplerate,
+                                           channels=self.channels, block_ms=100)
+            return rec.blocks(running=lambda: self.running)
+        if self.source == "vbcable":
+            idx = capture.find_device_by_name("cable output")
+            if idx is None:
+                raise RuntimeError("No se encontró el dispositivo VB-Cable.")
+        else:
+            idx = self.device_index
+            if idx is None:
+                idx = sd.query_devices(kind="input")["index"]
+
+        def gen():
+            stream = sd.InputStream(device=idx, channels=self.channels,
+                                    samplerate=self.samplerate,
+                                    blocksize=int(self.samplerate * 0.1))
+            stream.start()
+            try:
+                while self.running:
+                    yield stream.read(int(self.samplerate * 0.1))[0]
+            finally:
+                stream.stop()
+                stream.close()
+        return gen()
+
+    def run(self):
+        try:
+            self.running = True
+            self.status_update.emit("Capturando audio...")
+            segmenter = None if self.realtime else vad.VadSegmenter(
+                sample_rate=vad.VAD_SAMPLE_RATE
+            )
+
+            for block in self._blocks():
+                if not self.running:
+                    break
+                block = np.asarray(block, dtype=np.float32)
+                level = float(np.linalg.norm(block) / np.sqrt(max(len(block), 1)))
+                self.update_level.emit(level)
+
+                if self.realtime is not None:
+                    self.realtime.send_audio(
+                        transcriber.pcm16_for_realtime(block, self.samplerate)
+                    )
+                else:
+                    audio16 = vad.resample_linear(block, self.samplerate, vad.VAD_SAMPLE_RATE)
+                    for segment in segmenter.push(audio16):
+                        path = os.path.join(self.temp_dir, f"seg_{uuid.uuid4().hex}.wav")
+                        sf.write(path, segment, vad.VAD_SAMPLE_RATE)
+                        self.segment_ready.emit(path)
+
+            if segmenter is not None:
+                for segment in segmenter.flush():
+                    path = os.path.join(self.temp_dir, f"seg_{uuid.uuid4().hex}.wav")
+                    sf.write(path, segment, vad.VAD_SAMPLE_RATE)
+                    self.segment_ready.emit(path)
+
+            self.status_update.emit("Captura detenida")
+        except Exception as e:
+            self.running = False
+            self.error_occurred.emit(f"Error en captura: {e}")
+
+    def stop(self):
+        self.running = False
+
+
+class AudioTranscriptionWorker(QThread):
+    """Consume archivos de la cola y los transcribe con el proveedor elegido."""
+
+    update_transcription = Signal(str)
+    status_update = Signal(str)
+    error_occurred = Signal(str)
+
+    def __init__(self, api_key, language_code,
+                 provider=transcriber.DEFAULT_PROVIDER,
+                 model=transcriber.DEFAULT_MODEL):
+        super().__init__()
+        self.api_key = api_key
+        self.language_code = language_code
+        self.provider = provider
+        self.model = model
+        self.running = False
+        self.file_queue = queue.Queue()
+        self.full_transcription = ""
+        self.mutex = QMutex()
+
+    def enqueue_file(self, filename):
+        self.file_queue.put(filename)
+
+    def run(self):
+        self.running = True
+        self.status_update.emit("Transcriptor listo")
+
+        while self.running:
+            try:
+                try:
+                    filename = self.file_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                self.status_update.emit(
+                    f"Transcribiendo {os.path.basename(filename)} ({self.provider}/{self.model})"
+                )
+                try:
+                    text = transcriber.transcribe_file(
+                        self.api_key, filename, self.language_code,
+                        provider=self.provider, model=self.model,
+                    )
+                    if text and not text.startswith("[Error"):
+                        self.mutex.lock()
+                        self.full_transcription = (
+                            f"{self.full_transcription}\n{text}" if self.full_transcription else text
+                        )
+                        self.mutex.unlock()
+                        self.update_transcription.emit(text)   # emitimos el fragmento nuevo
+                        self.status_update.emit(f"+{len(text)} caracteres")
+                except Exception as e:
+                    self.error_occurred.emit(f"Error al transcribir: {e}")
+                finally:
+                    try:
+                        os.remove(filename)
+                    except OSError:
+                        pass
+            except Exception as e:
+                self.error_occurred.emit(f"Error en el transcriptor: {e}")
+                time.sleep(1)
+
+        self.status_update.emit("Transcriptor detenido")
+
+    def stop(self):
+        self.running = False
+
+
+# ---------------------------------------------------------------------------
+# Ventana principal
+# ---------------------------------------------------------------------------
+
 class WhisperApp(QMainWindow):
+    # Las señales se emiten desde hilos auxiliares y llegan encoladas a la UI.
+    realtime_text = Signal(str, bool)
+    realtime_error = Signal(str)
+
+    CAPTURE_SOURCES = [
+        ("loopback", "Audio del sistema (loopback WASAPI)"),
+        ("input", "Micrófono / dispositivo de entrada"),
+        ("vbcable", "VB-Cable (legacy)"),
+    ]
+
     def __init__(self):
         super().__init__()
+        self.settings = _load_settings()
         self.api_key = None
         self.current_audio_file = None
         self.recorder_thread = None
         self.transcription_thread = None
         self.selected_input_device = None
-        self.selected_output_device = None
-        self.audio_level_monitor = None
-        
-        # Hilos para modo continuo
-        self.continuous_recorder = None
+        self.capture_thread = None
         self.transcription_worker = None
+        self.realtime = None
         self.is_continuous_mode = False
-        
-        # Verificar y obtener API key antes de inicializar la UI
-        if not self.setup_api_key():
-            # Si el usuario cancela el diálogo, cerrar la aplicación
-            sys.exit()
-        
+        self._gpt_threads = []
+
         self.init_ui()
-    
-    def setup_api_key(self):
-        """Verifica si existe API key guardada o solicita una nueva"""
-        # Intentar cargar API key existente
-        saved_api_key = ApiKeyManager.load_api_key()
-        
-        if saved_api_key:
-            self.api_key = saved_api_key
-            return True
-        
-        # Si no existe, mostrar diálogo para pedirla
-        dialog = ApiKeyDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            self.api_key = dialog.get_api_key()
-            return True
-        
-        return False
-    
+        self.realtime_text.connect(self._append_transcript)
+        self.realtime_error.connect(self.handle_continuous_error)
+        self._apply_settings()
+
+    # ------------------------- construcción de UI -------------------------
+
     def init_ui(self):
-        # Configuración de la ventana principal
-        self.setWindowTitle("Grabadora y Transcriptor de Audio")
-        self.setGeometry(100, 100, 900, 700)
-        
-        # Widget central y layout principal
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        
-        # Botón grande de inicio/detención de transcripción continua
-        self.continuous_button_layout = QHBoxLayout()
+        self.setWindowTitle("audio_gpt — Transcriptor y asistente")
+        self.setGeometry(100, 100, 980, 760)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+
         self.continuous_button = QPushButton("INICIAR TRANSCRIPCIÓN CONTINUA")
-        self.continuous_button.setMinimumHeight(60)
+        self.continuous_button.setMinimumHeight(56)
         self.continuous_button.setFont(QFont("Arial", 12, QFont.Bold))
-        self.continuous_button.setStyleSheet(
-            "QPushButton { background-color: #4CAF50; color: white; border-radius: 8px; }"
-            "QPushButton:hover { background-color: #45a049; }"
-            "QPushButton:pressed { background-color: #398438; }"
-        )
+        self._style_continuous_button(start=True)
         self.continuous_button.clicked.connect(self.toggle_continuous_mode)
-        self.continuous_button_layout.addWidget(self.continuous_button)
-        
-        main_layout.addLayout(self.continuous_button_layout)
-        
-        # Splitter para dividir la interfaz
+        main_layout.addWidget(self.continuous_button)
+
         splitter = QSplitter(Qt.Vertical)
         main_layout.addWidget(splitter, 1)
-        
-        # --- Sección de configuración de grabación ---
-        top_widget = QWidget()
-        top_layout = QVBoxLayout(top_widget)
-        
-        recording_group = QGroupBox("Configuración de grabación")
-        recording_layout = QVBoxLayout(recording_group)
-        
-        # Selector de modo de grabación
-        mode_layout = QHBoxLayout()
-        mode_label = QLabel("Método de grabación:")
-        self.mode_selector = QComboBox()
-        self.mode_selector.addItem("Virtual Cable (audio del sistema)")
-        self.mode_selector.addItem("Micrófono u otro dispositivo")
-        mode_layout.addWidget(mode_label)
-        mode_layout.addWidget(self.mode_selector)
-        
-        # Botón de configuración de audio
-        self.audio_setup_button = QPushButton("Configurar Dispositivos")
-        mode_layout.addWidget(self.audio_setup_button)
-        
-        recording_layout.addLayout(mode_layout)
-        
-        # Duración de grabación
+
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+
+        # --- captura ---
+        rec_group = QGroupBox("Captura de audio")
+        rec_layout = QVBoxLayout(rec_group)
+
+        source_layout = QHBoxLayout()
+        source_layout.addWidget(QLabel("Fuente:"))
+        self.source_selector = QComboBox()
+        for key, label in self.CAPTURE_SOURCES:
+            self.source_selector.addItem(label, key)
+        self.audio_setup_button = QPushButton("Dispositivos…")
+        self.audio_setup_button.clicked.connect(self.show_audio_setup)
+        source_layout.addWidget(self.source_selector, 1)
+        source_layout.addWidget(self.audio_setup_button)
+        rec_layout.addLayout(source_layout)
+
         duration_layout = QHBoxLayout()
-        duration_label = QLabel("Duración (segundos):")
+        duration_layout.addWidget(QLabel("Grabación manual (s):"))
         self.duration_input = QSpinBox()
         self.duration_input.setRange(1, 300)
         self.duration_input.setValue(30)
-        duration_layout.addWidget(duration_label)
         duration_layout.addWidget(self.duration_input)
-        recording_layout.addLayout(duration_layout)
-        
-        # Monitor de nivel de audio
-        self.level_monitor = AudioLevelWidget()
-        recording_layout.addWidget(self.level_monitor)
-        
-        # Botones de grabación
-        button_layout = QHBoxLayout()
         self.record_button = QPushButton("Grabar")
         self.play_button = QPushButton("Reproducir")
         self.play_button.setEnabled(False)
-        button_layout.addWidget(self.record_button)
-        button_layout.addWidget(self.play_button)
-        recording_layout.addLayout(button_layout)
-        
-        # Barra de progreso
+        self.record_button.clicked.connect(self.start_recording)
+        self.play_button.clicked.connect(self.play_audio)
+        duration_layout.addWidget(self.record_button)
+        duration_layout.addWidget(self.play_button)
+        duration_layout.addStretch()
+        rec_layout.addLayout(duration_layout)
+
+        self.level_monitor = AudioLevelWidget()
+        rec_layout.addWidget(self.level_monitor)
         self.progress_bar = QProgressBar()
-        recording_layout.addWidget(self.progress_bar)
-        
-        top_layout.addWidget(recording_group)
-        
-        # --- Sección de OpenAI Whisper ---
-        whisper_group = QGroupBox("Transcripción con OpenAI Whisper")
-        whisper_layout = QVBoxLayout(whisper_group)
-        
-        # Estado de la API Key
-        api_status_layout = QHBoxLayout()
-        api_status_label = QLabel("Estado de API Key:")
-        self.api_status_text = QLabel("✅ Configurada correctamente")
-        self.api_status_text.setStyleSheet("color: green; font-weight: bold;")
-        self.change_api_button = QPushButton("Cambiar API Key")
+        rec_layout.addWidget(self.progress_bar)
+        top_layout.addWidget(rec_group)
+
+        # --- transcripción ---
+        tr_group = QGroupBox("Transcripción")
+        tr_layout = QVBoxLayout(tr_group)
+
+        prov_layout = QHBoxLayout()
+        prov_layout.addWidget(QLabel("Proveedor:"))
+        self.provider_selector = QComboBox()
+        for key, meta in transcriber.PROVIDERS.items():
+            self.provider_selector.addItem(meta["label"], key)
+        self.provider_selector.currentIndexChanged.connect(self._on_provider_changed)
+        prov_layout.addWidget(self.provider_selector, 1)
+        self.change_api_button = QPushButton("API key…")
         self.change_api_button.clicked.connect(self.change_api_key)
-        api_status_layout.addWidget(api_status_label)
-        api_status_layout.addWidget(self.api_status_text)
-        api_status_layout.addStretch()
-        api_status_layout.addWidget(self.change_api_button)
-        whisper_layout.addLayout(api_status_layout)
-        
-        # Selector de idioma
-        language_layout = QHBoxLayout()
-        language_label = QLabel("Idioma:")
+        prov_layout.addWidget(self.change_api_button)
+        tr_layout.addLayout(prov_layout)
+
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Modelo:"))
+        self.model_selector = QComboBox()
+        model_layout.addWidget(self.model_selector, 1)
+        model_layout.addWidget(QLabel("Idioma:"))
         self.language_selector = QComboBox()
-        
-        # Cargar idiomas disponibles
-        languages = WhisperService.get_available_languages()
-        for code, name in languages.items():
+        for code, name in WhisperService.get_available_languages().items():
             self.language_selector.addItem(name, code)
-            
-        language_layout.addWidget(language_label)
-        language_layout.addWidget(self.language_selector)
-        whisper_layout.addLayout(language_layout)
-        
-        # Botón de transcripción
-        self.transcribe_button = QPushButton("Transcribir")
+        self.language_selector.setCurrentIndex(1)  # Español por defecto
+        model_layout.addWidget(self.language_selector, 1)
+        tr_layout.addLayout(model_layout)
+
+        self.provider_help = QLabel("")
+        self.provider_help.setWordWrap(True)
+        self.provider_help.setStyleSheet("color: #888; font-size: 11px;")
+        tr_layout.addWidget(self.provider_help)
+
+        manual_layout = QHBoxLayout()
+        self.transcribe_button = QPushButton("Transcribir grabación")
         self.transcribe_button.setEnabled(False)
-        whisper_layout.addWidget(self.transcribe_button)
-        
-        top_layout.addWidget(whisper_group)
-        splitter.addWidget(top_widget)
-        
-        # --- Sección de resultado ---
-        bottom_widget = QWidget()
-        bottom_layout = QVBoxLayout(bottom_widget)
-        
-        result_group = QGroupBox("Transcripción")
-        result_layout = QVBoxLayout(result_group)
-        
+        self.transcribe_button.clicked.connect(self.transcribe_audio)
+        manual_layout.addWidget(self.transcribe_button)
+        self.auto_gpt_checkbox = QCheckBox("Responder con GPT automáticamente")
+        manual_layout.addWidget(self.auto_gpt_checkbox)
+        manual_layout.addStretch()
+        tr_layout.addLayout(manual_layout)
+
+        top_layout.addWidget(tr_group)
+        splitter.addWidget(top)
+
+        # --- salidas ---
+        bottom = QWidget()
+        bottom_layout = QVBoxLayout(bottom)
+
+        out_group = QGroupBox("Transcripción")
+        out_layout = QVBoxLayout(out_group)
         self.transcription_output = QTextEdit()
         self.transcription_output.setReadOnly(True)
-        result_layout.addWidget(self.transcription_output)
-        
-        # Botones para texto
-        text_button_layout = QHBoxLayout()
+        self.transcription_output.setPlaceholderText("La transcripción aparecerá aquí…")
+        out_layout.addWidget(self.transcription_output)
+
+        text_buttons = QHBoxLayout()
         self.copy_button = QPushButton("Copiar")
         self.save_button = QPushButton("Guardar")
         self.clear_button = QPushButton("Limpiar")
-        
-        # Añadir botón para enviar a GPT
+        self.copy_button.clicked.connect(self.copy_text)
+        self.save_button.clicked.connect(self.save_text)
+        self.clear_button.clicked.connect(self.clear_text)
         self.send_to_gpt_button = QPushButton("Enviar a GPT")
         self.send_to_gpt_button.setStyleSheet(
             "QPushButton { background-color: #6a0dad; color: white; }"
             "QPushButton:hover { background-color: #8a2be2; }"
         )
         self.send_to_gpt_button.setMinimumHeight(30)
-        
-        text_button_layout.addWidget(self.copy_button)
-        text_button_layout.addWidget(self.save_button)
-        text_button_layout.addWidget(self.clear_button)
-        text_button_layout.addWidget(self.send_to_gpt_button)
-        result_layout.addLayout(text_button_layout)
-        
-        bottom_layout.addWidget(result_group)
-        splitter.addWidget(bottom_widget)
-        
-        # Barra de estado
+        self.send_to_gpt_button.clicked.connect(self.send_to_gpt)
+        text_buttons.addWidget(self.copy_button)
+        text_buttons.addWidget(self.save_button)
+        text_buttons.addWidget(self.clear_button)
+        text_buttons.addStretch()
+        text_buttons.addWidget(self.send_to_gpt_button)
+        out_layout.addLayout(text_buttons)
+        bottom_layout.addWidget(out_group)
+
+        gpt_group = QGroupBox("Respuestas GPT")
+        gpt_layout = QVBoxLayout(gpt_group)
+        self.gpt_output = QTextEdit()
+        self.gpt_output.setReadOnly(True)
+        self.gpt_output.setPlaceholderText("Respuestas automáticas de GPT…")
+        gpt_layout.addWidget(self.gpt_output)
+        bottom_layout.addWidget(gpt_group)
+
+        splitter.addWidget(bottom)
+
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Listo")
-        
-        # Conectar señales y slots
-        self.connect_signals()
-    
-    def connect_signals(self):
-        # Botones de grabación
-        self.record_button.clicked.connect(self.start_recording)
-        self.play_button.clicked.connect(self.play_audio)
-        self.audio_setup_button.clicked.connect(self.show_audio_setup)
-        
-        # Botón de transcripción
-        self.transcribe_button.clicked.connect(self.transcribe_audio)
-        
-        # Botones de texto
-        self.copy_button.clicked.connect(self.copy_text)
-        self.save_button.clicked.connect(self.save_text)
-        self.clear_button.clicked.connect(self.clear_text)
-        self.send_to_gpt_button.clicked.connect(self.send_to_gpt)
-    
-    def toggle_continuous_mode(self):
-        """Alterna entre iniciar y detener la transcripción continua"""
-        if not self.is_continuous_mode:
-            # Iniciar modo continuo
-            self.start_continuous_mode()
-        else:
-            # Detener modo continuo
-            self.stop_continuous_mode()
-    
-    def start_continuous_mode(self):
-        """Inicia la grabación y transcripción continua"""
-        # Verificar API key
-        if not self.api_key:
-            QMessageBox.warning(self, "Error", "No hay API key configurada")
-            return
-        
-        # Obtener dispositivo de audio según el modo seleccionado
-        if self.mode_selector.currentIndex() == 0:  # Virtual Cable
-            device_idx = recorder.find_device_by_name('cable output')
-            if device_idx is None:
-                QMessageBox.warning(
-                    self, "Error", 
-                    "No se encontró el dispositivo Virtual Cable. Verifica la configuración."
-                )
-                return
-        else:
-            # Usar dispositivo seleccionado o el predeterminado
-            device_idx = self.selected_input_device
-            if device_idx is None:
-                # Intentar usar el dispositivo de entrada predeterminado
-                try:
-                    device_idx = sd.query_devices(kind='input')['index']
-                except:
-                    QMessageBox.warning(
-                        self, "Error", 
-                        "No se ha seleccionado un dispositivo de entrada. Usa 'Configurar Dispositivos'.",
-                        QMessageBox.Ok
-                    )
-                    return
-        
-        # Obtener idioma seleccionado
-        selected_language = self.language_selector.currentData()
-        
-        # Desactivar elementos de UI durante la transcripción continua
-        self.record_button.setEnabled(False)
-        self.play_button.setEnabled(False)
-        self.transcribe_button.setEnabled(False)
-        self.audio_setup_button.setEnabled(False)
-        self.mode_selector.setEnabled(False)
-        self.language_selector.setEnabled(False)
-        self.duration_input.setEnabled(False)
-        
-        # Cambiar estilo del botón a rojo (detener)
-        self.continuous_button.setText("DETENER TRANSCRIPCIÓN CONTINUA")
-        self.continuous_button.setStyleSheet(
-            "QPushButton { background-color: #f44336; color: white; border-radius: 8px; }"
-            "QPushButton:hover { background-color: #e53935; }"
-            "QPushButton:pressed { background-color: #c62828; }"
+
+        self._on_provider_changed()
+
+    def _style_continuous_button(self, start):
+        color, hover, pressed = (
+            ("#4CAF50", "#45a049", "#398438") if start else ("#f44336", "#e53935", "#c62828")
         )
-        
-        # Limpiar transcripción anterior
-        self.transcription_output.clear()
-        
-        # Crear y configurar el hilo de grabación continua
-        self.continuous_recorder = ContinuousAudioRecorder(device_idx, chunk_duration=3)
-        self.continuous_recorder.update_level.connect(self.update_audio_level)
-        self.continuous_recorder.error_occurred.connect(self.handle_continuous_error)
-        
-        # Crear y configurar el hilo de transcripción
-        self.transcription_worker = AudioTranscriptionWorker(self.api_key, selected_language)
-        self.transcription_worker.update_transcription.connect(self.update_continuous_transcription)
-        self.transcription_worker.status_update.connect(self.status_bar.showMessage)
-        self.transcription_worker.error_occurred.connect(self.handle_continuous_error)
-        
-        # Conectar la señal de chunk_ready del grabador al worker de transcripción
-        self.continuous_recorder.chunk_ready.connect(self.transcription_worker.enqueue_file)
-        
-        # Iniciar ambos hilos
-        self.transcription_worker.start()
-        self.continuous_recorder.start()
-        
-        self.is_continuous_mode = True
-        self.status_bar.showMessage("Transcripción continua iniciada")
-    
-    def stop_continuous_mode(self):
-        """Detiene la grabación y transcripción continua"""
-        # Detener hilos en orden correcto
-        if self.continuous_recorder:
-            self.continuous_recorder.stop()
-            self.continuous_recorder = None
-            
-        if self.transcription_worker:
-            self.transcription_worker.stop()
-            self.transcription_worker = None
-        
-        # Restaurar interfaz
-        self.record_button.setEnabled(True)
-        self.audio_setup_button.setEnabled(True)
-        self.mode_selector.setEnabled(True)
-        self.language_selector.setEnabled(True)
-        self.duration_input.setEnabled(True)
-        
-        # Restaurar botón a verde (iniciar)
-        self.continuous_button.setText("INICIAR TRANSCRIPCIÓN CONTINUA")
         self.continuous_button.setStyleSheet(
-            "QPushButton { background-color: #4CAF50; color: white; border-radius: 8px; }"
-            "QPushButton:hover { background-color: #45a049; }"
-            "QPushButton:pressed { background-color: #398438; }"
+            f"QPushButton {{ background-color: {color}; color: white; border-radius: 8px; }}"
+            f"QPushButton:hover {{ background-color: {hover}; }}"
+            f"QPushButton:pressed {{ background-color: {pressed}; }}"
         )
-        
-        self.is_continuous_mode = False
-        self.status_bar.showMessage("Transcripción continua detenida")
-    
-    def update_continuous_transcription(self, text):
-        """Actualiza el campo de texto con la transcripción continua"""
-        self.transcription_output.setPlainText(text)
-        # Desplazar automáticamente hacia abajo
-        self.transcription_output.moveCursor(self.transcription_output.textCursor().End)
-    
-    def handle_continuous_error(self, error_msg):
-        """Maneja errores en la transcripción continua"""
-        QMessageBox.warning(self, "Error", error_msg)
-        self.stop_continuous_mode()
-    
-    def show_audio_setup(self):
-        """Muestra el diálogo de configuración de audio"""
-        dialog = AudioDeviceSetupDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            selected_devices = dialog.get_selected_devices()
-            self.selected_input_device = selected_devices['input']
-            self.selected_output_device = selected_devices['output']
-            self.status_bar.showMessage("Configuración de dispositivos actualizada")
-    
-    def update_audio_level(self, level):
-        """Actualiza el widget de nivel de audio"""
-        self.level_monitor.set_level(level)
-    
+
+    def _apply_settings(self):
+        s = self.settings
+        provider = s.get("provider")
+        if provider in transcriber.PROVIDERS:
+            self.provider_selector.setCurrentIndex(
+                list(transcriber.PROVIDERS).index(provider))
+        self._on_provider_changed()
+        model = s.get("model")
+        if model:
+            idx = self.model_selector.findData(model)
+            if idx >= 0:
+                self.model_selector.setCurrentIndex(idx)
+        lang = s.get("language")
+        if lang is not None:
+            idx = self.language_selector.findData(lang)
+            if idx >= 0:
+                self.language_selector.setCurrentIndex(idx)
+        source = s.get("source")
+        if source:
+            idx = self.source_selector.findData(source)
+            if idx >= 0:
+                self.source_selector.setCurrentIndex(idx)
+
+    def _persist_settings(self):
+        _save_settings({
+            "provider": self.provider_selector.currentData(),
+            "model": self.model_selector.currentData(),
+            "language": self.language_selector.currentData(),
+            "source": self.source_selector.currentData(),
+        })
+
+    # ------------------------- proveedor / api key -------------------------
+
+    def _on_provider_changed(self):
+        provider = self.provider_selector.currentData()
+        meta = transcriber.PROVIDERS.get(provider, {})
+        self.model_selector.clear()
+        for value, label in meta.get("models", []):
+            self.model_selector.addItem(label, value)
+        self.provider_help.setText(meta.get("help", ""))
+        self.api_key = ApiKeyManager.load_api_key(provider)
+        needs_key = meta.get("key_env") is not None
+        self.change_api_button.setEnabled(needs_key)
+        if needs_key and not self.api_key:
+            dialog = ApiKeyDialog(self, provider)
+            if dialog.exec() == QDialog.Accepted:
+                self.api_key = dialog.get_api_key()
+
+    def change_api_key(self):
+        provider = self.provider_selector.currentData()
+        dialog = ApiKeyDialog(self, provider)
+        if dialog.exec() == QDialog.Accepted:
+            self.api_key = dialog.get_api_key()
+            self.status_bar.showMessage("API key actualizada")
+
+    def _current_provider(self):
+        return self.provider_selector.currentData()
+
+    def _current_model(self):
+        return self.model_selector.currentData()
+
+    def _current_language(self):
+        return self.language_selector.currentData()
+
+    def _current_source(self):
+        return self.source_selector.currentData()
+
+    # ------------------------- grabación manual -------------------------
+
     def start_recording(self):
-        # Desactivar botones durante la grabación
         self.record_button.setEnabled(False)
         self.transcribe_button.setEnabled(False)
         self.play_button.setEnabled(False)
-        
-        # Crear nombre de archivo temporal
+
         self.current_audio_file = os.path.join(os.getcwd(), "recording.wav")
-        
-        # Obtener duración y método
-        duration = self.duration_input.value()
-        use_virtual_cable = self.mode_selector.currentIndex() == 0
-        
-        # Iniciar hilo de grabación
         self.recorder_thread = AudioRecorderThread(
-            self.current_audio_file, 
-            duration, 
-            use_virtual_cable,
-            self.selected_input_device
+            self.current_audio_file,
+            self.duration_input.value(),
+            source=self._current_source(),
+            device_index=self.selected_input_device,
         )
-        self.recorder_thread.update_progress.connect(self.update_progress)
-        self.recorder_thread.update_level.connect(self.update_audio_level)
+        self.recorder_thread.update_progress.connect(self.progress_bar.setValue)
+        self.recorder_thread.update_level.connect(self.level_monitor.set_level)
         self.recorder_thread.recording_complete.connect(self.recording_finished)
-        
-        # Reiniciar barra de progreso
         self.progress_bar.setValue(0)
-        
-        # Iniciar grabación
-        self.status_bar.showMessage("Grabando audio...")
+        self.status_bar.showMessage("Grabando…")
         self.recorder_thread.start()
-    
-    def update_progress(self, value):
-        self.progress_bar.setValue(value)
-    
+
     def recording_finished(self, success, message):
-        # Reactivar botones
         self.record_button.setEnabled(True)
-        
         if success:
             self.status_bar.showMessage("Grabación completada")
             self.play_button.setEnabled(True)
@@ -1295,218 +890,315 @@ class WhisperApp(QMainWindow):
         else:
             self.status_bar.showMessage(f"Error: {message}")
             QMessageBox.critical(self, "Error", f"Error durante la grabación: {message}")
-            # Sugerir solución si es por silencio
-            if "silencio" in message.lower():
-                if self.mode_selector.currentIndex() == 0:  # Virtual Cable
-                    QMessageBox.information(
-                        self, "Sugerencia", 
-                        "La grabación está silenciosa. Verifica que:\n\n"
-                        "1. CABLE Input está configurado como dispositivo de salida predeterminado\n"
-                        "2. Estás reproduciendo algún sonido mientras grabas\n"
-                        "3. El volumen del sistema no está silenciado\n\n"
-                        "Puedes usar el botón 'Configurar Dispositivos' para verificar la configuración."
-                    )
-    
+
     def play_audio(self):
         if self.current_audio_file and os.path.exists(self.current_audio_file):
-            recorder.reproducir_audio(self.current_audio_file)
+            data, sr = sf.read(self.current_audio_file)
+            sd.play(data, sr)
         else:
-            QMessageBox.warning(self, "Error", "No hay archivo de audio para reproducir")
-    
-    def change_api_key(self):
-        """Permite cambiar la API key actual"""
-        dialog = ApiKeyDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            self.api_key = dialog.get_api_key()
-            self.status_bar.showMessage("API key actualizada correctamente")
-    
+            QMessageBox.warning(self, "Error", "No hay audio para reproducir")
+
+    def show_audio_setup(self):
+        dialog = AudioDeviceSetupDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            selected = dialog.get_selected_devices()
+            self.selected_input_device = selected["input"]
+            self.status_bar.showMessage("Dispositivo de entrada actualizado")
+
     def transcribe_audio(self):
-        # Verificar que tenemos audio grabado
         if not self.current_audio_file or not os.path.exists(self.current_audio_file):
-            QMessageBox.warning(self, "Error", "No hay archivo de audio para transcribir")
+            QMessageBox.warning(self, "Error", "No hay audio grabado para transcribir")
             return
-        
-        # Verificar API key (ahora usa la almacenada)
-        if not self.api_key:
-            QMessageBox.warning(self, "Error", "No hay API key configurada")
-            return
-        
-        # Obtener idioma seleccionado
-        selected_language = self.language_selector.currentData()
-        
-        # Desactivar botón durante la transcripción
         self.transcribe_button.setEnabled(False)
-        self.status_bar.showMessage("Transcribiendo audio...")
-        
-        # Iniciar hilo de transcripción
+        self.status_bar.showMessage("Transcribiendo…")
         self.transcription_thread = TranscriptionThread(
-            self.api_key, self.current_audio_file, selected_language
+            self.api_key, self.current_audio_file, self._current_language(),
+            provider=self._current_provider(), model=self._current_model(),
         )
         self.transcription_thread.transcription_complete.connect(self.transcription_finished)
         self.transcription_thread.start()
-    
+
     def transcription_finished(self, success, result):
-        # Reactivar botón
         self.transcribe_button.setEnabled(True)
-        
         if success:
             self.transcription_output.setPlainText(result)
             self.status_bar.showMessage("Transcripción completada")
         else:
-            QMessageBox.critical(self, "Error", f"Error durante la transcripción: {result}")
+            QMessageBox.critical(self, "Error", f"Error en la transcripción: {result}")
             self.status_bar.showMessage(f"Error: {result}")
-    
+
+    # ------------------------- modo continuo -------------------------
+
+    def toggle_continuous_mode(self):
+        if not self.is_continuous_mode:
+            self.start_continuous_mode()
+        else:
+            self.stop_continuous_mode()
+
+    def start_continuous_mode(self):
+        provider = self._current_provider()
+        meta = transcriber.PROVIDERS.get(provider, {})
+        if meta.get("key_env") and not self.api_key:
+            QMessageBox.warning(self, "Error", "No hay API key configurada para este proveedor")
+            return
+        if provider == "local" and not self._check_local_available():
+            return
+        if provider != "openai-realtime" and not vad.is_available():
+            QMessageBox.warning(
+                self, "Error",
+                "webrtcvad no está instalado (pip install webrtcvad-wheels)."
+            )
+            return
+
+        source = self._current_source()
+        if source == "loopback" and not capture.loopback_available():
+            QMessageBox.warning(
+                self, "Error",
+                "El loopback WASAPI no está disponible. Prueba con micrófono o VB-Cable."
+            )
+            return
+
+        self._set_controls_enabled(False)
+        self.continuous_button.setText("DETENER TRANSCRIPCIÓN CONTINUA")
+        self._style_continuous_button(start=False)
+        self.transcription_output.clear()
+        self._persist_settings()
+
+        language = self._current_language()
+        model = self._current_model()
+
+        if provider == "openai-realtime":
+            if not self._start_realtime(language, model):
+                self._set_controls_enabled(True)
+                self.continuous_button.setText("INICIAR TRANSCRIPCIÓN CONTINUA")
+                self._style_continuous_button(start=True)
+                return
+        else:
+            self.capture_thread = ContinuousCaptureThread(
+                source=source, device_index=self.selected_input_device)
+            self.capture_thread.update_level.connect(self.level_monitor.set_level)
+            self.capture_thread.status_update.connect(self.status_bar.showMessage)
+            self.capture_thread.error_occurred.connect(self.handle_continuous_error)
+
+            self.transcription_worker = AudioTranscriptionWorker(
+                self.api_key, language, provider=provider, model=model)
+            self.transcription_worker.update_transcription.connect(self._on_new_segment)
+            self.transcription_worker.status_update.connect(self.status_bar.showMessage)
+            self.transcription_worker.error_occurred.connect(self.handle_continuous_error)
+            self.capture_thread.segment_ready.connect(self.transcription_worker.enqueue_file)
+
+            self.transcription_worker.start()
+            self.capture_thread.start()
+
+        self.is_continuous_mode = True
+        self.status_bar.showMessage("Transcripción continua iniciada")
+
+    def _start_realtime(self, language, model):
+        self.realtime = transcriber.RealtimeTranscriber(
+            self.api_key, model=model, language=language,
+            prompt=transcriber.DEFAULT_PROMPT,
+            on_transcript=lambda t, fin: self.realtime_text.emit(t, fin),
+            on_error=lambda m: self.realtime_error.emit(m),
+        )
+        try:
+            self.realtime.start()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo abrir la sesión realtime: {e}")
+            self.realtime = None
+            return False
+
+        self.capture_thread = ContinuousCaptureThread(
+            source=self._current_source(),
+            device_index=self.selected_input_device,
+            realtime=self.realtime,
+        )
+        self.capture_thread.update_level.connect(self.level_monitor.set_level)
+        self.capture_thread.status_update.connect(self.status_bar.showMessage)
+        self.capture_thread.error_occurred.connect(self.handle_continuous_error)
+        self.capture_thread.start()
+        return True
+
+    @Slot(str, bool)
+    def _append_transcript(self, text, is_final):
+        if is_final:
+            self._on_new_segment(text)
+
+    def stop_continuous_mode(self):
+        if self.capture_thread:
+            self.capture_thread.stop()
+            self.capture_thread = None
+        if self.realtime:
+            self.realtime.stop()
+            self.realtime = None
+        if self.transcription_worker:
+            self.transcription_worker.stop()
+            self.transcription_worker = None
+
+        self._set_controls_enabled(True)
+        self.continuous_button.setText("INICIAR TRANSCRIPCIÓN CONTINUA")
+        self._style_continuous_button(start=True)
+        self.is_continuous_mode = False
+        self.status_bar.showMessage("Transcripción continua detenida")
+
+    def _set_controls_enabled(self, enabled):
+        for w in (self.record_button, self.play_button, self.transcribe_button,
+                  self.audio_setup_button, self.source_selector,
+                  self.language_selector, self.duration_input,
+                  self.provider_selector, self.model_selector):
+            w.setEnabled(enabled)
+
+    def _check_local_available(self):
+        try:
+            __import__("faster_whisper")
+            return True
+        except ImportError:
+            QMessageBox.warning(
+                self, "faster-whisper no instalado",
+                "Para transcripción local instala: pip install faster-whisper\n"
+                "(descargará el modelo la primera vez, ~1.6 GB para large-v3-turbo)."
+            )
+            return False
+
+    def _on_new_segment(self, text):
+        """Llamado con cada fragmento nuevo transcrito (modo continuo)."""
+        current = self.transcription_output.toPlainText()
+        self.transcription_output.setPlainText(
+            f"{current}\n{text}" if current else text)
+        cursor = self.transcription_output.textCursor()
+        cursor.movePosition(cursor.End)
+        self.transcription_output.setTextCursor(cursor)
+
+        if self.auto_gpt_checkbox.isChecked() and text.strip():
+            gpt_key = ApiKeyManager.load_api_key("openai")
+            if not gpt_key:
+                self.status_bar.showMessage(
+                    "Auto-GPT necesita una API key de OpenAI (botón «API key…»)"
+                )
+                return
+            thread = GptQueryThread(gpt_key, text)
+            self._gpt_threads.append(thread)
+            thread.query_complete.connect(self._on_auto_gpt_result)
+            thread.query_complete.connect(
+                lambda *a, t=thread: self._gpt_threads.remove(t))
+            thread.start()
+
+    def _on_auto_gpt_result(self, success, result):
+        if success:
+            existing = self.gpt_output.toPlainText()
+            self.gpt_output.setPlainText(f"{existing}\n\n{result}" if existing else result)
+            cursor = self.gpt_output.textCursor()
+            cursor.movePosition(cursor.End)
+            self.gpt_output.setTextCursor(cursor)
+        else:
+            self.status_bar.showMessage(f"GPT: {result}")
+
+    def handle_continuous_error(self, error_msg):
+        QMessageBox.warning(self, "Error", error_msg)
+        self.stop_continuous_mode()
+
+    # ------------------------- texto / gpt manual -------------------------
+
     def copy_text(self):
         text = self.transcription_output.toPlainText()
         if text:
-            clipboard = QApplication.clipboard()
-            clipboard.setText(text)
-            self.status_bar.showMessage("Texto copiado al portapapeles")
-    
+            QApplication.clipboard().setText(text)
+            self.status_bar.showMessage("Copiado al portapapeles")
+
     def save_text(self):
         text = self.transcription_output.toPlainText()
         if not text:
             QMessageBox.warning(self, "Advertencia", "No hay texto para guardar")
             return
-        
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Guardar transcripción", "", "Archivos de texto (*.txt);;Todos los archivos (*)"
-        )
-        
+            self, "Guardar transcripción", "",
+            "Archivos de texto (*.txt);;Todos los archivos (*)")
         if filename:
             try:
                 with open(filename, "w", encoding="utf-8") as f:
                     f.write(text)
-                self.status_bar.showMessage(f"Texto guardado en {filename}")
+                self.status_bar.showMessage(f"Guardado en {filename}")
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Error al guardar el archivo: {e}")
-    
+                QMessageBox.critical(self, "Error", f"Error al guardar: {e}")
+
     def clear_text(self):
         self.transcription_output.clear()
+        self.gpt_output.clear()
         self.status_bar.showMessage("Transcripción borrada")
-    
-    def save_api_key(self):
-        api_key = self.api_key_input.text().strip()
-        if api_key:
-            ApiKeyManager.save_api_key(api_key)
 
     def send_to_gpt(self):
-        """Envía la transcripción actual a GPT y muestra la respuesta"""
         transcription = self.transcription_output.toPlainText()
-        
         if not transcription:
             QMessageBox.warning(self, "Advertencia", "No hay texto para enviar a GPT")
             return
-        
-        if not self.api_key:
-            QMessageBox.warning(self, "Error", "No hay API key configurada")
+        gpt_key = ApiKeyManager.load_api_key("openai")
+        if not gpt_key:
+            QMessageBox.warning(
+                self, "Error",
+                "GPT usa la API de OpenAI: configura una API key con «API key…» "
+                "seleccionando el proveedor OpenAI."
+            )
             return
-        
-        # Mostrar diálogo de espera
+
         wait_dialog = QMessageBox(self)
         wait_dialog.setWindowTitle("Procesando")
-        wait_dialog.setText("Enviando texto a GPT. Por favor, espera...")
+        wait_dialog.setText("Enviando a GPT…")
         wait_dialog.setStandardButtons(QMessageBox.NoButton)
         wait_dialog.setIcon(QMessageBox.Information)
-        
-        # Iniciar en un hilo para no bloquear la interfaz
+
         self.gpt_thread = GptQueryThread(self.api_key, transcription)
-        self.gpt_thread.query_complete.connect(lambda success, result: self.handle_gpt_response(success, result, wait_dialog, transcription))
-        
-        # Mostrar diálogo y empezar proceso
+        self.gpt_thread.query_complete.connect(
+            lambda ok, res: self._handle_gpt_response(ok, res, wait_dialog, transcription))
         wait_dialog.show()
         self.gpt_thread.start()
-    
-    def handle_gpt_response(self, success, result, wait_dialog, transcription):
-        """Maneja la respuesta del hilo de GPT"""
-        # Cerrar diálogo de espera
+
+    def _handle_gpt_response(self, success, result, wait_dialog, transcription):
         wait_dialog.accept()
-        
         if success:
-            # Mostrar diálogo con la respuesta
-            dialog = GptResponseDialog(self, transcription, result)
-            dialog.exec_()
+            existing = self.gpt_output.toPlainText()
+            self.gpt_output.setPlainText(
+                f"{existing}\n\n{result}" if existing else result)
+            GptResponseDialog(self, transcription, result).exec()
         else:
-            QMessageBox.critical(self, "Error", f"Error al obtener respuesta de GPT: {result}")
-    
-        # Procesar otros eventos de teclado normalmente
-        super().keyPressEvent(event)
-    
+            QMessageBox.critical(self, "Error", f"Error de GPT: {result}")
+
+    # ------------------------- cierre -------------------------
+
     def closeEvent(self, event):
-        """Limpia recursos y archivos temporales al cerrar la aplicación"""
         try:
-            # Detener hilos activos primero
-            if hasattr(self, 'continuous_recorder') and self.continuous_recorder:
-                self.continuous_recorder.stop()
-            
-            if hasattr(self, 'transcription_worker') and self.transcription_worker:
+            if self.capture_thread:
+                self.capture_thread.stop()
+            if self.realtime:
+                self.realtime.stop()
+            if self.transcription_worker:
                 self.transcription_worker.stop()
-            
-            # Ruta a la carpeta de archivos temporales
+
             temp_dir = os.path.join(os.getcwd(), "temp_audio")
-            
-            # Si la carpeta existe, eliminar todos los archivos dentro
             if os.path.exists(temp_dir):
-                self.status_bar.showMessage("Limpiando archivos temporales...")
-                
-                # Contar archivos eliminados para informar
-                total_files = 0
-                failed_files = 0
-                
-                for filename in os.listdir(temp_dir):
-                    file_path = os.path.join(temp_dir, filename)
+                removed = 0
+                for name in os.listdir(temp_dir):
+                    path = os.path.join(temp_dir, name)
                     try:
-                        if os.path.isfile(file_path):
-                            os.unlink(file_path)
-                            total_files += 1
-                    except Exception as e:
-                        print(f"Error al eliminar {file_path}: {e}")
-                        failed_files += 1
-                
-                # Intentar eliminar la carpeta si está vacía
+                        if os.path.isfile(path):
+                            os.unlink(path)
+                            removed += 1
+                    except OSError:
+                        pass
                 try:
-                    if not os.listdir(temp_dir):
-                        os.rmdir(temp_dir)
-                        print(f"Carpeta temporal eliminada: {temp_dir}")
-                except Exception as e:
-                    print(f"No se pudo eliminar la carpeta temporal: {e}")
-                
-                print(f"Limpieza completada: {total_files} archivos temporales eliminados")
-                if failed_files > 0:
-                    print(f"No se pudieron eliminar {failed_files} archivos")
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
+                print(f"Limpieza: {removed} temporales eliminados")
         except Exception as e:
-            print(f"Error durante la limpieza de archivos temporales: {e}")
-        
-        # Continuar con el cierre normal
+            print(f"Error al cerrar: {e}")
         super().closeEvent(event)
-        wait_dialog.setStandardButtons(QMessageBox.NoButton)
-        wait_dialog.setIcon(QMessageBox.Information)
-        
-        # Iniciar en un hilo para no bloquear la interfaz
-        self.gpt_thread = GptQueryThread(self.api_key, transcription)
-        self.gpt_thread.query_complete.connect(lambda success, result: self.handle_gpt_response(success, result, wait_dialog, transcription))
-        
-        # Mostrar diálogo y empezar proceso
-        wait_dialog.show()
-        self.gpt_thread.start()
-    
-    def handle_gpt_response(self, success, result, wait_dialog, transcription):
-        """Maneja la respuesta del hilo de GPT"""
-        # Cerrar diálogo de espera
-        wait_dialog.accept()
-        
-        if success:
-            # Mostrar diálogo con la respuesta
-            dialog = GptResponseDialog(self, transcription, result)
-            dialog.exec_()
-        else:
-            QMessageBox.critical(self, "Error", f"Error al obtener respuesta de GPT: {result}")
-    
+
+
 def main():
     app = QApplication(sys.argv)
     window = WhisperApp()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
