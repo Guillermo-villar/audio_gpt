@@ -290,8 +290,10 @@ class AudioDeviceSetupDialog(QDialog):
 
     def closeEvent(self, event):
         if self.monitor_thread:
+            # No destruir el QThread si sigue corriendo
             self.monitor_thread.stop()
-            self.monitor_thread = None
+            if self.monitor_thread.wait(2000):
+                self.monitor_thread = None
         super().closeEvent(event)
 
 
@@ -384,12 +386,12 @@ class AudioRecorderThread(QThread):
         self.channels = 2
 
     def _open_stream(self):
-        """Devuelve (read_fn, close_fn). read_fn(n_frames) -> np.float32."""
+        """Devuelve (read_fn, close_fn, channels). read_fn(n) -> np.float32."""
         if self.source == "loopback":
             rec = capture.LoopbackRecorder(samplerate=self.samplerate,
                                            channels=self.channels, block_ms=100)
             rec.start()
-            return (lambda n: rec.read(), rec.close)
+            return (lambda n: rec.read(), rec.close, self.channels)
         if self.source == "vbcable":
             idx = capture.find_device_by_name("cable output")
             if idx is None:
@@ -399,17 +401,20 @@ class AudioRecorderThread(QThread):
             if idx is None:
                 idx = sd.query_devices(kind="input")["index"]
 
-        stream = sd.InputStream(device=idx, channels=self.channels,
+        # Los micros mono no admiten 2 canales: usa los que el dispositivo tenga
+        channels = min(2, sd.query_devices(idx)["max_input_channels"])
+        stream = sd.InputStream(device=idx, channels=channels,
                                 samplerate=self.samplerate)
         stream.start()
         return (lambda n: stream.read(n)[0],
-                lambda: (stream.stop(), stream.close()))
+                lambda: (stream.stop(), stream.close()),
+                channels)
 
     def run(self):
         try:
-            read, close = self._open_stream()
+            read, close, channels = self._open_stream()
             total_frames = int(self.duration * self.samplerate)
-            audio_buffer = np.zeros((0, self.channels), dtype=np.float32)
+            audio_buffer = np.zeros((0, channels), dtype=np.float32)
             frames_recorded = 0
 
             while frames_recorded < total_frames:
@@ -473,8 +478,11 @@ class ContinuousCaptureThread(QThread):
             if idx is None:
                 idx = sd.query_devices(kind="input")["index"]
 
+        # min(2, canales del dispositivo): los micros mono no admiten estéreo
+        channels = min(2, sd.query_devices(idx)["max_input_channels"])
+
         def gen():
-            stream = sd.InputStream(device=idx, channels=self.channels,
+            stream = sd.InputStream(device=idx, channels=channels,
                                     samplerate=self.samplerate,
                                     blocksize=int(self.samplerate * 0.1))
             stream.start()
@@ -622,6 +630,7 @@ class WhisperApp(QMainWindow):
         self.realtime = None
         self.is_continuous_mode = False
         self._gpt_threads = []
+        self._dying_threads = []
 
         self.init_ui()
         self.realtime_text.connect(self._append_transcript)
@@ -1023,16 +1032,28 @@ class WhisperApp(QMainWindow):
         if is_final:
             self._on_new_segment(text)
 
+    def _retire_thread(self, thread):
+        """Detiene un QThread sin destruirlo mientras siga corriendo.
+
+        wait() con cota; si no termina, se retiene la referencia hasta su
+        señal finished para que Qt no lo destruya en ejecución (crash).
+        """
+        if thread is None:
+            return
+        thread.stop()
+        if not thread.wait(3000):
+            self._dying_threads.append(thread)
+            thread.finished.connect(
+                lambda t=thread: self._dying_threads.remove(t))
+
     def stop_continuous_mode(self):
-        if self.capture_thread:
-            self.capture_thread.stop()
-            self.capture_thread = None
+        self._retire_thread(self.capture_thread)
+        self.capture_thread = None
         if self.realtime:
             self.realtime.stop()
             self.realtime = None
-        if self.transcription_worker:
-            self.transcription_worker.stop()
-            self.transcription_worker = None
+        self._retire_thread(self.transcription_worker)
+        self.transcription_worker = None
 
         self._set_controls_enabled(True)
         self.continuous_button.setText("INICIAR TRANSCRIPCIÓN CONTINUA")
@@ -1145,14 +1166,16 @@ class WhisperApp(QMainWindow):
         wait_dialog.setStandardButtons(QMessageBox.NoButton)
         wait_dialog.setIcon(QMessageBox.Information)
 
-        self.gpt_thread = GptQueryThread(self.api_key, transcription)
+        self.gpt_thread = GptQueryThread(gpt_key, transcription)
         self.gpt_thread.query_complete.connect(
             lambda ok, res: self._handle_gpt_response(ok, res, wait_dialog, transcription))
         wait_dialog.show()
+        self.send_to_gpt_button.setEnabled(False)   # evita reemplazar el hilo en curso
         self.gpt_thread.start()
 
     def _handle_gpt_response(self, success, result, wait_dialog, transcription):
         wait_dialog.accept()
+        self.send_to_gpt_button.setEnabled(True)
         if success:
             existing = self.gpt_output.toPlainText()
             self.gpt_output.setPlainText(
@@ -1165,12 +1188,10 @@ class WhisperApp(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            if self.capture_thread:
-                self.capture_thread.stop()
+            self._retire_thread(self.capture_thread)
             if self.realtime:
                 self.realtime.stop()
-            if self.transcription_worker:
-                self.transcription_worker.stop()
+            self._retire_thread(self.transcription_worker)
 
             temp_dir = os.path.join(os.getcwd(), "temp_audio")
             if os.path.exists(temp_dir):

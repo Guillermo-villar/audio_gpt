@@ -183,6 +183,7 @@ class RealtimeTranscriber:
         self._ws = None
         self._recv_thread = None
         self._running = False
+        self._final_event = threading.Event()
 
     def start(self):
         import websocket  # websocket-client
@@ -248,6 +249,7 @@ class RealtimeTranscriber:
                     self.on_transcript(event.get("delta", ""), False)
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     self.on_transcript(event.get("transcript", ""), True)
+                    self._final_event.set()
                 elif etype == "error":
                     self.on_error(json.dumps(event.get("error", event)))
                 elif etype in ("input_audio_buffer.speech_started",
@@ -259,13 +261,18 @@ class RealtimeTranscriber:
                 self.on_error(str(e))
 
     def stop(self):
-        self._running = False
+        """Commit el audio pendiente y espera a la última transcripción."""
         try:
             if self._ws is not None:
+                self._final_event.clear()
                 self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                # Espera acotada a que llegue el último turno transcrito
+                self._final_event.wait(1.5)
+                self._running = False
                 self._ws.close()
         except Exception:
             pass
+        self._running = False
         self._ws = None
 
 

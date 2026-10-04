@@ -89,6 +89,7 @@ class VadSegmenter:
         self._pending = b""        # bytes PCM16 aún no agrupados en frames
         self._ring = []            # frames previos al inicio del habla
         self._current = []         # frames del segmento en curso
+        self._voiced = 0           # frames con voz dentro del segmento
         self._silence_run = 0      # frames de silencio consecutivos
 
     def _frames_from_pending(self):
@@ -118,11 +119,16 @@ class VadSegmenter:
                 self._silence_run += 1
             else:
                 self._silence_run = 0
+                self._voiced += 1
 
             if self._silence_run >= self.trailing_frames or len(self._current) >= self.max_frames:
                 segment = b"".join(self._current)
+                enough_voice = self._voiced >= self.min_frames
                 self._current = []
+                self._voiced = 0
                 self._silence_run = 0
+                if not enough_voice:
+                    return None  # ruido corto: no vale una llamada API
                 return np.frombuffer(segment, dtype=np.int16).astype(np.float32) / 32768.0
             return None
 
@@ -136,19 +142,21 @@ class VadSegmenter:
             # contexto previo incluido.
             self._current = self._ring[:]
             self._ring = []
+            self._voiced = 1
             self._silence_run = 0
         return None
 
     def flush(self):
-        """Devuelve el segmento en curso (si tiene duración suficiente)."""
+        """Devuelve el segmento en curso (si tiene suficiente voz)."""
         segments = []
-        if len(self._current) >= self.min_frames:
+        if self._voiced >= self.min_frames:
             segment = b"".join(self._current)
             segments.append(
                 np.frombuffer(segment, dtype=np.int16).astype(np.float32) / 32768.0
             )
         self._current = []
         self._ring = []
+        self._voiced = 0
         self._silence_run = 0
         self._pending = b""
         return segments
