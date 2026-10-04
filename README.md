@@ -47,10 +47,10 @@ GROQ_API_KEY=gsk_...        # solo si usas Groq
 python main.py
 ```
 
-1. **Fuente**: «Audio del sistema (loopback WASAPI)» — graba lo que suena sin tocar la configuración de Windows. Alternativas: micrófono o VB-Cable.
-2. **Proveedor/modelo**: OpenAI `gpt-4o-transcribe` recomendado; `…-diarize` para reuniones con varios hablantes; *Realtime* para latencia mínima; *Groq* o *local* para gastar (casi) nada.
+1. **Fuente**: «Audio del sistema (loopback WASAPI)» — graba lo que suena sin tocar la configuración de Windows. Alternativas: micrófono, **«Loopback + micro (2 carriles)»** — captura dos canales independientes y etiqueta `Entrevistador:` (loopback) y `Tú:` (micro) como hace Granola — o VB-Cable.
+2. **Proveedor/modelo**: OpenAI `gpt-4o-transcribe` recomendado; `…-diarize` para reuniones con varios hablantes; *Realtime* (`gpt-live-transcribe`, el modelo más reciente y de menor latencia — usa VAD en cliente) para latencia mínima; *Groq* o *local* para gastar (casi) nada. El modo dúo funciona con OpenAI/Groq/local (no con Realtime).
 3. Pulsa **INICIAR TRANSCRIPCIÓN CONTINUA**. La VAD detecta la voz y cada fragmento se transcribe y aparece en pantalla.
-4. Activa **«Responder con GPT automáticamente»** para que cada fragmento pase por GPT y las respuestas aparezcan en el panel inferior.
+4. Activa **«Responder con GPT automáticamente»** para que cada fragmento pase por GPT y las respuestas aparezcan en el panel inferior. El motor puede ser *API OpenAI* o *Codex CLI (ChatGPT sub)* — este último gasta la cuota de tu suscripción en vez de la API (requiere `npm i -g @openai/codex` + `codex login`).
 5. **Grabar** (duración fija) + **Transcribir grabación** sigue disponible para uso puntual.
 
 ## 📁 Estructura

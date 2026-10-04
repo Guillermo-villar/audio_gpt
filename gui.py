@@ -450,7 +450,7 @@ class ContinuousCaptureThread(QThread):
     """Captura continua: emite nivel y segmentos de habla (o alimenta realtime)."""
 
     update_level = Signal(float)
-    segment_ready = Signal(str)         # path wav a transcribir (modo archivo)
+    segment_ready = Signal(str, str)    # (path wav, carril) — "" en modo simple
     status_update = Signal(str)
     error_occurred = Signal(str)
 
@@ -465,11 +465,8 @@ class ContinuousCaptureThread(QThread):
         self.temp_dir = os.path.join(os.getcwd(), "temp_audio")
         os.makedirs(self.temp_dir, exist_ok=True)
 
-    def _blocks(self):
-        if self.source == "loopback":
-            rec = capture.LoopbackRecorder(samplerate=self.samplerate,
-                                           channels=self.channels, block_ms=100)
-            return rec.blocks(running=lambda: self.running)
+    def _input_gen(self):
+        """Generador de bloques del dispositivo de entrada (micro/VB-Cable)."""
         if self.source == "vbcable":
             idx = capture.find_device_by_name("cable output")
             if idx is None:
@@ -495,37 +492,76 @@ class ContinuousCaptureThread(QThread):
                 stream.close()
         return gen()
 
+    def _lanes(self):
+        """Devuelve [(nombre_carril, generador)] — separación por canal estilo
+        Granola: loopback = «ellos», micro = «tú». Un solo carril sin nombre
+        en las fuentes simples."""
+        if self.source in ("loopback", "duo"):
+            rec = capture.LoopbackRecorder(samplerate=self.samplerate,
+                                           channels=self.channels, block_ms=100)
+            them = rec.blocks(running=lambda: self.running)
+            if self.source == "loopback":
+                return [("", them)]
+            # modo dúo: carril «ellos» (loopback) + carril «tú» (micro)
+            return [("Entrevistador", them), ("Tú", self._input_gen())]
+        return [("", self._input_gen())]
+
     def run(self):
         try:
             self.running = True
             self.status_update.emit("Capturando audio...")
-            segmenter = None if self.realtime else vad.VadSegmenter(
-                sample_rate=vad.VAD_SAMPLE_RATE
+            # commit_driven: gpt-live-transcribe no tiene VAD en servidor, así
+            # que el segmentador local dispara input_audio_buffer.commit
+            commit_driven = (self.realtime is not None
+                             and getattr(self.realtime, "model", "") == "gpt-live-transcribe")
+            need_vad = self.realtime is None or commit_driven
+
+            lanes = self._lanes()
+            segmenters = (
+                {name: vad.VadSegmenter(sample_rate=vad.VAD_SAMPLE_RATE)
+                 for name, _ in lanes}
+                if need_vad else {}
             )
 
-            for block in self._blocks():
-                if not self.running:
-                    break
-                block = np.asarray(block, dtype=np.float32)
-                level = float(np.linalg.norm(block) / np.sqrt(max(len(block), 1)))
-                self.update_level.emit(level)
+            while self.running:
+                for name, gen in lanes:
+                    try:
+                        block = next(gen)
+                    except StopIteration:
+                        continue
+                    if not self.running:
+                        break
+                    block = np.asarray(block, dtype=np.float32)
+                    level = float(np.linalg.norm(block) / np.sqrt(max(len(block), 1)))
+                    self.update_level.emit(level)
 
-                if self.realtime is not None:
-                    self.realtime.send_audio(
-                        transcriber.pcm16_for_realtime(block, self.samplerate)
-                    )
-                else:
-                    audio16 = vad.resample_linear(block, self.samplerate, vad.VAD_SAMPLE_RATE)
-                    for segment in segmenter.push(audio16):
-                        path = os.path.join(self.temp_dir, f"seg_{uuid.uuid4().hex}.wav")
-                        sf.write(path, segment, vad.VAD_SAMPLE_RATE)
-                        self.segment_ready.emit(path)
+                    if self.realtime is not None:
+                        self.realtime.send_audio(
+                            transcriber.pcm16_for_realtime(block, self.samplerate)
+                        )
+                        if commit_driven:
+                            audio16 = vad.resample_linear(
+                                block, self.samplerate, vad.VAD_SAMPLE_RATE)
+                            for _ in segmenters[name].push(audio16):
+                                self.realtime.commit()
+                    else:
+                        audio16 = vad.resample_linear(
+                            block, self.samplerate, vad.VAD_SAMPLE_RATE)
+                        for segment in segmenters[name].push(audio16):
+                            path = os.path.join(
+                                self.temp_dir, f"seg_{uuid.uuid4().hex}.wav")
+                            sf.write(path, segment, vad.VAD_SAMPLE_RATE)
+                            self.segment_ready.emit(path, name)
 
-            if segmenter is not None:
+            for name, segmenter in segmenters.items():
                 for segment in segmenter.flush():
-                    path = os.path.join(self.temp_dir, f"seg_{uuid.uuid4().hex}.wav")
-                    sf.write(path, segment, vad.VAD_SAMPLE_RATE)
-                    self.segment_ready.emit(path)
+                    if self.realtime is not None:
+                        self.realtime.commit()
+                    else:
+                        path = os.path.join(
+                            self.temp_dir, f"seg_{uuid.uuid4().hex}.wav")
+                        sf.write(path, segment, vad.VAD_SAMPLE_RATE)
+                        self.segment_ready.emit(path, name)
 
             self.status_update.emit("Captura detenida")
         except Exception as e:
@@ -539,7 +575,7 @@ class ContinuousCaptureThread(QThread):
 class AudioTranscriptionWorker(QThread):
     """Consume archivos de la cola y los transcribe con el proveedor elegido."""
 
-    update_transcription = Signal(str)
+    update_transcription = Signal(str, str)   # (texto, carril)
     status_update = Signal(str)
     error_occurred = Signal(str)
 
@@ -556,8 +592,8 @@ class AudioTranscriptionWorker(QThread):
         self.full_transcription = ""
         self.mutex = QMutex()
 
-    def enqueue_file(self, filename):
-        self.file_queue.put(filename)
+    def enqueue_file(self, filename, lane=""):
+        self.file_queue.put((filename, lane))
 
     def run(self):
         self.running = True
@@ -566,7 +602,7 @@ class AudioTranscriptionWorker(QThread):
         while self.running:
             try:
                 try:
-                    filename = self.file_queue.get(timeout=0.5)
+                    filename, lane = self.file_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
 
@@ -584,7 +620,7 @@ class AudioTranscriptionWorker(QThread):
                             f"{self.full_transcription}\n{text}" if self.full_transcription else text
                         )
                         self.mutex.unlock()
-                        self.update_transcription.emit(text)   # emitimos el fragmento nuevo
+                        self.update_transcription.emit(text, lane)  # fragmento nuevo
                         self.status_update.emit(f"+{len(text)} caracteres")
                 except Exception as e:
                     self.error_occurred.emit(f"Error al transcribir: {e}")
@@ -615,6 +651,7 @@ class WhisperApp(QMainWindow):
     CAPTURE_SOURCES = [
         ("loopback", "Audio del sistema (loopback WASAPI)"),
         ("input", "Micrófono / dispositivo de entrada"),
+        ("duo", "Loopback + micro (2 carriles: entrevistador / tú)"),
         ("vbcable", "VB-Cable (legacy)"),
     ]
 
@@ -975,7 +1012,14 @@ class WhisperApp(QMainWindow):
             return
 
         source = self._current_source()
-        if source == "loopback" and not capture.loopback_available():
+        if source == "duo" and provider == "openai-realtime":
+            QMessageBox.warning(
+                self, "Error",
+                "El modo dúo (2 carriles) aún no está soportado con Realtime. "
+                "Usa OpenAI, Groq o Local."
+            )
+            return
+        if source in ("loopback", "duo") and not capture.loopback_available():
             QMessageBox.warning(
                 self, "Error",
                 "El loopback WASAPI no está disponible. Prueba con micrófono o VB-Cable."
@@ -1095,18 +1139,20 @@ class WhisperApp(QMainWindow):
             )
             return False
 
-    def _on_new_segment(self, text):
+    def _on_new_segment(self, text, lane=""):
         """Llamado con cada fragmento nuevo transcrito (modo continuo)."""
+        display = f"{lane}: {text}" if lane else text
         current = self.transcription_output.toPlainText()
         self.transcription_output.setPlainText(
-            f"{current}\n{text}" if current else text)
+            f"{current}\n{display}" if current else display)
         cursor = self.transcription_output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.transcription_output.setTextCursor(cursor)
 
         if self.auto_gpt_checkbox.isChecked() and text.strip():
+            gpt_input = display  # la etiqueta de carril da contexto a GPT
             if self.gpt_engine_combo.currentData() == "codex":
-                thread = CodexCliThread(text)
+                thread = CodexCliThread(gpt_input)
             else:
                 gpt_key = ApiKeyManager.load_api_key("openai")
                 if not gpt_key:
@@ -1114,7 +1160,7 @@ class WhisperApp(QMainWindow):
                         "Auto-GPT necesita una API key de OpenAI (botón «API key…»)"
                     )
                     return
-                thread = GptQueryThread(gpt_key, text)
+                thread = GptQueryThread(gpt_key, gpt_input)
             self._gpt_threads.append(thread)
             thread.query_complete.connect(self._on_auto_gpt_result)
             thread.query_complete.connect(

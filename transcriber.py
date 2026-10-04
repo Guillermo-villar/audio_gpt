@@ -205,7 +205,12 @@ class RealtimeTranscriber:
             turn_detection = None  # este modelo no admite server_vad
 
         transcription = {"model": self.model}
-        if self.language:
+        if self.model == "gpt-live-transcribe":
+            # live usa `languages` (array) y admite delay bajo; no `language`
+            if self.language:
+                transcription["languages"] = [self.language]
+            transcription["delay"] = "low"
+        elif self.language:
             transcription["language"] = self.language
         if self.prompt and self.model != "gpt-4o-transcribe-diarize":
             transcription["prompt"] = self.prompt
