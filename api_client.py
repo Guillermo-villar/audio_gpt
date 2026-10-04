@@ -8,6 +8,9 @@ Cambios respecto a la versión original:
 
 import os
 import json
+import shutil
+import subprocess
+import tempfile
 
 from dotenv import load_dotenv
 from PySide6.QtCore import QThread, Signal
@@ -110,7 +113,7 @@ class WhisperService:
 
 
 DEFAULT_GPT_CONFIG = {
-    "model": "gpt-6-luna",
+    "model": "gpt-5.4-mini",   # mejor equilibrio velocidad/razonamiento (EXA 2026)
     "system_prompt": (
         "Eres un asistente virtual experto que ayuda a los usuarios a responder "
         "preguntas sobre conceptos técnicos y resolver problemas de programación "
@@ -229,3 +232,82 @@ class GptQueryThread(QThread):
     def run(self):
         success, result = GptClient.send_to_gpt(self.api_key, self.transcription)
         self.query_complete.emit(success, result)
+
+
+# El modelo con más margen de uso en los planes ChatGPT (Plus: ~350-3000
+# mensajes locales / 5 h, mucho más que Sol o Astra). gpt-5.4-mini también está
+# disponible en Codex al ~30 % de cuota si se prefiere.
+CODEX_MODEL = "gpt-6-luna"
+
+
+def codex_available():
+    """True si la CLI de Codex está instalada y en el PATH."""
+    return shutil.which("codex") is not None
+
+
+class CodexCliThread(QThread):
+    """Consulta GPT a través de `codex exec` (CLI incluida en ChatGPT Plus/Pro).
+
+    Requiere `npm i -g @openai/codex` y `codex login` con la cuenta ChatGPT.
+    Las peticiones consumen la cuota de la suscripción, no créditos de API.
+    """
+
+    query_complete = Signal(bool, str)
+
+    def __init__(self, transcription, model=CODEX_MODEL):
+        super().__init__()
+        self.transcription = transcription
+        self.model = model
+
+    def run(self):
+        exe = shutil.which("codex")
+        if not exe:
+            self.query_complete.emit(
+                False,
+                "No se encontró la CLI de Codex. Instálala con "
+                "«npm i -g @openai/codex» y entra con «codex login» usando tu "
+                "cuenta de ChatGPT."
+            )
+            return
+
+        config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+        prompt = (
+            config.get("system_prompt", "Eres un asistente útil.")
+            + "\n\nTranscription: " + self.transcription
+        )
+
+        out_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    suffix=".txt", delete=False) as tf:
+                out_path = tf.name
+            proc = subprocess.run(
+                [exe, "exec", "--skip-git-repo-check",
+                 "--sandbox", "read-only",            # nunca edita archivos
+                 "--output-last-message", out_path,   # solo la respuesta final
+                 "-m", self.model, prompt],
+                capture_output=True, text=True, timeout=300,
+                encoding="utf-8", errors="replace",
+            )
+        except Exception as e:
+            self.query_complete.emit(False, f"Codex CLI: {e}")
+            return
+
+        answer = ""
+        if out_path and os.path.exists(out_path):
+            try:
+                with open(out_path, "r", encoding="utf-8") as f:
+                    answer = f.read().strip()
+            finally:
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
+
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            self.query_complete.emit(
+                False, f"Codex CLI (exit {proc.returncode}): {detail}")
+            return
+        self.query_complete.emit(
+            True, answer or proc.stdout.strip() or "(Codex no devolvió texto)")

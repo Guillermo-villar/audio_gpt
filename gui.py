@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
 )
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex
-from PySide6.QtGui import QPainter, QColor, QPen, QFont
+from PySide6.QtGui import QPainter, QColor, QPen, QFont, QTextCursor
 
 import numpy as np
 import sounddevice as sd
@@ -34,6 +34,7 @@ import transcriber
 import vad
 from api_client import (
     ApiKeyManager, TranscriptionThread, WhisperService, GptQueryThread,
+    CodexCliThread,
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -772,6 +773,14 @@ class WhisperApp(QMainWindow):
         text_buttons.addWidget(self.save_button)
         text_buttons.addWidget(self.clear_button)
         text_buttons.addStretch()
+        self.gpt_engine_combo = QComboBox()
+        self.gpt_engine_combo.addItem("API OpenAI", "openai")
+        self.gpt_engine_combo.addItem("Codex CLI (ChatGPT sub)", "codex")
+        self.gpt_engine_combo.setToolTip(
+            "API OpenAI: pago por uso (necesita API key). "
+            "Codex CLI: usa tu suscripción ChatGPT (necesita codex instalado)."
+        )
+        text_buttons.addWidget(self.gpt_engine_combo)
         text_buttons.addWidget(self.send_to_gpt_button)
         out_layout.addLayout(text_buttons)
         bottom_layout.addWidget(out_group)
@@ -824,6 +833,11 @@ class WhisperApp(QMainWindow):
             idx = self.source_selector.findData(source)
             if idx >= 0:
                 self.source_selector.setCurrentIndex(idx)
+        engine = s.get("gpt_engine")
+        if engine:
+            idx = self.gpt_engine_combo.findData(engine)
+            if idx >= 0:
+                self.gpt_engine_combo.setCurrentIndex(idx)
 
     def _persist_settings(self):
         _save_settings({
@@ -831,6 +845,7 @@ class WhisperApp(QMainWindow):
             "model": self.model_selector.currentData(),
             "language": self.language_selector.currentData(),
             "source": self.source_selector.currentData(),
+            "gpt_engine": self.gpt_engine_combo.currentData(),
         })
 
     # ------------------------- proveedor / api key -------------------------
@@ -1086,17 +1101,20 @@ class WhisperApp(QMainWindow):
         self.transcription_output.setPlainText(
             f"{current}\n{text}" if current else text)
         cursor = self.transcription_output.textCursor()
-        cursor.movePosition(cursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         self.transcription_output.setTextCursor(cursor)
 
         if self.auto_gpt_checkbox.isChecked() and text.strip():
-            gpt_key = ApiKeyManager.load_api_key("openai")
-            if not gpt_key:
-                self.status_bar.showMessage(
-                    "Auto-GPT necesita una API key de OpenAI (botón «API key…»)"
-                )
-                return
-            thread = GptQueryThread(gpt_key, text)
+            if self.gpt_engine_combo.currentData() == "codex":
+                thread = CodexCliThread(text)
+            else:
+                gpt_key = ApiKeyManager.load_api_key("openai")
+                if not gpt_key:
+                    self.status_bar.showMessage(
+                        "Auto-GPT necesita una API key de OpenAI (botón «API key…»)"
+                    )
+                    return
+                thread = GptQueryThread(gpt_key, text)
             self._gpt_threads.append(thread)
             thread.query_complete.connect(self._on_auto_gpt_result)
             thread.query_complete.connect(
@@ -1108,14 +1126,16 @@ class WhisperApp(QMainWindow):
             existing = self.gpt_output.toPlainText()
             self.gpt_output.setPlainText(f"{existing}\n\n{result}" if existing else result)
             cursor = self.gpt_output.textCursor()
-            cursor.movePosition(cursor.End)
+            cursor.movePosition(QTextCursor.MoveOperation.End)
             self.gpt_output.setTextCursor(cursor)
         else:
             self.status_bar.showMessage(f"GPT: {result}")
 
     def handle_continuous_error(self, error_msg):
+        if not self.is_continuous_mode:
+            return  # coalesce: errores en vuelo tras la primera parada
+        self.stop_continuous_mode()       # detener antes de abrir el modal
         QMessageBox.warning(self, "Error", error_msg)
-        self.stop_continuous_mode()
 
     # ------------------------- texto / gpt manual -------------------------
 
@@ -1151,14 +1171,19 @@ class WhisperApp(QMainWindow):
         if not transcription:
             QMessageBox.warning(self, "Advertencia", "No hay texto para enviar a GPT")
             return
-        gpt_key = ApiKeyManager.load_api_key("openai")
-        if not gpt_key:
-            QMessageBox.warning(
-                self, "Error",
-                "GPT usa la API de OpenAI: configura una API key con «API key…» "
-                "seleccionando el proveedor OpenAI."
-            )
-            return
+
+        if self.gpt_engine_combo.currentData() == "codex":
+            thread = CodexCliThread(transcription)
+        else:
+            gpt_key = ApiKeyManager.load_api_key("openai")
+            if not gpt_key:
+                QMessageBox.warning(
+                    self, "Error",
+                    "GPT usa la API de OpenAI: configura una API key con «API key…» "
+                    "seleccionando el proveedor OpenAI."
+                )
+                return
+            thread = GptQueryThread(gpt_key, transcription)
 
         wait_dialog = QMessageBox(self)
         wait_dialog.setWindowTitle("Procesando")
@@ -1166,7 +1191,7 @@ class WhisperApp(QMainWindow):
         wait_dialog.setStandardButtons(QMessageBox.NoButton)
         wait_dialog.setIcon(QMessageBox.Information)
 
-        self.gpt_thread = GptQueryThread(gpt_key, transcription)
+        self.gpt_thread = thread
         self.gpt_thread.query_complete.connect(
             lambda ok, res: self._handle_gpt_response(ok, res, wait_dialog, transcription))
         wait_dialog.show()
