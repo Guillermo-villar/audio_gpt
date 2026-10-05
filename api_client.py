@@ -226,7 +226,7 @@ class GptClient:
 
     @staticmethod
     def send_to_gpt(api_key, transcription, engine="openai", context="",
-                    effort=None, max_tokens=None):
+                    effort=None, max_tokens=None, brief=""):
         """Envía la transcripción a GPT y devuelve (ok, respuesta_o_error).
 
         engine="cloudflare" usa Workers AI (openai/gpt-6-luna servido por CF,
@@ -265,14 +265,17 @@ class GptClient:
             model = config.get("model", DEFAULT_GPT_CONFIG["model"])
 
         instructions = config.get("system_prompt", "Eres un asistente útil.")
-        if context and "Contexto de la entrevista:" in context:
+        if brief:
+            # El brief es identidad/política (system), no contenido (input):
+            # experiencia aprobada + límites explícitos contra fabricación.
             instructions += (
-                "\n\nEl «Contexto de la entrevista» describe la experiencia "
-                "APROBADA del candidato: úsala para adaptar la respuesta, pero "
-                "nunca conviertas requisitos del puesto ni notas de empresa en "
-                "experiencia del candidato ni inventes métricas o historias que "
-                "el brief no respalde; ante falta de evidencia, responde en "
-                "hipotético."
+                "\n\nContexto de la entrevista — experiencia APROBADA del "
+                "candidato y límites; úsala para adaptar cada respuesta:\n"
+                + brief +
+                "\nNunca conviertas requisitos del puesto ni notas de empresa "
+                "en experiencia del candidato ni inventes métricas o historias "
+                "que el brief no respalde; ante falta de evidencia, responde "
+                "en hipotético."
             )
 
         if context:
@@ -343,7 +346,7 @@ class GptQueryThread(QThread):
     query_complete = Signal(bool, str)
 
     def __init__(self, api_key, transcription, engine="openai", context="",
-                 effort=None, max_tokens=None):
+                 effort=None, max_tokens=None, brief=""):
         super().__init__()
         self.api_key = api_key
         self.transcription = transcription
@@ -351,12 +354,13 @@ class GptQueryThread(QThread):
         self.context = context
         self.effort = effort
         self.max_tokens = max_tokens
+        self.brief = brief
 
     def run(self):
         success, result = GptClient.send_to_gpt(
             self.api_key, self.transcription, engine=self.engine,
             context=self.context, effort=self.effort,
-            max_tokens=self.max_tokens)
+            max_tokens=self.max_tokens, brief=self.brief)
         self.query_complete.emit(success, result)
 
 
@@ -380,11 +384,13 @@ class CodexCliThread(QThread):
 
     query_complete = Signal(bool, str)
 
-    def __init__(self, transcription, model=CODEX_MODEL, context=""):
+    def __init__(self, transcription, model=CODEX_MODEL, context="",
+                 brief=""):
         super().__init__()
         self.transcription = transcription
         self.model = model
         self.context = context
+        self.brief = brief
 
     def run(self):
         exe = shutil.which("codex")
@@ -399,14 +405,15 @@ class CodexCliThread(QThread):
 
         config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
         prompt = config.get("system_prompt", "Eres un asistente útil.")
-        if self.context and "Contexto de la entrevista:" in self.context:
+        if self.brief:
             prompt += (
-                "\n\nEl «Contexto de la entrevista» describe la experiencia "
-                "APROBADA del candidato: úsala para adaptar la respuesta, pero "
-                "nunca conviertas requisitos del puesto ni notas de empresa en "
-                "experiencia del candidato ni inventes métricas o historias que "
-                "el brief no respalde; ante falta de evidencia, responde en "
-                "hipotético."
+                "\n\nContexto de la entrevista — experiencia APROBADA del "
+                "candidato y límites; úsala para adaptar cada respuesta:\n"
+                + self.brief +
+                "\nNunca conviertas requisitos del puesto ni notas de empresa "
+                "en experiencia del candidato ni inventes métricas o historias "
+                "que el brief no respalde; ante falta de evidencia, responde "
+                "en hipotético."
             )
         if self.context:
             prompt += f"\n\nContexto de la conversación:\n{self.context}"

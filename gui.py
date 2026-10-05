@@ -1271,11 +1271,8 @@ class WhisperApp(QMainWindow):
     def _build_context(self):
         """Contexto por capas: brief pineado + hechos fijados + reciente.
         Generoso a propósito — el input apenas cuesta latencia; lo que no
-        se permite perder: el brief, los fijados y tu última respuesta."""
+        se permite perder: los fijados y tu última respuesta."""
         parts = []
-        brief = self.brief_input.toPlainText().strip()
-        if brief:
-            parts.append("Contexto de la entrevista:\n" + brief)
         if self._pinned:
             parts.append("Hechos fijados:\n" + "\n".join(self._pinned))
         recent = list(self._ctx)[-14:]
@@ -1301,12 +1298,14 @@ class WhisperApp(QMainWindow):
         # revisiones: respuesta completa.
         max_tokens = 200 if kind == "Borrador" else None
 
+        brief = self.brief_input.toPlainText().strip()
         if engine == "codex":
-            thread = CodexCliThread(gpt_input, context=context)
+            thread = CodexCliThread(gpt_input, context=context, brief=brief)
         elif engine == "cloudflare":
             thread = GptQueryThread(
                 None, gpt_input, engine="cloudflare",
-                context=context, effort=effort, max_tokens=max_tokens)
+                context=context, effort=effort, max_tokens=max_tokens,
+                brief=brief)
         else:
             gpt_key = ApiKeyManager.load_api_key("openai")
             if not gpt_key:
@@ -1316,7 +1315,7 @@ class WhisperApp(QMainWindow):
                 return
             thread = GptQueryThread(
                 gpt_key, gpt_input, context=context, effort=effort,
-                max_tokens=max_tokens)
+                max_tokens=max_tokens, brief=brief)
 
         header = f"[{kind}] {gpt_input}" if kind else gpt_input
         self._gpt_threads.append(thread)
@@ -1393,10 +1392,13 @@ class WhisperApp(QMainWindow):
             return
 
         engine = self.gpt_engine_combo.currentData()
+        brief = self.brief_input.toPlainText().strip()
+        context = self._build_context()
         if engine == "codex":
-            thread = CodexCliThread(transcription)
+            thread = CodexCliThread(transcription, context=context, brief=brief)
         elif engine == "cloudflare":
-            thread = GptQueryThread(None, transcription, engine="cloudflare")
+            thread = GptQueryThread(None, transcription, engine="cloudflare",
+                                    context=context, brief=brief)
         else:
             gpt_key = ApiKeyManager.load_api_key("openai")
             if not gpt_key:
@@ -1406,7 +1408,8 @@ class WhisperApp(QMainWindow):
                     "seleccionando el proveedor OpenAI."
                 )
                 return
-            thread = GptQueryThread(gpt_key, transcription)
+            thread = GptQueryThread(gpt_key, transcription,
+                                    context=context, brief=brief)
 
         wait_dialog = QMessageBox(self)
         wait_dialog.setWindowTitle("Procesando")
