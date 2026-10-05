@@ -82,3 +82,18 @@ audio_gpt/
 ## 📄 Licencia
 
 MIT.
+
+## Uso durante la llamada (modo copiloto)
+
+- **Modo compacto** (botón o `Ctrl+Alt+D`): panel semitransparente siempre
+  encima — estado, lo que se oye en vivo y la última respuesta. Anclable
+  sobre cualquier ventana; doble clic para ocultarlo.
+- **Hotkeys globales** (Ctrl+Alt+letra, funcionan con otra app enfocada):
+  `G` responder la última intervención del entrevistador (rescate del gate) ·
+  `D` overlay · `A` auto-GPT on/off · `C` copiar última respuesta ·
+  `T` start/stop transcripción.
+- **Brief de la entrevista**: puesto, empresa, experiencia aprobada y
+  límites — va en el system prompt de cada llamada (nunca fabrica
+  experiencia que el brief no respalde).
+- **Fijar**: selecciona texto del transcript y fíjalo — requisitos y
+  decisiones entran en el contexto permanente.

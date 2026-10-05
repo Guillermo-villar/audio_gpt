@@ -15,6 +15,8 @@ import time
 import queue
 import uuid
 import json
+import html
+import ctypes
 from collections import deque
 
 from PySide6.QtWidgets import (
@@ -24,7 +26,7 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
     QPlainTextEdit,
 )
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex, QTimer
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QTextCursor
 
 import numpy as np
@@ -41,6 +43,114 @@ from api_client import (
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
+
+# Hotkeys globales (Ctrl+Alt+tecla) — vía GetAsyncKeyState, sin permisos
+# de admin ni dependencias. G responder última · D overlay · A auto-GPT ·
+# C copiar respuesta · T start/stop.
+HOTKEYS = {
+    "g": (0x47, "answer_last", "responder última intervención"),
+    "d": (0x44, "toggle_compact", "modo compacto"),
+    "a": (0x41, "toggle_auto", "auto-GPT on/off"),
+    "c": (0x43, "copy_answer", "copiar última respuesta"),
+    "t": (0x54, "toggle_capture", "start/stop transcripción"),
+}
+VK_CTRL, VK_ALT = 0x11, 0x12
+
+
+def _combo_pressed(letter):
+    """True si Ctrl+Alt+letter están pulsados ahora mismo (Windows)."""
+    if sys.platform != "win32":
+        return False
+    vk = HOTKEYS[letter][0]
+    u32 = ctypes.windll.user32
+    return bool(
+        u32.GetAsyncKeyState(VK_CTRL) & 0x8000
+        and u32.GetAsyncKeyState(VK_ALT) & 0x8000
+        and u32.GetAsyncKeyState(vk) & 0x8000
+    )
+
+
+# ---------------------------------------------------------------------------
+# Overlay compacto — ventana anclable encima de todo durante la llamada
+# ---------------------------------------------------------------------------
+
+class CompactOverlay(QWidget):
+    """Mini-panel always-on-top: estado, lo que se está oyendo en vivo y la
+    última respuesta. Arrastrable, semitransparente, sin bordes."""
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.Window | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint,
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(460, 190)
+        self._drag_pos = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        panel = QFrame()
+        panel.setStyleSheet(
+            "QFrame { background: rgba(18,18,22,235); border-radius: 10px; }"
+            "QLabel { color: #e8e8e8; }"
+            "QTextEdit { background: rgba(255,255,255,18); color: #f2f2f2;"
+            "            border: none; border-radius: 6px; }"
+        )
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(10, 8, 10, 8)
+        panel_layout.setSpacing(4)
+
+        self.status_label = QLabel("● en espera")
+        self.status_label.setStyleSheet("color: #9a9a9a; font-size: 11px;")
+        panel_layout.addWidget(self.status_label)
+
+        self.live_label = QLabel("")
+        self.live_label.setWordWrap(True)
+        self.live_label.setStyleSheet("color: #9ecbff; font-size: 12px;")
+        self.live_label.setMaximumHeight(34)
+        panel_layout.addWidget(self.live_label)
+
+        self.answer_box = QTextEdit()
+        self.answer_box.setReadOnly(True)
+        self.answer_box.setPlaceholderText("última respuesta…")
+        panel_layout.addWidget(self.answer_box, 1)
+
+        legend = QLabel("Ctrl+Alt+G responder · D dock · A auto · C copiar · T start/stop")
+        legend.setStyleSheet("color: #777; font-size: 10px;")
+        panel_layout.addWidget(legend)
+
+        root.addWidget(panel)
+
+    def set_listening(self, listening):
+        self.status_label.setText(
+            "● escuchando" if listening else "● en espera")
+        self.status_label.setStyleSheet(
+            f"color: {'#5ee07a' if listening else '#9a9a9a'}; font-size: 11px;")
+
+    def set_live(self, text):
+        self.live_label.setText(text[-180:])
+
+    def set_answer(self, text):
+        self.answer_box.setPlainText(text)
+        cur = self.answer_box.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.Start)
+        self.answer_box.setTextCursor(cur)
+
+    # arrastrar la ventana sin barra de título
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint() - self.pos()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_pos is not None and e.buttons() & Qt.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+    def mouseDoubleClickEvent(self, e):
+        self.hide()                       # doble clic = cerrar overlay
 
 
 def _load_settings():
@@ -680,17 +790,31 @@ class WhisperApp(QMainWindow):
         self._ctx = deque(maxlen=16)      # últimas intervenciones «Carril: texto»
         self._draft_state = {}            # carril -> interim ya respondido
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
+        self._last_answer = ""            # para Ctrl+Alt+C (copiar respuesta)
+        self._hk_prev = set()             # hotkeys actualmente pulsados
 
         self.init_ui()
+        self.overlay = CompactOverlay()
         self.realtime_text.connect(self._append_transcript)
         self.realtime_error.connect(self.handle_continuous_error)
         self._apply_settings()
+
+        # poll de hotkeys globales ~90 ms (nada de hooks de SO ni admin)
+        self._hk_timer = QTimer(self)
+        self._hk_timer.timeout.connect(self._hotkey_tick)
+        self._hk_timer.start(90)
 
     # ------------------------- construcción de UI -------------------------
 
     def init_ui(self):
         self.setWindowTitle("audio_gpt — Transcriptor y asistente")
         self.setGeometry(100, 100, 980, 760)
+        self.setStyleSheet(
+            "QTextEdit, QPlainTextEdit { background: #ffffff; color: #1a1a1a;"
+            "   border: 1px solid #c9c9c9; border-radius: 6px; }"
+            "QLineEdit, QComboBox, QSpinBox { background: #ffffff;"
+            "   color: #1a1a1a; }"
+        )
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -847,10 +971,17 @@ class WhisperApp(QMainWindow):
         )
         self.send_to_gpt_button.setMinimumHeight(30)
         self.send_to_gpt_button.clicked.connect(self.send_to_gpt)
+        self.compact_button = QPushButton("Modo compacto")
+        self.compact_button.setToolTip(
+            "Panel pequeño siempre encima (Ctrl+Alt+D): estado, lo que se "
+            "oye en vivo y la última respuesta — para tenerlo anclado sobre "
+            "la llamada sin la ventana entera.")
+        self.compact_button.clicked.connect(self.toggle_compact)
         text_buttons.addWidget(self.copy_button)
         text_buttons.addWidget(self.save_button)
         text_buttons.addWidget(self.clear_button)
         text_buttons.addWidget(self.pin_button)
+        text_buttons.addWidget(self.compact_button)
         text_buttons.addStretch()
         self.gpt_engine_combo = QComboBox()
         self.gpt_engine_combo.addItem("API OpenAI", "openai")
@@ -1110,6 +1241,7 @@ class WhisperApp(QMainWindow):
             self.capture_thread.start()
 
         self.is_continuous_mode = True
+        self.overlay.set_listening(True)
         self.status_bar.showMessage("Transcripción continua iniciada")
 
     def _start_realtime(self, language, model):
@@ -1168,8 +1300,57 @@ class WhisperApp(QMainWindow):
         self.capture_thread.start()
         return True
 
+    # ------------------------- hotkeys globales / overlay ------------------
+
+    def _hotkey_tick(self):
+        """Detecta flancos de subida de cada Ctrl+Alt+tecla y despacha."""
+        for letter, (_, action, _) in HOTKEYS.items():
+            down = _combo_pressed(letter)
+            if down and letter not in self._hk_prev:
+                self._hk_prev.add(letter)
+                getattr(self, "_hk_" + action)()
+            elif not down:
+                self._hk_prev.discard(letter)
+
+    def _hk_answer_last(self):
+        """Rescate: responder la última intervención del entrevistador aunque
+        el gate no la haya pillado."""
+        last = next((x for x in reversed(self._ctx)
+                     if not x.startswith("Tú:")), None)
+        if not last:
+            self.status_bar.showMessage("Nada que responder todavía")
+            return
+        text = last.split(":", 1)[1].strip() if ":" in last else last
+        self._fire_gpt(text, "Entrevistador", kind="Manual",
+                       effort=self._review_effort("medium"))
+
+    def _hk_toggle_compact(self):
+        self.toggle_compact()
+
+    def _hk_toggle_auto(self):
+        self.auto_gpt_checkbox.toggle()
+        self.status_bar.showMessage(
+            f"Auto-GPT {'ON' if self.auto_gpt_checkbox.isChecked() else 'OFF'}")
+
+    def _hk_copy_answer(self):
+        if self._last_answer:
+            QApplication.clipboard().setText(self._last_answer)
+            self.status_bar.showMessage("Última respuesta copiada")
+
+    def _hk_toggle_capture(self):
+        self.toggle_continuous_mode()
+
+    def toggle_compact(self):
+        if self.overlay.isVisible():
+            self.overlay.hide()
+        else:
+            self.overlay.set_listening(self.is_continuous_mode)
+            self.overlay.show()
+
     @Slot(str, bool, str)
     def _append_transcript(self, text, is_final, lane=""):
+        tag = f"{lane}: " if lane else ""
+        self.overlay.set_live(f"{tag}{text}")
         if is_final:
             self._draft_state.pop(lane, None)   # turno cerrado: próximo borrador
             self._on_new_segment(text, lane)
@@ -1215,6 +1396,7 @@ class WhisperApp(QMainWindow):
         self.continuous_button.setText("INICIAR TRANSCRIPCIÓN CONTINUA")
         self._style_continuous_button(start=True)
         self.is_continuous_mode = False
+        self.overlay.set_listening(False)
         self.status_bar.showMessage("Transcripción continua detenida")
 
     def _set_controls_enabled(self, enabled):
@@ -1239,12 +1421,13 @@ class WhisperApp(QMainWindow):
     def _on_new_segment(self, text, lane=""):
         """Llamado con cada fragmento nuevo transcrito (modo continuo)."""
         display = f"{lane}: {text}" if lane else text
-        current = self.transcription_output.toPlainText()
-        self.transcription_output.setPlainText(
-            f"{current}\n{display}" if current else display)
-        cursor = self.transcription_output.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.transcription_output.setTextCursor(cursor)
+        if lane:
+            color = "#1a56db" if lane == "Entrevistador" else "#0f7a3d"
+            self.transcription_output.append(
+                f'<b style="color:{color}">{html.escape(lane)}:</b> '
+                f'{html.escape(text)}')
+        else:
+            self.transcription_output.append(html.escape(text))
 
         if not text.strip():
             return
@@ -1327,12 +1510,11 @@ class WhisperApp(QMainWindow):
 
     def _on_auto_gpt_result(self, success, result, header=""):
         if success:
-            existing = self.gpt_output.toPlainText()
+            self._last_answer = result
             block = f"{header}\n{result}" if header else result
-            self.gpt_output.setPlainText(f"{existing}\n\n{block}" if existing else block)
-            cursor = self.gpt_output.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self.gpt_output.setTextCursor(cursor)
+            self.gpt_output.append(block)
+            self.gpt_output.append("")
+            self.overlay.set_answer(block)
         else:
             self.status_bar.showMessage(f"GPT: {result}")
 
@@ -1355,8 +1537,13 @@ class WhisperApp(QMainWindow):
         if not text:
             QMessageBox.warning(self, "Advertencia", "No hay texto para guardar")
             return
+        # Default sensato: transcripts/transcripcion_YYYYmmdd_HHMMSS.txt
+        os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+        default = os.path.join(
+            TRANSCRIPTS_DIR,
+            "transcripcion_" + time.strftime("%Y%m%d_%H%M%S") + ".txt")
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Guardar transcripción", "",
+            self, "Guardar transcripción", default,
             "Archivos de texto (*.txt);;Todos los archivos (*)")
         if filename:
             try:
