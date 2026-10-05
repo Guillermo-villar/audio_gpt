@@ -140,6 +140,7 @@ DEFAULT_GPT_CONFIG = {
     ),
     "temperature": None,          # los modelos de razonamiento (gpt-5/6) no admiten temperature
     "reasoning_effort": "low",    # respuestas rápidas y baratas; sube a "medium" para más calidad
+    "service_tier": "fast",       # Fast mode (~2.5x menos latencia, ~2x precio); "auto"/"flex" alternativas
     "max_tokens": 2000,
 }
 
@@ -194,15 +195,17 @@ class GptClient:
             kwargs["top_p"] = config["top_p"]
         if config.get("reasoning_effort"):
             kwargs["reasoning"] = {"effort": config["reasoning_effort"]}
+        if config.get("service_tier") and config["service_tier"] != "auto":
+            kwargs["service_tier"] = config["service_tier"]
 
         try:
             response = client.responses.create(**kwargs)
         except BadRequestError as e:
             # Los modelos de razonamiento rechazan temperature/top_p; los no
-            # razonadores pueden rechazar `reasoning`. Reintentar sin ellos.
+            # razonadores pueden rechazar `reasoning`/`service_tier`. Reintentar sin ellos.
             msg = str(e).lower()
             if "unsupported" in msg or "unknown" in msg or "invalid" in msg:
-                for key in ("temperature", "top_p", "reasoning"):
+                for key in ("temperature", "top_p", "reasoning", "service_tier"):
                     kwargs.pop(key, None)
                 try:
                     response = client.responses.create(**kwargs)
