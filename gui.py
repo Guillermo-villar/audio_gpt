@@ -454,11 +454,13 @@ class ContinuousCaptureThread(QThread):
     status_update = Signal(str)
     error_occurred = Signal(str)
 
-    def __init__(self, source="loopback", device_index=None, realtime=None):
+    def __init__(self, source="loopback", device_index=None, realtime=None,
+                 realtimes=None):
         super().__init__()
         self.source = source
         self.device_index = device_index
-        self.realtime = realtime        # RealtimeTranscriber o None
+        self.realtime = realtime        # transcriptor streaming único, o None
+        self.realtimes = realtimes or {}  # {carril: transcriptor} en modo dúo
         self.running = False
         self.samplerate = 48000
         self.channels = 2
@@ -514,7 +516,7 @@ class ContinuousCaptureThread(QThread):
             # que el segmentador local dispara input_audio_buffer.commit
             commit_driven = (self.realtime is not None
                              and getattr(self.realtime, "model", "") == "gpt-live-transcribe")
-            need_vad = self.realtime is None or commit_driven
+            need_vad = (self.realtime is None and not self.realtimes) or commit_driven
 
             lanes = self._lanes()
             segmenters = (
@@ -535,15 +537,17 @@ class ContinuousCaptureThread(QThread):
                     level = float(np.linalg.norm(block) / np.sqrt(max(len(block), 1)))
                     self.update_level.emit(level)
 
-                    if self.realtime is not None:
-                        self.realtime.send_audio(
-                            transcriber.pcm16_for_realtime(block, self.samplerate)
+                    rt = self.realtimes.get(name) or self.realtime
+                    if rt is not None:
+                        rt.send_audio(
+                            transcriber.pcm16_for_realtime(
+                                block, self.samplerate, rt.sample_rate)
                         )
                         if commit_driven:
                             audio16 = vad.resample_linear(
                                 block, self.samplerate, vad.VAD_SAMPLE_RATE)
                             for _ in segmenters[name].push(audio16):
-                                self.realtime.commit()
+                                rt.commit()
                     else:
                         audio16 = vad.resample_linear(
                             block, self.samplerate, vad.VAD_SAMPLE_RATE)
@@ -555,8 +559,9 @@ class ContinuousCaptureThread(QThread):
 
             for name, segmenter in segmenters.items():
                 for segment in segmenter.flush():
-                    if self.realtime is not None:
-                        self.realtime.commit()
+                    rt = self.realtimes.get(name) or self.realtime
+                    if rt is not None:
+                        rt.commit()
                     else:
                         path = os.path.join(
                             self.temp_dir, f"seg_{uuid.uuid4().hex}.wav")
@@ -645,7 +650,7 @@ class AudioTranscriptionWorker(QThread):
 
 class WhisperApp(QMainWindow):
     # Las señales se emiten desde hilos auxiliares y llegan encoladas a la UI.
-    realtime_text = Signal(str, bool)
+    realtime_text = Signal(str, bool, str)   # (texto, final, carril)
     realtime_error = Signal(str)
 
     CAPTURE_SOURCES = [
@@ -666,6 +671,7 @@ class WhisperApp(QMainWindow):
         self.capture_thread = None
         self.transcription_worker = None
         self.realtime = None
+        self.realtimes = {}
         self.is_continuous_mode = False
         self._gpt_threads = []
         self._dying_threads = []
@@ -1015,8 +1021,8 @@ class WhisperApp(QMainWindow):
         if source == "duo" and provider == "openai-realtime":
             QMessageBox.warning(
                 self, "Error",
-                "El modo dúo (2 carriles) aún no está soportado con Realtime. "
-                "Usa OpenAI, Groq o Local."
+                "El modo dúo (2 carriles) aún no está soportado con OpenAI "
+                "Realtime. Usa OpenAI, Groq, Local o Deepgram."
             )
             return
         if source in ("loopback", "duo") and not capture.loopback_available():
@@ -1035,7 +1041,7 @@ class WhisperApp(QMainWindow):
         language = self._current_language()
         model = self._current_model()
 
-        if provider == "openai-realtime":
+        if meta.get("streaming") or provider == "openai-realtime":
             if not self._start_realtime(language, model):
                 self._set_controls_enabled(True)
                 self.continuous_button.setText("INICIAR TRANSCRIPCIÓN CONTINUA")
@@ -1062,34 +1068,58 @@ class WhisperApp(QMainWindow):
         self.status_bar.showMessage("Transcripción continua iniciada")
 
     def _start_realtime(self, language, model):
-        self.realtime = transcriber.RealtimeTranscriber(
-            self.api_key, model=model, language=language,
-            prompt=transcriber.DEFAULT_PROMPT,
-            on_transcript=lambda t, fin: self.realtime_text.emit(t, fin),
-            on_error=lambda m: self.realtime_error.emit(m),
-        )
+        """Crea el/los transcriptor(es) streaming según proveedor y fuente."""
+        provider = self._current_provider()
+        source = self._current_source()
+
+        def make_rt(lane=""):
+            cb = (lambda t, fin, l=lane: self.realtime_text.emit(t, fin, l))
+            err = (lambda m: self.realtime_error.emit(m))
+            if provider == "deepgram":
+                return transcriber.DeepgramRealtime(
+                    self.api_key, model=model, language=language,
+                    on_transcript=cb, on_error=err)
+            return transcriber.RealtimeTranscriber(
+                self.api_key, model=model, language=language,
+                prompt=transcriber.DEFAULT_PROMPT,
+                on_transcript=cb, on_error=err)
+
+        lanes = ["Entrevistador", "Tú"] if source == "duo" else [""]
+        self.realtimes = {}
         try:
-            self.realtime.start()
+            for lane_label in lanes:
+                rt = make_rt(lane_label)
+                rt.start()
+                self.realtimes[lane_label] = rt
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"No se pudo abrir la sesión realtime: {e}")
-            self.realtime = None
+            for rt in self.realtimes.values():
+                try:
+                    rt.stop()
+                except Exception:
+                    pass
+            self.realtimes = {}
+            QMessageBox.critical(self, "Error", f"No se pudo abrir la sesión streaming: {e}")
             return False
 
-        self.capture_thread = ContinuousCaptureThread(
-            source=self._current_source(),
-            device_index=self.selected_input_device,
-            realtime=self.realtime,
-        )
+        if source == "duo":
+            self.capture_thread = ContinuousCaptureThread(
+                source=source, device_index=self.selected_input_device,
+                realtimes=self.realtimes)
+        else:
+            self.realtime = next(iter(self.realtimes.values()))
+            self.capture_thread = ContinuousCaptureThread(
+                source=source, device_index=self.selected_input_device,
+                realtime=self.realtime)
         self.capture_thread.update_level.connect(self.level_monitor.set_level)
         self.capture_thread.status_update.connect(self.status_bar.showMessage)
         self.capture_thread.error_occurred.connect(self.handle_continuous_error)
         self.capture_thread.start()
         return True
 
-    @Slot(str, bool)
-    def _append_transcript(self, text, is_final):
+    @Slot(str, bool, str)
+    def _append_transcript(self, text, is_final, lane=""):
         if is_final:
-            self._on_new_segment(text)
+            self._on_new_segment(text, lane)
 
     def _retire_thread(self, thread):
         """Detiene un QThread sin destruirlo mientras siga corriendo.
@@ -1108,9 +1138,13 @@ class WhisperApp(QMainWindow):
     def stop_continuous_mode(self):
         self._retire_thread(self.capture_thread)
         self.capture_thread = None
-        if self.realtime:
-            self.realtime.stop()
-            self.realtime = None
+        for rt in self.realtimes.values():
+            try:
+                rt.stop()
+            except Exception:
+                pass
+        self.realtimes = {}
+        self.realtime = None
         self._retire_thread(self.transcription_worker)
         self.transcription_worker = None
 
@@ -1260,8 +1294,13 @@ class WhisperApp(QMainWindow):
     def closeEvent(self, event):
         try:
             self._retire_thread(self.capture_thread)
-            if self.realtime:
-                self.realtime.stop()
+            for rt in self.realtimes.values():
+                try:
+                    rt.stop()
+                except Exception:
+                    pass
+            self.realtimes = {}
+            self.realtime = None
             self._retire_thread(self.transcription_worker)
 
             temp_dir = os.path.join(os.getcwd(), "temp_audio")

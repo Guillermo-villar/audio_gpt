@@ -46,6 +46,13 @@ REALTIME_MODELS = [
     ("gpt-live-transcribe", "GPT Live Transcribe (menor latencia)"),
 ]
 
+DEEPGRAM_MODELS = [
+    ("flux-general-multi", "Flux Multi (menor latencia, ES+EN)"),
+    ("flux-general-en", "Flux (inglés, menor latencia)"),
+    ("nova-3-multilingual", "Nova-3 Multi (más preciso, ES+EN)"),
+    ("nova-3", "Nova-3 (inglés, más preciso)"),
+]
+
 PROVIDERS = {
     "openai": {
         "label": "OpenAI (nube)",
@@ -71,6 +78,14 @@ PROVIDERS = {
         "key_env": None,
         "help": "Gratis y privado. Descarga el modelo la primera vez; usa CPU o GPU.",
     },
+    "deepgram": {
+        "label": "Deepgram (streaming)",
+        "models": DEEPGRAM_MODELS,
+        "key_env": "DEEPGRAM_API_KEY",
+        "streaming": True,
+        "help": "Flux ~20ms EOT / Nova-3 ~250ms y ~1.6% WER. ~$0.006-0.008/min. "
+                "Key en console.deepgram.com — también transcribe archivos por REST.",
+    },
 }
 
 DEFAULT_PROVIDER = "openai"
@@ -78,6 +93,10 @@ DEFAULT_MODEL = "gpt-4o-transcribe"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 REALTIME_SAMPLE_RATE = 24000
+DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"      # nova-3
+DEEPGRAM_FLUX_URL = "wss://api.deepgram.com/v2/listen"  # flux-*
+DEEPGRAM_REST_URL = "https://api.deepgram.com/v1/listen"
+DEEPGRAM_SAMPLE_RATE = 16000
 
 # Texto guía para mejorar vocabulario técnico en ES/EN (solo modelos gpt-4o-*)
 DEFAULT_PROMPT = (
@@ -111,6 +130,8 @@ def transcribe_file(api_key, file_path, language=None, provider=DEFAULT_PROVIDER
     """Transcribe un archivo de audio. Devuelve texto o lanza excepción."""
     if provider == "local":
         return _transcribe_local(file_path, language, model)
+    if provider == "deepgram":
+        return _transcribe_deepgram(api_key, file_path, language, model)
 
     client = _client(api_key, provider)
     params = {"model": model, "file": open(file_path, "rb")}
@@ -160,6 +181,141 @@ def _transcribe_local(file_path, language, model_size):
     return " ".join(seg.text.strip() for seg in segments if seg.text.strip())
 
 
+# ------------------------- deepgram -------------------------
+
+def _transcribe_deepgram(api_key, file_path, language, model):
+    """Prerecorded REST: POST /v1/listen con el audio en el body."""
+    import urllib.parse
+    import urllib.request
+
+    key = api_key or os.environ.get("DEEPGRAM_API_KEY")
+    if not key:
+        raise RuntimeError("Falta la API key de Deepgram")
+    q = {"model": model, "punctuate": "true", "smart_format": "true"}
+    if language:
+        q["language"] = language
+    url = DEEPGRAM_REST_URL + "?" + urllib.parse.urlencode(q)
+    with open(file_path, "rb") as f:
+        body = f.read()
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Authorization": f"Token {key}", "Content-Type": "audio/wav"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Deepgram HTTP {e.code}: {e.read()[:400]!r}")
+    return (data["results"]["channels"][0]["alternatives"][0]
+            .get("transcript", ""))
+
+
+class DeepgramRealtime:
+    """Streaming STT vía wss://api.deepgram.com/v1/listen.
+
+    PCM16 mono crudo por frames binarios; eventos Results con is_final.
+    Flux detecta fin de turno en servidor (endpointing); sin VAD en cliente.
+    """
+
+    def __init__(self, api_key, model="flux-general-multi", language=None,
+                 on_transcript=None, on_error=None, on_status=None):
+        self.api_key = api_key
+        self.model = model
+        self.language = language
+        self.on_transcript = on_transcript or (lambda t, final: None)
+        self.on_error = on_error or (lambda e: None)
+        self.on_status = on_status or (lambda e: None)
+        self._ws = None
+        self._recv_thread = None
+        self._running = False
+        self._final_event = threading.Event()
+        self.sample_rate = DEEPGRAM_SAMPLE_RATE
+
+    def start(self):
+        import websocket
+        import urllib.parse
+
+        if self.model.startswith("flux"):
+            # Flux vive en /v2/listen con parámetros distintos a /v1.
+            q = {
+                "model": self.model,
+                "encoding": "linear16",
+                "sample_rate": DEEPGRAM_SAMPLE_RATE,
+            }
+            base = DEEPGRAM_FLUX_URL
+        else:
+            q = {
+                "model": self.model,
+                "encoding": "linear16",
+                "sample_rate": DEEPGRAM_SAMPLE_RATE,
+                "channels": 1,
+                "punctuate": "true",
+                "smart_format": "true",
+                "interim_results": "true",
+                "endpointing": 300,
+            }
+            base = DEEPGRAM_URL
+            if self.language and "multi" not in self.model:
+                q["language"] = self.language   # multi detecta idiomas solo
+        url = base + "?" + urllib.parse.urlencode(q)
+        self._ws = websocket.create_connection(
+            url,
+            header=[f"Authorization: Token {self.api_key}"],
+            timeout=30,
+        )
+        self._running = True
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._recv_thread.start()
+
+    def send_audio(self, pcm16_bytes):
+        """Frames binarios PCM16 mono (no JSON)."""
+        if self._ws is not None:
+            self._ws.send_binary(pcm16_bytes)
+
+    def commit(self):
+        """Fuerza finalización del turno actual (Finalize)."""
+        if self._ws is not None:
+            self._ws.send(json.dumps({"type": "Finalize"}))
+
+    def _recv_loop(self):
+        try:
+            while self._running:
+                raw = self._ws.recv()
+                if not raw:
+                    break
+                event = json.loads(raw)
+                etype = event.get("type", "")
+                if etype == "Results":
+                    alts = (event.get("channel", {})
+                            .get("alternatives") or [])
+                    text = alts[0].get("transcript", "") if alts else ""
+                    if text:
+                        self.on_transcript(text, bool(event.get("is_final")))
+                        if event.get("is_final"):
+                            self._final_event.set()
+                elif etype == "Error":
+                    self.on_error(json.dumps(event))
+                elif etype in ("Metadata", "SpeechStarted", "UtteranceEnd"):
+                    self.on_status(etype)
+        except Exception as e:
+            if self._running:
+                self.on_error(str(e))
+
+    def stop(self):
+        """CloseStream + drenaje acotado de los últimos resultados."""
+        try:
+            if self._ws is not None:
+                self._final_event.clear()
+                self._ws.send(json.dumps({"type": "CloseStream"}))
+                self._final_event.wait(1.5)
+                self._running = False
+                self._ws.close()
+        except Exception:
+            pass
+        self._running = False
+        self._ws = None
+
+
 # ------------------------- tiempo real (WebSocket) -------------------------
 
 class RealtimeTranscriber:
@@ -184,6 +340,7 @@ class RealtimeTranscriber:
         self._recv_thread = None
         self._running = False
         self._final_event = threading.Event()
+        self.sample_rate = REALTIME_SAMPLE_RATE
 
     def start(self):
         import websocket  # websocket-client
@@ -281,11 +438,11 @@ class RealtimeTranscriber:
         self._ws = None
 
 
-def pcm16_for_realtime(audio_float, src_rate):
-    """float32 (mono o estéreo) a cualquier rate -> PCM16 mono 24 kHz."""
+def pcm16_for_realtime(audio_float, src_rate, dst_rate=REALTIME_SAMPLE_RATE):
+    """float32 (mono o estéreo) a cualquier rate -> PCM16 mono dst_rate Hz."""
     from vad import resample_linear
 
-    audio = resample_linear(audio_float, src_rate, REALTIME_SAMPLE_RATE)
+    audio = resample_linear(audio_float, src_rate, dst_rate)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     audio = np.clip(audio, -1.0, 1.0)
