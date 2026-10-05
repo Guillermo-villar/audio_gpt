@@ -1254,8 +1254,9 @@ class WhisperApp(QMainWindow):
         gpt_input = f"{lane}: {text}" if lane and not text.startswith(lane) else text
         if effort == "medium":
             effort = self._review_effort("medium")
-        # Borradores: boceto corto y rápido; revisiones: respuesta completa.
-        max_tokens = 400 if kind == "Borrador" else None
+        # Borradores: boceto corto y rápido (~3s en CF a ~55 tok/s);
+        # revisiones: respuesta completa.
+        max_tokens = 200 if kind == "Borrador" else None
 
         if engine == "codex":
             thread = CodexCliThread(gpt_input, context=context)
