@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QSpinBox, QTextEdit, QLineEdit, QComboBox,
     QProgressBar, QFileDialog, QMessageBox, QGroupBox, QStatusBar,
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
+    QPlainTextEdit,
 )
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QTextCursor
@@ -678,6 +679,7 @@ class WhisperApp(QMainWindow):
         self._dying_threads = []
         self._ctx = deque(maxlen=16)      # últimas intervenciones «Carril: texto»
         self._draft_state = {}            # carril -> interim ya respondido
+        self._pinned = []                 # hechos fijados a mano, siempre en contexto
 
         self.init_ui()
         self.realtime_text.connect(self._append_transcript)
@@ -801,6 +803,17 @@ class WhisperApp(QMainWindow):
         keyterm_layout.addWidget(self.keyterms_input, 1)
         tr_layout.addLayout(keyterm_layout)
 
+        brief_layout = QHBoxLayout()
+        brief_layout.addWidget(QLabel("Brief de la entrevista:"))
+        self.brief_input = QPlainTextEdit()
+        self.brief_input.setMaximumHeight(56)
+        self.brief_input.setPlaceholderText(
+            "Puesto, empresa, tu experiencia aprobada, límites "
+            "(p. ej. «sin Kubernetes en prod»). Va en cada llamada a GPT — "
+            "las respuestas se adaptan a este contexto.")
+        brief_layout.addWidget(self.brief_input, 1)
+        tr_layout.addLayout(brief_layout)
+
         top_layout.addWidget(tr_group)
         splitter.addWidget(top)
 
@@ -819,9 +832,14 @@ class WhisperApp(QMainWindow):
         self.copy_button = QPushButton("Copiar")
         self.save_button = QPushButton("Guardar")
         self.clear_button = QPushButton("Limpiar")
+        self.pin_button = QPushButton("Fijar")
+        self.pin_button.setToolTip(
+            "Fija la selección del transcript: requisitos, cifras, "
+            "decisiones — van en el contexto de cada llamada y nunca ruedan.")
         self.copy_button.clicked.connect(self.copy_text)
         self.save_button.clicked.connect(self.save_text)
         self.clear_button.clicked.connect(self.clear_text)
+        self.pin_button.clicked.connect(self.pin_selection)
         self.send_to_gpt_button = QPushButton("Enviar a GPT")
         self.send_to_gpt_button.setStyleSheet(
             "QPushButton { background-color: #6a0dad; color: white; }"
@@ -832,6 +850,7 @@ class WhisperApp(QMainWindow):
         text_buttons.addWidget(self.copy_button)
         text_buttons.addWidget(self.save_button)
         text_buttons.addWidget(self.clear_button)
+        text_buttons.addWidget(self.pin_button)
         text_buttons.addStretch()
         self.gpt_engine_combo = QComboBox()
         self.gpt_engine_combo.addItem("API OpenAI", "openai")
@@ -903,6 +922,7 @@ class WhisperApp(QMainWindow):
                 self.gpt_engine_combo.setCurrentIndex(idx)
         self.keyterms_input.setText(s.get("dg_keyterms", ""))
         self.diarize_checkbox.setChecked(bool(s.get("dg_diarize")))
+        self.brief_input.setPlainText(s.get("interview_brief", ""))
 
     def _persist_settings(self):
         _save_settings({
@@ -913,6 +933,7 @@ class WhisperApp(QMainWindow):
             "gpt_engine": self.gpt_engine_combo.currentData(),
             "dg_keyterms": self.keyterms_input.text().strip(),
             "dg_diarize": self.diarize_checkbox.isChecked(),
+            "interview_brief": self.brief_input.toPlainText().strip(),
         })
 
     # ------------------------- proveedor / api key -------------------------
@@ -1247,10 +1268,32 @@ class WhisperApp(QMainWindow):
         except ValueError:
             return base
 
+    def _build_context(self):
+        """Contexto por capas: brief pineado + hechos fijados + reciente.
+        Generoso a propósito — el input apenas cuesta latencia; lo que no
+        se permite perder: el brief, los fijados y tu última respuesta."""
+        parts = []
+        brief = self.brief_input.toPlainText().strip()
+        if brief:
+            parts.append("Contexto de la entrevista:\n" + brief)
+        if self._pinned:
+            parts.append("Hechos fijados:\n" + "\n".join(self._pinned))
+        recent = list(self._ctx)[-14:]
+        if recent:
+            # tu última respuesta sustantiva nunca se pierde del contexto
+            if not any(x.startswith("Tú:") and len(x) > 40 for x in recent):
+                last_tu = next(
+                    (x for x in reversed(self._ctx)
+                     if x.startswith("Tú:") and len(x) > 40), None)
+                if last_tu:
+                    parts.append(f"Tu última respuesta: {last_tu}")
+            parts.append("Conversación reciente:\n" + "\n".join(recent))
+        return "\n\n".join(parts)
+
     def _fire_gpt(self, text, lane, kind, effort=None):
         """Lanza una consulta GPT (borrador o revisión) con contexto."""
         engine = self.gpt_engine_combo.currentData()
-        context = "\n".join(list(self._ctx)[-8:])
+        context = self._build_context()
         gpt_input = f"{lane}: {text}" if lane and not text.startswith(lane) else text
         if effort == "medium":
             effort = self._review_effort("medium")
@@ -1324,10 +1367,24 @@ class WhisperApp(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Error al guardar: {e}")
 
+    def pin_selection(self):
+        """Fija el texto seleccionado del transcript: va en cada llamada."""
+        sel = self.transcription_output.textCursor().selectedText()
+        sel = sel.replace("\u2029", "\n").strip()
+        if not sel:
+            self.status_bar.showMessage("Selecciona texto en la transcripción para fijarlo")
+            return
+        self._pinned.append(sel)
+        self.status_bar.showMessage(
+            f"Fijado ({len(self._pinned)} hecho(s) en contexto): {sel[:60]}")
+
     def clear_text(self):
         self.transcription_output.clear()
         self.gpt_output.clear()
-        self.status_bar.showMessage("Transcripción borrada")
+        self._ctx.clear()            # estado oculto no sobrevive al «Limpiar»
+        self._draft_state.clear()
+        self._pinned.clear()
+        self.status_bar.showMessage("Transcripción y contexto borrados")
 
     def send_to_gpt(self):
         transcription = self.transcription_output.toPlainText()

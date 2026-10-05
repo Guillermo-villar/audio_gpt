@@ -8,6 +8,7 @@ Cambios respecto a la versión original:
 
 import os
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -56,15 +57,24 @@ _TECH_TASK_HINTS = (
 )
 
 
-def looks_like_question(text, min_words=5):
+_MARKER_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _QUESTION_MARKERS) + r")\b")
+
+
+def looks_like_question(text, min_words=4):
     """Puerta local: ¿esto suena a pregunta/encargo técnico? Heurística,
-    sin LLM — sólo evita quemar llamadas en muletillas y charla."""
+    sin LLM — sólo evita quemar llamadas en muletillas y charla.
+    «?» explícito pasa sin mínimo de palabras (¿y la complejidad?, Why?);
+    los marcadores usan límites de palabra («whatever» no dispara «what»)."""
     t = text.strip().lower()
-    if len(t.split()) < min_words:
+    words = t.split()
+    if not words:
         return False
     if "?" in t or "¿" in t:
-        return True
-    if any(t.startswith(w) or f" {w} " in f" {t} " for w in _QUESTION_MARKERS):
+        return True                          # «Why?», «¿Cómo?» explícitas
+    if len(words) < min_words:
+        return False
+    if _MARKER_RE.search(t):
         return True
     return any(h in t for h in _TECH_TASK_HINTS)
 
@@ -254,6 +264,17 @@ class GptClient:
             client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
             model = config.get("model", DEFAULT_GPT_CONFIG["model"])
 
+        instructions = config.get("system_prompt", "Eres un asistente útil.")
+        if context and "Contexto de la entrevista:" in context:
+            instructions += (
+                "\n\nEl «Contexto de la entrevista» describe la experiencia "
+                "APROBADA del candidato: úsala para adaptar la respuesta, pero "
+                "nunca conviertas requisitos del puesto ni notas de empresa en "
+                "experiencia del candidato ni inventes métricas o historias que "
+                "el brief no respalde; ante falta de evidencia, responde en "
+                "hipotético."
+            )
+
         if context:
             gpt_input = (f"Contexto de la conversación:\n{context}\n\n"
                          f"Nueva intervención: {transcription}")
@@ -262,7 +283,7 @@ class GptClient:
 
         kwargs = {
             "model": model,
-            "instructions": config.get("system_prompt", "Eres un asistente útil."),
+            "instructions": instructions,
             "input": gpt_input,
             "max_output_tokens": max_tokens or config.get("max_tokens", 2000),
         }
@@ -378,6 +399,15 @@ class CodexCliThread(QThread):
 
         config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
         prompt = config.get("system_prompt", "Eres un asistente útil.")
+        if self.context and "Contexto de la entrevista:" in self.context:
+            prompt += (
+                "\n\nEl «Contexto de la entrevista» describe la experiencia "
+                "APROBADA del candidato: úsala para adaptar la respuesta, pero "
+                "nunca conviertas requisitos del puesto ni notas de empresa en "
+                "experiencia del candidato ni inventes métricas o historias que "
+                "el brief no respalde; ante falta de evidencia, responde en "
+                "hipotético."
+            )
         if self.context:
             prompt += f"\n\nContexto de la conversación:\n{self.context}"
         prompt += "\n\nTranscription: " + self.transcription
