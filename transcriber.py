@@ -235,6 +235,10 @@ class DeepgramRealtime:
         import websocket
         import urllib.parse
 
+        if self.model == "nova-3-multilingual":
+            self.model = "nova-3"
+            self.language = "multi"   # multilingual = nova-3 + language=multi
+
         if self.model.startswith("flux"):
             # Flux vive en /v2/listen con parámetros distintos a /v1.
             q = {
@@ -273,9 +277,10 @@ class DeepgramRealtime:
             self._ws.send_binary(pcm16_bytes)
 
     def commit(self):
-        """Fuerza finalización del turno actual (Finalize)."""
+        """Fuerza el fin del turno actual (v1: Finalize; v2/Flux: ForceEndTurn)."""
         if self._ws is not None:
-            self._ws.send(json.dumps({"type": "Finalize"}))
+            kind = "ForceEndTurn" if self.model.startswith("flux") else "Finalize"
+            self._ws.send(json.dumps({"type": kind}))
 
     def _recv_loop(self):
         try:
@@ -285,7 +290,7 @@ class DeepgramRealtime:
                     break
                 event = json.loads(raw)
                 etype = event.get("type", "")
-                if etype == "Results":
+                if etype == "Results":   # /v1 (nova-3): resultados por utterance
                     alts = (event.get("channel", {})
                             .get("alternatives") or [])
                     text = alts[0].get("transcript", "") if alts else ""
@@ -293,6 +298,13 @@ class DeepgramRealtime:
                         self.on_transcript(text, bool(event.get("is_final")))
                         if event.get("is_final"):
                             self._final_event.set()
+                elif etype == "TurnInfo":   # /v2 (flux): turnos con transcript
+                    text = event.get("transcript", "")
+                    is_final = event.get("event") == "EndOfTurn"
+                    if text:
+                        self.on_transcript(text, is_final)
+                    if is_final:
+                        self._final_event.set()
                 elif etype == "Error":
                     self.on_error(json.dumps(event))
                 elif etype in ("Metadata", "SpeechStarted", "UtteranceEnd"):
