@@ -19,6 +19,7 @@ Aplicación de escritorio para **Windows** que graba el **audio del sistema** (r
 - Python 3.9+ (probado con 3.13)
 - Una API key según el proveedor elegido:
   - **OpenAI**: <https://platform.openai.com/api-keys> — pago por uso (~$0.003–0.006/min de transcripción). *Nota: la suscripción ChatGPT Plus/Pro no incluye uso de API; son productos separados.*
+  - **Deepgram**: <https://console.deepgram.com/> — streaming Flux (~20 ms fin de turno) / Nova-3 (~250 ms, ~1.6% WER), ~$0.006–0.008/min.
   - **Groq**: <https://console.groq.com/keys> — casi gratis.
   - **Local**: sin clave; instala `faster-whisper` y el modelo se descarga solo (~1.6 GB para `large-v3-turbo`).
 
@@ -39,6 +40,7 @@ Crea un `.env` con tu clave (o déjalo y la app te la pedirá la primera vez):
 ```env
 OPENAI_API_KEY=sk-...
 GROQ_API_KEY=gsk_...        # solo si usas Groq
+DEEPGRAM_API_KEY=...        # solo si usas Deepgram
 ```
 
 ## ▶️ Uso
@@ -48,7 +50,7 @@ python main.py
 ```
 
 1. **Fuente**: «Audio del sistema (loopback WASAPI)» — graba lo que suena sin tocar la configuración de Windows. Alternativas: micrófono, **«Loopback + micro (2 carriles)»** — captura dos canales independientes y etiqueta `Entrevistador:` (loopback) y `Tú:` (micro) como hace Granola — o VB-Cable.
-2. **Proveedor/modelo**: OpenAI `gpt-4o-transcribe` recomendado; `…-diarize` para reuniones con varios hablantes; *Realtime* (`gpt-live-transcribe`, el modelo más reciente y de menor latencia — usa VAD en cliente) para latencia mínima; *Groq* o *local* para gastar (casi) nada. El modo dúo funciona con OpenAI/Groq/local (no con Realtime).
+2. **Proveedor/modelo**: OpenAI `gpt-4o-transcribe` recomendado; `…-diarize` para reuniones con varios hablantes; *Deepgram* (`flux-general-multi`, el más rápido del mercado ~20 ms fin de turno; `nova-3-multilingual` si prefieres precisión ~1.6% WER) para latencia mínima; *OpenAI Realtime* (`gpt-live-transcribe`) como opción OpenAI-native; *Groq* o *local* para gastar (casi) nada. El modo dúo funciona con OpenAI/Groq/local/Deepgram — con Deepgram cada carril es un WebSocket propio — (no con OpenAI Realtime).
 3. Pulsa **INICIAR TRANSCRIPCIÓN CONTINUA**. La VAD detecta la voz y cada fragmento se transcribe y aparece en pantalla.
 4. Activa **«Responder con GPT automáticamente»** para que cada fragmento pase por GPT y las respuestas aparezcan en el panel inferior. El motor puede ser *API OpenAI* o *Codex CLI (ChatGPT sub)* — este último gasta la cuota de tu suscripción en vez de la API (requiere `npm i -g @openai/codex` + `codex login`).
 5. **Grabar** (duración fija) + **Transcribir grabación** sigue disponible para uso puntual.
@@ -61,7 +63,7 @@ audio_gpt/
 ├── gui.py            # Interfaz PySide6 + hilos de captura/transcripción
 ├── capture.py        # Loopback WASAPI (soundcard) y dispositivos (sounddevice)
 ├── vad.py            # Segmentación por voz (webrtcvad)
-├── transcriber.py    # Motores: OpenAI, Realtime WS, Groq, faster-whisper local
+├── transcriber.py    # Motores: OpenAI, Realtime WS, Deepgram WS/REST, Groq, faster-whisper local
 ├── api_client.py     # API keys, Responses API (GPT), compatibilidad
 ├── recorder.py       # Diagnóstico de audio por línea de comandos
 ├── gpt_config.json   # Modelo GPT, prompt de sistema, esfuerzo de razonamiento
