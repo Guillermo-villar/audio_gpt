@@ -15,6 +15,7 @@ import time
 import queue
 import uuid
 import json
+from collections import deque
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -33,8 +34,8 @@ import capture
 import transcriber
 import vad
 from api_client import (
-    ApiKeyManager, TranscriptionThread, WhisperService, GptQueryThread,
-    CodexCliThread,
+    ApiKeyManager, TranscriptionThread, WhisperService, GptClient,
+    GptQueryThread, CodexCliThread, looks_like_question,
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -675,6 +676,8 @@ class WhisperApp(QMainWindow):
         self.is_continuous_mode = False
         self._gpt_threads = []
         self._dying_threads = []
+        self._ctx = deque(maxlen=16)      # últimas intervenciones «Carril: texto»
+        self._draft_state = {}            # carril -> interim ya respondido
 
         self.init_ui()
         self.realtime_text.connect(self._append_transcript)
@@ -781,8 +784,22 @@ class WhisperApp(QMainWindow):
         manual_layout.addWidget(self.transcribe_button)
         self.auto_gpt_checkbox = QCheckBox("Responder con GPT automáticamente")
         manual_layout.addWidget(self.auto_gpt_checkbox)
+        self.diarize_checkbox = QCheckBox("Diarizar (panel)")
+        self.diarize_checkbox.setToolTip(
+            "Deepgram nova-3: etiqueta voces distintas dentro del mismo carril "
+            "(<S0>, <S1>…). Para llamadas con varios entrevistadores."
+        )
+        manual_layout.addWidget(self.diarize_checkbox)
         manual_layout.addStretch()
         tr_layout.addLayout(manual_layout)
+
+        keyterm_layout = QHBoxLayout()
+        keyterm_layout.addWidget(QLabel("Términos clave:"))
+        self.keyterms_input = QLineEdit()
+        self.keyterms_input.setPlaceholderText(
+            "python, kubernetes, pytorch… (Deepgram nova-3 los escucha mejor)")
+        keyterm_layout.addWidget(self.keyterms_input, 1)
+        tr_layout.addLayout(keyterm_layout)
 
         top_layout.addWidget(tr_group)
         splitter.addWidget(top)
@@ -818,9 +835,12 @@ class WhisperApp(QMainWindow):
         text_buttons.addStretch()
         self.gpt_engine_combo = QComboBox()
         self.gpt_engine_combo.addItem("API OpenAI", "openai")
+        self.gpt_engine_combo.addItem("Cloudflare AI (créditos CF)", "cloudflare")
         self.gpt_engine_combo.addItem("Codex CLI (ChatGPT sub)", "codex")
         self.gpt_engine_combo.setToolTip(
             "API OpenAI: pago por uso (necesita API key). "
+            "Cloudflare: openai/gpt-6-luna servido por Workers AI "
+            "(necesita CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID). "
             "Codex CLI: usa tu suscripción ChatGPT (necesita codex instalado)."
         )
         text_buttons.addWidget(self.gpt_engine_combo)
@@ -881,6 +901,8 @@ class WhisperApp(QMainWindow):
             idx = self.gpt_engine_combo.findData(engine)
             if idx >= 0:
                 self.gpt_engine_combo.setCurrentIndex(idx)
+        self.keyterms_input.setText(s.get("dg_keyterms", ""))
+        self.diarize_checkbox.setChecked(bool(s.get("dg_diarize")))
 
     def _persist_settings(self):
         _save_settings({
@@ -889,6 +911,8 @@ class WhisperApp(QMainWindow):
             "language": self.language_selector.currentData(),
             "source": self.source_selector.currentData(),
             "gpt_engine": self.gpt_engine_combo.currentData(),
+            "dg_keyterms": self.keyterms_input.text().strip(),
+            "dg_diarize": self.diarize_checkbox.isChecked(),
         })
 
     # ------------------------- proveedor / api key -------------------------
@@ -1072,13 +1096,20 @@ class WhisperApp(QMainWindow):
         provider = self._current_provider()
         source = self._current_source()
 
+        keyterms = [t.strip() for t in self.keyterms_input.text().split(",")
+                    if t.strip()]
+        diarize = (self.diarize_checkbox.isChecked()
+                   and provider == "deepgram"
+                   and model.startswith("nova"))
+
         def make_rt(lane=""):
             cb = (lambda t, fin, l=lane: self.realtime_text.emit(t, fin, l))
             err = (lambda m: self.realtime_error.emit(m))
             if provider == "deepgram":
                 return transcriber.DeepgramRealtime(
                     self.api_key, model=model, language=language,
-                    on_transcript=cb, on_error=err)
+                    on_transcript=cb, on_error=err,
+                    diarize=diarize, keyterms=keyterms)
             return transcriber.RealtimeTranscriber(
                 self.api_key, model=model, language=language,
                 prompt=transcriber.DEFAULT_PROMPT,
@@ -1119,7 +1150,18 @@ class WhisperApp(QMainWindow):
     @Slot(str, bool, str)
     def _append_transcript(self, text, is_final, lane=""):
         if is_final:
+            self._draft_state.pop(lane, None)   # turno cerrado: próximo borrador
             self._on_new_segment(text, lane)
+            return
+        # Interim: borrador anticipado mientras la persona sigue hablando.
+        if lane == "Tú" or not self.auto_gpt_checkbox.isChecked():
+            return
+        prev = self._draft_state.get(lane)
+        if prev is not None and prev in text:
+            return                                # mismo turno, ya disparado
+        if looks_like_question(text):
+            self._draft_state[lane] = text
+            self._fire_gpt(text, lane, kind="Borrador")
 
     def _retire_thread(self, thread):
         """Detiene un QThread sin destruirlo mientras siga corriendo.
@@ -1183,28 +1225,65 @@ class WhisperApp(QMainWindow):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.transcription_output.setTextCursor(cursor)
 
-        if self.auto_gpt_checkbox.isChecked() and text.strip():
-            gpt_input = display  # la etiqueta de carril da contexto a GPT
-            if self.gpt_engine_combo.currentData() == "codex":
-                thread = CodexCliThread(gpt_input)
+        if not text.strip():
+            return
+        if self.auto_gpt_checkbox.isChecked() and lane != "Tú":
+            # Revisión sobre el final: misma puerta, esfuerzo mayor y
+            # contexto de las últimas intervenciones.
+            if looks_like_question(text):
+                self._fire_gpt(display, lane, kind="Revisión",
+                               effort="medium")
             else:
-                gpt_key = ApiKeyManager.load_api_key("openai")
-                if not gpt_key:
-                    self.status_bar.showMessage(
-                        "Auto-GPT necesita una API key de OpenAI (botón «API key…»)"
-                    )
-                    return
-                thread = GptQueryThread(gpt_key, gpt_input)
-            self._gpt_threads.append(thread)
-            thread.query_complete.connect(self._on_auto_gpt_result)
-            thread.query_complete.connect(
-                lambda *a, t=thread: self._gpt_threads.remove(t))
-            thread.start()
+                self._ctx.append(display)
+                return
+        self._ctx.append(display)
 
-    def _on_auto_gpt_result(self, success, result):
+    def _review_effort(self, base):
+        """Revisión al menos a «medium» salvo que el usuario pida más."""
+        order = ("none", "minimal", "low", "medium", "high", "max")
+        cfg = (GptClient.load_config() or {}).get("reasoning_effort") or "low"
+        try:
+            return base if order.index(base) > order.index(cfg) else cfg
+        except ValueError:
+            return base
+
+    def _fire_gpt(self, text, lane, kind, effort=None):
+        """Lanza una consulta GPT (borrador o revisión) con contexto."""
+        engine = self.gpt_engine_combo.currentData()
+        context = "\n".join(list(self._ctx)[-8:])
+        gpt_input = f"{lane}: {text}" if lane and not text.startswith(lane) else text
+        if effort == "medium":
+            effort = self._review_effort("medium")
+
+        if engine == "codex":
+            thread = CodexCliThread(gpt_input, context=context)
+        elif engine == "cloudflare":
+            thread = GptQueryThread(
+                None, gpt_input, engine="cloudflare",
+                context=context, effort=effort)
+        else:
+            gpt_key = ApiKeyManager.load_api_key("openai")
+            if not gpt_key:
+                self.status_bar.showMessage(
+                    "Auto-GPT necesita una API key de OpenAI (botón «API key…»)"
+                )
+                return
+            thread = GptQueryThread(
+                gpt_key, gpt_input, context=context, effort=effort)
+
+        header = f"[{kind}] {gpt_input}" if kind else gpt_input
+        self._gpt_threads.append(thread)
+        thread.query_complete.connect(
+            lambda ok, res, h=header: self._on_auto_gpt_result(ok, res, h))
+        thread.query_complete.connect(
+            lambda *a, t=thread: self._gpt_threads.remove(t))
+        thread.start()
+
+    def _on_auto_gpt_result(self, success, result, header=""):
         if success:
             existing = self.gpt_output.toPlainText()
-            self.gpt_output.setPlainText(f"{existing}\n\n{result}" if existing else result)
+            block = f"{header}\n{result}" if header else result
+            self.gpt_output.setPlainText(f"{existing}\n\n{block}" if existing else block)
             cursor = self.gpt_output.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
             self.gpt_output.setTextCursor(cursor)
@@ -1252,8 +1331,11 @@ class WhisperApp(QMainWindow):
             QMessageBox.warning(self, "Advertencia", "No hay texto para enviar a GPT")
             return
 
-        if self.gpt_engine_combo.currentData() == "codex":
+        engine = self.gpt_engine_combo.currentData()
+        if engine == "codex":
             thread = CodexCliThread(transcription)
+        elif engine == "cloudflare":
+            thread = GptQueryThread(None, transcription, engine="cloudflare")
         else:
             gpt_key = ApiKeyManager.load_api_key("openai")
             if not gpt_key:

@@ -210,6 +210,20 @@ def _transcribe_deepgram(api_key, file_path, language, model):
             .get("transcript", ""))
 
 
+def _tag_speakers(words):
+    """Reconstruye texto con marcas <S#> en los cambios de hablante
+    (diarización dentro del carril, para llamadas de varias personas)."""
+    parts = []
+    last = None
+    for w in words:
+        speaker = w.get("speaker", -1)
+        if speaker != last:
+            parts.append(f"<S{speaker}>")
+            last = speaker
+        parts.append(w.get("punctuated_word", w.get("word", "")))
+    return " ".join(parts)
+
+
 class DeepgramRealtime:
     """Streaming STT vía wss://api.deepgram.com/v1/listen.
 
@@ -218,10 +232,13 @@ class DeepgramRealtime:
     """
 
     def __init__(self, api_key, model="flux-general-multi", language=None,
-                 on_transcript=None, on_error=None, on_status=None):
+                 on_transcript=None, on_error=None, on_status=None,
+                 diarize=False, keyterms=None):
         self.api_key = api_key
         self.model = model
         self.language = language
+        self.diarize = diarize        # solo nova-3: etiquetas <S0>/<S1> por voz
+        self.keyterms = list(keyterms or [])
         self.on_transcript = on_transcript or (lambda t, final: None)
         self.on_error = on_error or (lambda e: None)
         self.on_status = on_status or (lambda e: None)
@@ -258,10 +275,14 @@ class DeepgramRealtime:
                 "interim_results": "true",
                 "endpointing": 300,
             }
+            if self.diarize:
+                q["diarize"] = "true"
+            if self.keyterms:
+                q["keyterm"] = self.keyterms   # jargon boosting (nova-3)
             base = DEEPGRAM_URL
             if self.language and "multi" not in self.model:
                 q["language"] = self.language   # multi detecta idiomas solo
-        url = base + "?" + urllib.parse.urlencode(q)
+        url = base + "?" + urllib.parse.urlencode(q, doseq=True)
         self._ws = websocket.create_connection(
             url,
             header=[f"Authorization: Token {self.api_key}"],
@@ -293,7 +314,12 @@ class DeepgramRealtime:
                 if etype == "Results":   # /v1 (nova-3): resultados por utterance
                     alts = (event.get("channel", {})
                             .get("alternatives") or [])
-                    text = alts[0].get("transcript", "") if alts else ""
+                    alt = alts[0] if alts else {}
+                    if (self.diarize and event.get("is_final")
+                            and alt.get("words")):
+                        text = _tag_speakers(alt["words"])
+                    else:
+                        text = alt.get("transcript", "")
                     if text:
                         self.on_transcript(text, bool(event.get("is_final")))
                         if event.get("is_final"):

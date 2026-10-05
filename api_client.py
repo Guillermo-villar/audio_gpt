@@ -24,6 +24,51 @@ def _key_file(provider):
     return "api_key.txt" if provider in ("openai", "openai-realtime") else f"{provider}_api_key.txt"
 
 
+def cloudflare_creds():
+    """(token, account_id) para Workers AI — env primero, luego archivos
+    cloudflare_api_key.txt / cloudflare_account_id.txt (gitignored)."""
+    token = (os.environ.get("CLOUDFLARE_API_TOKEN")
+             or ApiKeyManager.load_api_key("cloudflare"))
+    account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    if not account:
+        try:
+            with open("cloudflare_account_id.txt", "r") as f:
+                account = f.read().strip()
+        except OSError:
+            pass
+    return token or "", account
+
+
+# Palabras que delatan una pregunta/encargo en ES/EN. Puerta barata: si no
+# aparece ninguna y no hay «?», casi seguro es charla y no vale llamar al LLM.
+_QUESTION_MARKERS = (
+    "what", "how", "why", "when", "where", "who", "which", "explain",
+    "describe", "implement", "write", "design", "optimize", "walk me",
+    "tell me", "difference between", "would you", "could you", "given",
+    "qué", "cómo", "cuándo", "dónde", "por qué", "quién", "cuál",
+    "cuáles", "explica", "describe", "implementa", "dime", "cuéntame",
+    "diseña", "optimiza", "escribe", "podrías", "diferencia entre",
+)
+_TECH_TASK_HINTS = (
+    "algorithm", "algoritmo", "leetcode", "complexity", "complejidad",
+    "big-o", "big o", "system design", "sql", "query", "array", "tree",
+    "linked list", "hashmap", "binary search", "deadlock", "race condition",
+)
+
+
+def looks_like_question(text, min_words=5):
+    """Puerta local: ¿esto suena a pregunta/encargo técnico? Heurística,
+    sin LLM — sólo evita quemar llamadas en muletillas y charla."""
+    t = text.strip().lower()
+    if len(t.split()) < min_words:
+        return False
+    if "?" in t or "¿" in t:
+        return True
+    if any(t.startswith(w) or f" {w} " in f" {t} " for w in _QUESTION_MARKERS):
+        return True
+    return any(h in t for h in _TECH_TASK_HINTS)
+
+
 class ApiKeyManager:
     """Gestiona el almacenamiento y recuperación de API keys por proveedor."""
 
@@ -170,8 +215,15 @@ class GptClient:
             return None
 
     @staticmethod
-    def send_to_gpt(api_key, transcription):
-        """Envía la transcripción a GPT y devuelve (ok, respuesta_o_error)."""
+    def send_to_gpt(api_key, transcription, engine="openai", context="",
+                    effort=None):
+        """Envía la transcripción a GPT y devuelve (ok, respuesta_o_error).
+
+        engine="cloudflare" usa Workers AI (openai/gpt-6-luna servido por CF,
+        endpoint compatible con Responses); "openai" la API normal.
+        `context` son las últimas intervenciones etiquetadas por carril.
+        `effort` sube el razonamiento para la pasada de revisión.
+        """
         try:
             from openai import OpenAI, BadRequestError
         except ImportError:
@@ -181,21 +233,46 @@ class GptClient:
         if not config:
             return False, "Error al cargar la configuración de GPT"
 
-        client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
+        if engine == "cloudflare":
+            token, account = cloudflare_creds()
+            if not token or not account:
+                return False, (
+                    "Cloudflare necesita CLOUDFLARE_API_TOKEN y "
+                    "CLOUDFLARE_ACCOUNT_ID (o los archivos "
+                    "cloudflare_api_key.txt / cloudflare_account_id.txt)"
+                )
+            client = OpenAI(
+                api_key=token,
+                base_url=(f"https://api.cloudflare.com/client/v4/accounts/"
+                          f"{account}/ai/v1"),
+            )
+            model = config.get("cf_model", "openai/gpt-6-luna")
+        else:
+            client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
+            model = config.get("model", DEFAULT_GPT_CONFIG["model"])
+
+        if context:
+            gpt_input = (f"Contexto de la conversación:\n{context}\n\n"
+                         f"Nueva intervención: {transcription}")
+        else:
+            gpt_input = f"Transcription: {transcription}"
 
         kwargs = {
-            "model": config.get("model", DEFAULT_GPT_CONFIG["model"]),
+            "model": model,
             "instructions": config.get("system_prompt", "Eres un asistente útil."),
-            "input": f"Transcription: {transcription}",
+            "input": gpt_input,
             "max_output_tokens": config.get("max_tokens", 2000),
         }
         if config.get("temperature") is not None:
             kwargs["temperature"] = config["temperature"]
         if config.get("top_p") is not None:
             kwargs["top_p"] = config["top_p"]
-        if config.get("reasoning_effort"):
-            kwargs["reasoning"] = {"effort": config["reasoning_effort"]}
-        if config.get("service_tier") and config["service_tier"] != "auto":
+        effort = effort or config.get("reasoning_effort")
+        if effort:
+            kwargs["reasoning"] = {"effort": effort}
+        if (engine != "cloudflare"
+                and config.get("service_tier")
+                and config["service_tier"] != "auto"):
             kwargs["service_tier"] = config["service_tier"]
 
         try:
@@ -227,13 +304,19 @@ class GptQueryThread(QThread):
 
     query_complete = Signal(bool, str)
 
-    def __init__(self, api_key, transcription):
+    def __init__(self, api_key, transcription, engine="openai", context="",
+                 effort=None):
         super().__init__()
         self.api_key = api_key
         self.transcription = transcription
+        self.engine = engine
+        self.context = context
+        self.effort = effort
 
     def run(self):
-        success, result = GptClient.send_to_gpt(self.api_key, self.transcription)
+        success, result = GptClient.send_to_gpt(
+            self.api_key, self.transcription, engine=self.engine,
+            context=self.context, effort=self.effort)
         self.query_complete.emit(success, result)
 
 
@@ -257,10 +340,11 @@ class CodexCliThread(QThread):
 
     query_complete = Signal(bool, str)
 
-    def __init__(self, transcription, model=CODEX_MODEL):
+    def __init__(self, transcription, model=CODEX_MODEL, context=""):
         super().__init__()
         self.transcription = transcription
         self.model = model
+        self.context = context
 
     def run(self):
         exe = shutil.which("codex")
@@ -274,10 +358,10 @@ class CodexCliThread(QThread):
             return
 
         config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
-        prompt = (
-            config.get("system_prompt", "Eres un asistente útil.")
-            + "\n\nTranscription: " + self.transcription
-        )
+        prompt = config.get("system_prompt", "Eres un asistente útil.")
+        if self.context:
+            prompt += f"\n\nContexto de la conversación:\n{self.context}"
+        prompt += "\n\nTranscription: " + self.transcription
 
         out_path = None
         try:
