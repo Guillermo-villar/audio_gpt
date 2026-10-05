@@ -1254,13 +1254,15 @@ class WhisperApp(QMainWindow):
         gpt_input = f"{lane}: {text}" if lane and not text.startswith(lane) else text
         if effort == "medium":
             effort = self._review_effort("medium")
+        # Borradores: boceto corto y rápido; revisiones: respuesta completa.
+        max_tokens = 400 if kind == "Borrador" else None
 
         if engine == "codex":
             thread = CodexCliThread(gpt_input, context=context)
         elif engine == "cloudflare":
             thread = GptQueryThread(
                 None, gpt_input, engine="cloudflare",
-                context=context, effort=effort)
+                context=context, effort=effort, max_tokens=max_tokens)
         else:
             gpt_key = ApiKeyManager.load_api_key("openai")
             if not gpt_key:
@@ -1269,7 +1271,8 @@ class WhisperApp(QMainWindow):
                 )
                 return
             thread = GptQueryThread(
-                gpt_key, gpt_input, context=context, effort=effort)
+                gpt_key, gpt_input, context=context, effort=effort,
+                max_tokens=max_tokens)
 
         header = f"[{kind}] {gpt_input}" if kind else gpt_input
         self._gpt_threads.append(thread)

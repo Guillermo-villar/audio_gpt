@@ -216,7 +216,7 @@ class GptClient:
 
     @staticmethod
     def send_to_gpt(api_key, transcription, engine="openai", context="",
-                    effort=None):
+                    effort=None, max_tokens=None):
         """Envía la transcripción a GPT y devuelve (ok, respuesta_o_error).
 
         engine="cloudflare" usa Workers AI (openai/gpt-6-luna servido por CF,
@@ -246,7 +246,10 @@ class GptClient:
                 base_url=(f"https://api.cloudflare.com/client/v4/accounts/"
                           f"{account}/ai/v1"),
             )
-            model = config.get("cf_model", "openai/gpt-6-luna")
+            # Workers AI nativo va en créditos/free tier; los modelos de
+            # terceros (openai/*) requieren saldo en la gateway o BYOK.
+            model = config.get(
+                "cf_model", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
         else:
             client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
             model = config.get("model", DEFAULT_GPT_CONFIG["model"])
@@ -261,7 +264,7 @@ class GptClient:
             "model": model,
             "instructions": config.get("system_prompt", "Eres un asistente útil."),
             "input": gpt_input,
-            "max_output_tokens": config.get("max_tokens", 2000),
+            "max_output_tokens": max_tokens or config.get("max_tokens", 2000),
         }
         if config.get("temperature") is not None:
             kwargs["temperature"] = config["temperature"]
@@ -276,6 +279,20 @@ class GptClient:
             kwargs["service_tier"] = config["service_tier"]
 
         try:
+            if engine == "cloudflare" and model.startswith("@cf/"):
+                # Workers AI nativo: endpoint de chat completions (el de
+                # responses no acepta modelos @cf/*).
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system",
+                         "content": kwargs["instructions"]},
+                        {"role": "user", "content": kwargs["input"]},
+                    ],
+                    max_tokens=kwargs["max_output_tokens"],
+                )
+                text = response.choices[0].message.content
+                return (True, text) if text else (False, "La API no devolvió texto")
             response = client.responses.create(**kwargs)
         except BadRequestError as e:
             # Los modelos de razonamiento rechazan temperature/top_p; los no
@@ -305,18 +322,20 @@ class GptQueryThread(QThread):
     query_complete = Signal(bool, str)
 
     def __init__(self, api_key, transcription, engine="openai", context="",
-                 effort=None):
+                 effort=None, max_tokens=None):
         super().__init__()
         self.api_key = api_key
         self.transcription = transcription
         self.engine = engine
         self.context = context
         self.effort = effort
+        self.max_tokens = max_tokens
 
     def run(self):
         success, result = GptClient.send_to_gpt(
             self.api_key, self.transcription, engine=self.engine,
-            context=self.context, effort=self.effort)
+            context=self.context, effort=self.effort,
+            max_tokens=self.max_tokens)
         self.query_complete.emit(success, result)
 
 
