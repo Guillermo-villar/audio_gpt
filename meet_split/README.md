@@ -31,6 +31,13 @@ PC real con audio esto no ocurre.
 - El hook (`injected.js`) envuelve `RTCPeerConnection` antes de que Meet
   lo use (`document_start`). Los tracks remotos pueden llegar sin
   `e.streams` — no se exige.
+- CAVEAT (investigación EXA 2026-10): Google Meet NO garantiza un track
+  por asistente — su SFU puede agregar varios participantes en un mismo
+  "virtual stream" y el hablante real solo se identifica por CSRC en el
+  RTP. Es decir: Meet-Sn ≈ "canal de audio", no "persona". Para
+  atribución a nombre real, el camino fiable es híbrido: captions DOM de
+  Meet (llevan nombre del hablante) cruzadas por tiempo con nuestros
+  streams — igual que documentan Vexa/Orbit/Kuali.
 - `test_page.html` es la "Meet sintética" local: dos PCs en loopback con
   voces reales en loop. Sírvelo con cualquier servidor estático
   (`python -m http.server`) para reproducir la prueba.
