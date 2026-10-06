@@ -1080,12 +1080,18 @@ class WhisperApp(QMainWindow):
         self.continuous_button.setFont(QFont("Arial", 12, QFont.Bold))
         self._style_continuous_button(start=True)
         self.continuous_button.clicked.connect(self.toggle_continuous_mode)
-        main_layout.addWidget(self.continuous_button)
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(self.continuous_button, 1)
+        self.config_toggle_button = QPushButton("Ocultar configuración")
+        self.config_toggle_button.setCheckable(True)
+        self.config_toggle_button.toggled.connect(self.toggle_configuration)
+        controls_layout.addWidget(self.config_toggle_button)
+        main_layout.addLayout(controls_layout)
 
-        splitter = QSplitter(Qt.Vertical)
+        splitter = self.main_splitter = QSplitter(Qt.Vertical)
         main_layout.addWidget(splitter, 1)
 
-        top = QWidget()
+        top = self.config_panel = QWidget()
         top_layout = QVBoxLayout(top)
 
         # --- captura ---
@@ -1205,7 +1211,7 @@ class WhisperApp(QMainWindow):
 
         # --- salidas ---
         bottom = QWidget()
-        bottom_layout = QVBoxLayout(bottom)
+        bottom_layout = self.output_layout = QVBoxLayout(bottom)
 
         out_group = QGroupBox("Transcripción")
         out_layout = QVBoxLayout(out_group)
@@ -1292,6 +1298,16 @@ class WhisperApp(QMainWindow):
         self.status_bar.showMessage("Listo")
 
         self._on_provider_changed()
+
+    def toggle_configuration(self, hidden):
+        if hidden:
+            self._expanded_splitter_sizes = self.main_splitter.sizes()
+        self.config_panel.setVisible(not hidden)
+        self.output_layout.setStretch(1, 1 if hidden else 0)
+        self.config_toggle_button.setText(
+            "Mostrar configuración" if hidden else "Ocultar configuración")
+        if not hidden:
+            self.main_splitter.setSizes(self._expanded_splitter_sizes)
 
     def _style_continuous_button(self, start):
         color, hover, pressed = (
