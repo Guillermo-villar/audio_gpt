@@ -18,19 +18,24 @@ pip install -r requirements.txt
 Si hay cambios locales sin commitear en la working tree, `git stash` antes
 del pull o se pisarán.
 
-## 2. Arrancar
+## 2. Arrancar — config para llamada de 3+ personas ES/EN
 
 ```powershell
 python main.py
 ```
 
-En la GUI: Fuente = "Loopback + micro (2 carriles)", Proveedor = "deepgram",
-Modelo = "flux-general-multi". Reproduce un podcast/vídeo en inglés para
-tener audio real (YouTube sirve).
+En la GUI: **Fuente = "Loopback + micro (2 carriles)"**, **Proveedor =
+"deepgram"**, **Modelo = "nova-3"**, idioma `multi` (ES↔EN code-switching
+nativo) y marca **"Diarizar"**: el carril loopback separa a los 3
+entrevistadores en speakers 0/1/2. El micro (tu voz) va por Flux aparte.
+
+Para probar sin call real: reproduce una entrevista/podcast en YouTube
+con varios hablantes.
 
 ## 3. Qué verificar (checklist de pruebas)
 
-- [ ] STT en vivo: el transcript muestra líneas "Entrevistador:" en azul.
+- [ ] STT en vivo: transcript con "Entrevistador:" azul / "Tú:" verde.
+- [ ] Diarización: con varias voces, aparecen etiquetas de speaker distintas.
 - [ ] Modo compacto: `Ctrl+I` abre el overlay siempre encima (arrastrable,
       doble-clic oculta). Repítelo para cerrar.
 - [ ] Hotkeys con otra ventana enfocada (ej. el navegador):
@@ -44,10 +49,31 @@ tener audio real (YouTube sirve).
       respuestas se adaptan a ese contexto (menciona tu puesto/experiencia).
 - [ ] Fijar: selecciona una línea del transcript, pulsa Fijar; en la
       siguiente respuesta el modelo usa ese dato.
-- [ ] Diarizar: con nova-3 + `diarize=true`, un solo stream separa
-      hablantes en carriles (speaker 0/1 → Entrevistador/Tú).
 - [ ] Guardar: "Guardar" crea `transcripts/transcripcion_*.txt` con todo.
 
 Si auto-GPT no dispara con auto-GPT ON: puede ser el gate clef-flash sin
 credenciales CF (cae a la heurística local, menos precisa) — revisar
 cloudflare_api_key.txt / cloudflare_account_id.txt.
+
+## 4. meet_split — audio por asistente en Google Meet (PoC)
+
+Separa cada asistente de una Meet en un canal de audio propio (Chrome
+extension que engancha los tracks WebRTC) → un stream Deepgram por
+asistente.
+
+```powershell
+pip install websockets          # ya está en requirements.txt
+$env:DEEPGRAM_API_KEY = "<DEEPGRAM_KEY>"
+python meet_split\server.py     # escucha ws://127.0.0.1:8765
+```
+
+Luego en Chrome: `chrome://extensions` → modo desarrollador →
+"Cargar descomprimida" → carpeta `meet_split/` → únete a la llamada.
+En la consola del server aparecerá `[meet-split] track Meet-S1/S2/...`
+y transcripts `[Meet-Sn] (FINAL) ...` por canal. WAVs por canal en
+`meet_split/out/`.
+
+**Caveat**: Meet puede agregar varios asistentes en un mismo "virtual
+stream" del SFU — Meet-Sn ≈ canal, no garantía 1:1 persona. Si no salen
+tracks, plan B = la config del punto 2 (nova-3+multi+diarize sobre el
+loopback mezclado).
