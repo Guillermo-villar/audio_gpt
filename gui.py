@@ -193,9 +193,9 @@ def _install_ll_hook(dispatch):
 # ---------------------------------------------------------------------------
 
 
-def render_markdown(doc, text):
+def render_markdown(doc, text, font_px=13):
     doc.setDefaultStyleSheet(
-        "body { color: #d4d6d9; font-size: 13px; }"
+        f"body {{ color: #d4d6d9; font-size: {font_px}px; }}"
         "a { color: #8ab4f8; }"
         "table { border-collapse: collapse; }"
         "th, td { border: 1px solid #3a3d42; padding: 3px 6px; }"
@@ -292,10 +292,11 @@ class _AutoHeightBrowser(QTextBrowser):
 class AnswerCard(QFrame):
     content_changed = Signal()
 
-    def __init__(self, kind, model_label, question, parent=None):
+    def __init__(self, kind, model_label, question, font_px=13, parent=None):
         super().__init__(parent)
         self.kind = kind
         self.model_label = model_label
+        self.font_px = font_px
         self.question = question or "(transcript completo)"
         self.text = ""
         self.done = False
@@ -318,7 +319,8 @@ class AnswerCard(QFrame):
         header = QHBoxLayout()
         self.header_label = QLabel()
         self.header_label.setStyleSheet(
-            "color: #d4d6d9; font-weight: 600; font-size: 11px;")
+            f"color: #d4d6d9; font-weight: 600; "
+            f"font-size: {11 + (font_px > 13)}px;")
         self.status_label = QLabel()
         self.status_label.setStyleSheet(
             "color: #9aa0a6; font-size: 10px;")
@@ -331,10 +333,13 @@ class AnswerCard(QFrame):
         self.question_label = QLabel(f"«…» {short_question}")
         self.question_label.setWordWrap(False)
         self.question_label.setStyleSheet(
-            "color: #9aa0a6; font-style: italic; font-size: 10px;")
+            f"color: #9aa0a6; font-style: italic; "
+            f"font-size: {10 + (font_px > 13)}px;")
         layout.addWidget(self.question_label)
         self.body = _AutoHeightBrowser()
-        self.body.setFont(QFont("Segoe UI", 10))
+        body_font = QFont("Segoe UI")
+        body_font.setPixelSize(font_px)
+        self.body.setFont(body_font)
         self.body.setReadOnly(True)
         self.body.setOpenExternalLinks(False)
         self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -397,10 +402,10 @@ class AnswerCard(QFrame):
             self._pending_text = None
 
     def _render_text(self, text):
-        render_markdown(self.body.document(), text)
+        render_markdown(self.body.document(), text, self.font_px)
         if not self.ok:
             self.body.document().setDefaultStyleSheet(
-                "body { color: #e57373; font-size: 13px; }")
+                f"body {{ color: #e57373; font-size: {self.font_px}px; }}")
         self._last_render = time.monotonic()
         self.body.recompute_height()
         self.updateGeometry()
@@ -422,8 +427,9 @@ class AnswerCard(QFrame):
 class AnswerFeed(QScrollArea):
     content_changed = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, font_px=13, parent=None):
         super().__init__(parent)
+        self.font_px = font_px
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -450,7 +456,8 @@ class AnswerFeed(QScrollArea):
             self._release_anchor)
 
     def start(self, key, kind, model_label, question):
-        card = AnswerCard(kind, model_label, question, self.container)
+        card = AnswerCard(
+            kind, model_label, question, self.font_px, parent=self.container)
         card.content_changed.connect(self._schedule_content_changed)
         self._cards.append((key, card))
         self._by_key[key] = card
@@ -585,7 +592,7 @@ class CompactOverlay(QWidget):
         panel_layout.addWidget(self.interviewer_live)
         panel_layout.addWidget(self.you_live)
 
-        self.feed = AnswerFeed(panel)
+        self.feed = AnswerFeed(font_px=13, parent=panel)
         panel_layout.addWidget(self.feed, 1)
         self.feed.content_changed.connect(self._schedule_resize)
 
@@ -1408,6 +1415,7 @@ class WhisperApp(QMainWindow):
         self._gate_pending = set()        # carriles con gate clef en vuelo
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
         self._hide_from_capture = self.settings.get("hide_from_capture", True)
+        self._initial_splitter_sized = False
 
         self.init_ui()
         self.overlay = CompactOverlay()
@@ -1604,6 +1612,7 @@ class WhisperApp(QMainWindow):
             edit = QTextEdit()
             edit.setReadOnly(True)
             edit.setPlaceholderText(placeholder)
+            edit.setMaximumHeight(220)
             col.addWidget(edit)
             live = QLabel("En directo: \u2014")
             live.setWordWrap(True)
@@ -1636,12 +1645,23 @@ class WhisperApp(QMainWindow):
         hk_hint.setStyleSheet("color: #888; font-size: 11px;")
         self.send_to_gpt_button = QPushButton("Enviar a GPT")
         self.send_to_gpt_button.setStyleSheet(
-            "QPushButton { background-color: #5b4a8a; color: #d4d6d9; }"
+            "QPushButton { background-color: #5b4a8a; color: #d4d6d9;"
+            " border-radius: 8px; padding: 6px 18px; }"
             "QPushButton:hover { background-color: #6d5b9e; }"
+            "QPushButton:pressed { background-color: #4d3f78; }"
         )
-        self.send_to_gpt_button.setMinimumHeight(30)
+        self.send_to_gpt_button.setMinimumSize(170, 44)
+        self.send_to_gpt_button.setFont(QFont("Segoe UI", 12, QFont.Bold))
         self.send_to_gpt_button.clicked.connect(self.send_to_gpt)
         self.smarter_button = QPushButton("Más a fondo")
+        self.smarter_button.setMinimumSize(140, 44)
+        self.smarter_button.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        self.smarter_button.setStyleSheet(
+            "QPushButton { background: #2b2d31; color: #cdb8ff;"
+            " border: 1px solid #b08cff; border-radius: 8px;"
+            " padding: 6px 14px; }"
+            "QPushButton:hover { background: #34303f; }"
+        )
         self.smarter_button.clicked.connect(self._hk_smarter)
         text_buttons.addWidget(self.copy_button)
         text_buttons.addWidget(self.save_button)
@@ -1659,19 +1679,20 @@ class WhisperApp(QMainWindow):
             "(necesita CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID). "
             "Codex CLI: usa tu suscripción ChatGPT (necesita codex instalado)."
         )
+        self.gpt_engine_combo.setMinimumHeight(44)
         text_buttons.addWidget(self.gpt_engine_combo)
         text_buttons.addWidget(self.send_to_gpt_button)
         text_buttons.addWidget(self.smarter_button)
         out_layout.addLayout(text_buttons)
-        bottom_layout.addWidget(out_group)
+        bottom_layout.addWidget(out_group, 2)
 
         gpt_group = QGroupBox("Respuestas GPT")
         gpt_layout = QVBoxLayout(gpt_group)
-        self.gpt_output = AnswerFeed()
-        self.gpt_output.setMinimumHeight(120)
+        self.gpt_output = AnswerFeed(font_px=15)
+        self.gpt_output.setMinimumHeight(260)
         gpt_layout.addWidget(self.gpt_output)
-        gpt_group.setMinimumHeight(150)
-        bottom_layout.addWidget(gpt_group)
+        gpt_group.setMinimumHeight(300)
+        bottom_layout.addWidget(gpt_group, 3)
 
         splitter.addWidget(bottom)
 
@@ -1681,11 +1702,24 @@ class WhisperApp(QMainWindow):
 
         self._on_provider_changed()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._initial_splitter_sized:
+            self._initial_splitter_sized = True
+            QTimer.singleShot(0, self._set_initial_splitter_sizes)
+
+    def _set_initial_splitter_sizes(self):
+        height = self.main_splitter.height()
+        if height <= 0 or not self.config_panel.isVisible():
+            return
+        bottom_height = round(height * 0.55)
+        self.main_splitter.setSizes([height - bottom_height, bottom_height])
+        self._expanded_splitter_sizes = self.main_splitter.sizes()
+
     def toggle_configuration(self, hidden):
         if hidden:
             self._expanded_splitter_sizes = self.main_splitter.sizes()
         self.config_panel.setVisible(not hidden)
-        self.output_layout.setStretch(1, 1 if hidden else 0)
         self.config_toggle_button.setText(
             "Mostrar configuración" if hidden else "Ocultar configuración")
         if not hidden:
