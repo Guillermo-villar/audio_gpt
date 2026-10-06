@@ -791,7 +791,7 @@ class WhisperApp(QMainWindow):
         self.is_continuous_mode = False
         self._gpt_threads = []
         self._dying_threads = []
-        self._ctx = deque(maxlen=16)      # últimas intervenciones «Carril: texto»
+        self._ctx = deque()               # transcript completo «Carril: texto»
         self._draft_state = {}            # carril -> interim ya respondido
         self._gate_pending = set()        # carriles con gate clef en vuelo
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
@@ -1480,22 +1480,15 @@ class WhisperApp(QMainWindow):
             return base
 
     def _build_context(self):
-        """Contexto por capas: brief pineado + hechos fijados + reciente.
-        Generoso a propósito — el input apenas cuesta latencia; lo que no
-        se permite perder: los fijados y tu última respuesta."""
+        """Contexto = transcript COMPLETO de la llamada + hechos fijados.
+        Con ~8k tokens a los 45 min el input cuesta <$0.001 y ~0.3s de
+        prefill — nada rueda, no hace falta ledger ni recorte."""
         parts = []
         if self._pinned:
             parts.append("Hechos fijados:\n" + "\n".join(self._pinned))
-        recent = list(self._ctx)[-14:]
-        if recent:
-            # tu última respuesta sustantiva nunca se pierde del contexto
-            if not any(x.startswith("Tú:") and len(x) > 40 for x in recent):
-                last_tu = next(
-                    (x for x in reversed(self._ctx)
-                     if x.startswith("Tú:") and len(x) > 40), None)
-                if last_tu:
-                    parts.append(f"Tu última respuesta: {last_tu}")
-            parts.append("Conversación reciente:\n" + "\n".join(recent))
+        convo = list(self._ctx)
+        if convo:
+            parts.append("Conversación completa:\n" + "\n".join(convo))
         return "\n\n".join(parts)
 
     def _fire_gpt(self, text, lane, kind, effort=None):

@@ -325,8 +325,11 @@ class GptClient:
             )
 
         if context:
-            gpt_input = (f"Contexto de la conversación:\n{context}\n\n"
-                         f"Nueva intervención: {transcription}")
+            gpt_input = (
+                f"Contexto de la conversación (transcript completo de la "
+                f"llamada, solo como referencia):\n{context}\n\n"
+                f"Última intervención del entrevistador — esto es lo que "
+                f"hay que responder ahora: {transcription}")
         else:
             gpt_input = f"Transcription: {transcription}"
 
