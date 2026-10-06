@@ -954,10 +954,27 @@ class WhisperApp(QMainWindow):
 
         out_group = QGroupBox("Transcripción")
         out_layout = QVBoxLayout(out_group)
-        self.transcription_output = QTextEdit()
-        self.transcription_output.setReadOnly(True)
-        self.transcription_output.setPlaceholderText("La transcripción aparecerá aquí…")
-        out_layout.addWidget(self.transcription_output)
+
+        lanes_row = QHBoxLayout()
+
+        def _lane_pane(title, color, placeholder):
+            col = QVBoxLayout()
+            lab = QLabel(title)
+            lab.setStyleSheet(f"color: {color}; font-weight: bold;")
+            col.addWidget(lab)
+            edit = QTextEdit()
+            edit.setReadOnly(True)
+            edit.setPlaceholderText(placeholder)
+            col.addWidget(edit)
+            return col, edit
+
+        col_int, self.interviewer_output = _lane_pane(
+            "Entrevistador", "#1a56db", "Voces de la llamada…")
+        col_you, self.you_output = _lane_pane(
+            "Tú (micro)", "#0f7a3d", "Tu voz…")
+        lanes_row.addLayout(col_int)
+        lanes_row.addLayout(col_you)
+        out_layout.addLayout(lanes_row)
 
         text_buttons = QHBoxLayout()
         self.copy_button = QPushButton("Copiar")
@@ -1171,7 +1188,7 @@ class WhisperApp(QMainWindow):
     def transcription_finished(self, success, result):
         self.transcribe_button.setEnabled(True)
         if success:
-            self.transcription_output.setPlainText(result)
+            self.interviewer_output.setPlainText(result)
             self.status_bar.showMessage("Transcripción completada")
         else:
             QMessageBox.critical(self, "Error", f"Error en la transcripción: {result}")
@@ -1218,7 +1235,8 @@ class WhisperApp(QMainWindow):
         self._set_controls_enabled(False)
         self.continuous_button.setText("DETENER TRANSCRIPCIÓN CONTINUA")
         self._style_continuous_button(start=False)
-        self.transcription_output.clear()
+        self.interviewer_output.clear()
+        self.you_output.clear()
         self._persist_settings()
 
         language = self._current_language()
@@ -1455,13 +1473,10 @@ class WhisperApp(QMainWindow):
     def _on_new_segment(self, text, lane=""):
         """Llamado con cada fragmento nuevo transcrito (modo continuo)."""
         display = f"{lane}: {text}" if lane else text
-        if lane:
-            color = "#1a56db" if lane == "Entrevistador" else "#0f7a3d"
-            self.transcription_output.append(
-                f'<b style="color:{color}">{html.escape(lane)}:</b> '
-                f'{html.escape(text)}')
+        if lane == "Tú":
+            self.you_output.append(html.escape(text))
         else:
-            self.transcription_output.append(html.escape(text))
+            self.interviewer_output.append(html.escape(text))
 
         if not text.strip():
             return
@@ -1547,14 +1562,25 @@ class WhisperApp(QMainWindow):
 
     # ------------------------- texto / gpt manual -------------------------
 
+    def _transcript_text(self):
+        """Ambos carriles en texto plano, con cabecera de carril."""
+        parts = []
+        it = self.interviewer_output.toPlainText().strip()
+        you = self.you_output.toPlainText().strip()
+        if it:
+            parts.append("Entrevistador:\n" + it)
+        if you:
+            parts.append("Tú:\n" + you)
+        return "\n\n".join(parts)
+
     def copy_text(self):
-        text = self.transcription_output.toPlainText()
+        text = self._transcript_text()
         if text:
             QApplication.clipboard().setText(text)
             self.status_bar.showMessage("Copiado al portapapeles")
 
     def save_text(self):
-        text = self.transcription_output.toPlainText()
+        text = self._transcript_text()
         if not text:
             QMessageBox.warning(self, "Advertencia", "No hay texto para guardar")
             return
@@ -1576,7 +1602,9 @@ class WhisperApp(QMainWindow):
 
     def pin_selection(self):
         """Fija el texto seleccionado del transcript: va en cada llamada."""
-        sel = self.transcription_output.textCursor().selectedText()
+        sel = self.interviewer_output.textCursor().selectedText()
+        if not sel.strip():
+            sel = self.you_output.textCursor().selectedText()
         sel = sel.replace("\u2029", "\n").strip()
         if not sel:
             self.status_bar.showMessage("Selecciona texto en la transcripción para fijarlo")
@@ -1586,7 +1614,8 @@ class WhisperApp(QMainWindow):
             f"Fijado ({len(self._pinned)} hecho(s) en contexto): {sel[:60]}")
 
     def clear_text(self):
-        self.transcription_output.clear()
+        self.interviewer_output.clear()
+        self.you_output.clear()
         self.gpt_output.clear()
         self._ctx.clear()            # estado oculto no sobrevive al «Limpiar»
         self._draft_state.clear()
@@ -1594,7 +1623,7 @@ class WhisperApp(QMainWindow):
         self.status_bar.showMessage("Transcripción y contexto borrados")
 
     def send_to_gpt(self):
-        transcription = self.transcription_output.toPlainText()
+        transcription = self._transcript_text()
         if not transcription:
             QMessageBox.warning(self, "Advertencia", "No hay texto para enviar a GPT")
             return
