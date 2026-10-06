@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "meet-channel-split (PoC)",
+  "version": "0.1",
+  "description": "Extrae cada audio track remoto del RTCPeerConnection (un stream por asistente) y lo envia a un servidor local.",
+  "permissions": [],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://meet.google.com/*",
+        "http://127.0.0.1:8777/*",
+        "http://localhost:8777/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": [
+        "https://meet.google.com/*",
+        "http://127.0.0.1:8777/*",
+        "http://localhost:8777/*"
+      ]
+    }
+  ]
+}

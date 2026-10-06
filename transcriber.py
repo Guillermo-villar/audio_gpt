@@ -1,0 +1,504 @@
+"""Motor de transcripción con varios proveedores.
+
+Proveedores soportados:
+- openai           API de transcripción de OpenAI (gpt-4o-transcribe por
+                   defecto; también mini y diarize con etiquetas de hablante).
+- openai-realtime  Sesión de transcripción en tiempo real de la Realtime API:
+                   audio PCM16 a 24 kHz por WebSocket, VAD en servidor y
+                   transcripciones finales por turno de habla.
+- groq             whisper-large-v3-turbo hospedado en Groq (API compatible
+                   con OpenAI; ~$0.04/hora, muy rápido).
+- local            faster-whisper en la propia máquina (gratis, offline).
+
+Todos devuelven texto plano; el modelo diarize devuelve líneas
+"Hablante A: ..." para conservar las etiquetas de hablante.
+"""
+
+import base64
+import json
+import os
+import threading
+
+import numpy as np
+
+OPENAI_MODELS = [
+    ("gpt-4o-transcribe", "GPT-4o Transcribe (mejor calidad)"),
+    ("gpt-4o-mini-transcribe", "GPT-4o Mini Transcribe (barato)"),
+    ("gpt-4o-transcribe-diarize", "GPT-4o Transcribe Diarize (etiqueta hablantes)"),
+    ("whisper-1", "Whisper-1 (legacy)"),
+]
+
+GROQ_MODELS = [
+    ("whisper-large-v3-turbo", "Whisper Large v3 Turbo (rápido y casi gratis)"),
+    ("whisper-large-v3", "Whisper Large v3"),
+]
+
+LOCAL_MODELS = [
+    ("large-v3-turbo", "Large v3 Turbo (mejor, ~1.6 GB)"),
+    ("large-v3", "Large v3 (~3 GB)"),
+    ("small", "Small (ligero)"),
+    ("base", "Base (muy ligero)"),
+]
+
+REALTIME_MODELS = [
+    ("gpt-4o-transcribe", "GPT-4o Transcribe (streaming)"),
+    ("gpt-4o-transcribe-diarize", "GPT-4o Transcribe Diarize (streaming)"),
+    ("gpt-live-transcribe", "GPT Live Transcribe (menor latencia)"),
+]
+
+DEEPGRAM_MODELS = [
+    ("flux-general-multi", "Flux Multi (menor latencia, ES+EN)"),
+    ("flux-general-en", "Flux (inglés, menor latencia)"),
+    ("nova-3-multilingual", "Nova-3 Multi (más preciso, ES+EN)"),
+    ("nova-3", "Nova-3 (inglés, más preciso)"),
+]
+
+PROVIDERS = {
+    "openai": {
+        "label": "OpenAI (nube)",
+        "models": OPENAI_MODELS,
+        "key_env": "OPENAI_API_KEY",
+        "help": "Pago por uso (~$0.003–0.006/min). La mejor calidad sin instalar nada.",
+    },
+    "openai-realtime": {
+        "label": "OpenAI Realtime (streaming)",
+        "models": REALTIME_MODELS,
+        "key_env": "OPENAI_API_KEY",
+        "help": "Transcripción en directo por WebSocket con VAD en servidor.",
+    },
+    "groq": {
+        "label": "Groq (whisper v3 turbo)",
+        "models": GROQ_MODELS,
+        "key_env": "GROQ_API_KEY",
+        "help": "~$0.04/hora. Consigue la key en console.groq.com — API compatible con OpenAI.",
+    },
+    "local": {
+        "label": "Local (faster-whisper, gratis)",
+        "models": LOCAL_MODELS,
+        "key_env": None,
+        "help": "Gratis y privado. Descarga el modelo la primera vez; usa CPU o GPU.",
+    },
+    "deepgram": {
+        "label": "Deepgram (streaming)",
+        "models": DEEPGRAM_MODELS,
+        "key_env": "DEEPGRAM_API_KEY",
+        "streaming": True,
+        "help": "Flux ~20ms EOT / Nova-3 ~250ms y ~1.6% WER. ~$0.006-0.008/min. "
+                "Key en console.deepgram.com — también transcribe archivos por REST.",
+    },
+}
+
+DEFAULT_PROVIDER = "openai"
+DEFAULT_MODEL = "gpt-4o-transcribe"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
+REALTIME_SAMPLE_RATE = 24000
+DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"      # nova-3
+DEEPGRAM_FLUX_URL = "wss://api.deepgram.com/v2/listen"  # flux-*
+DEEPGRAM_REST_URL = "https://api.deepgram.com/v1/listen"
+DEEPGRAM_SAMPLE_RATE = 16000
+
+# Texto guía para mejorar vocabulario técnico en ES/EN (solo modelos gpt-4o-*)
+DEFAULT_PROMPT = (
+    "Transcripción de una conversación o presentación técnica en español o inglés. "
+    "Puede contener términos de programación, machine learning y entrevistas técnicas."
+)
+
+
+def _client(api_key, provider):
+    from openai import OpenAI
+
+    if provider == "groq":
+        key = api_key or os.environ.get("GROQ_API_KEY")
+        return OpenAI(api_key=key, base_url=GROQ_BASE_URL)
+    return OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
+
+
+def _format_diarized(result):
+    """TranscriptionDiarized -> texto con etiquetas de hablante."""
+    lines = []
+    for seg in getattr(result, "segments", []) or []:
+        speaker = getattr(seg, "speaker", "?")
+        text = getattr(seg, "text", "").strip()
+        if text:
+            lines.append(f"Hablante {speaker}: {text}")
+    return "\n".join(lines) if lines else getattr(result, "text", "")
+
+
+def transcribe_file(api_key, file_path, language=None, provider=DEFAULT_PROVIDER,
+                    model=DEFAULT_MODEL, prompt=None):
+    """Transcribe un archivo de audio. Devuelve texto o lanza excepción."""
+    if provider == "local":
+        return _transcribe_local(file_path, language, model)
+    if provider == "deepgram":
+        return _transcribe_deepgram(api_key, file_path, language, model)
+
+    client = _client(api_key, provider)
+    params = {"model": model, "file": open(file_path, "rb")}
+    try:
+        if language:
+            params["language"] = language
+        if model == "gpt-4o-transcribe-diarize":
+            params["response_format"] = "diarized_json"
+            result = client.audio.transcriptions.create(**params)
+            return _format_diarized(result)
+        if model.startswith("gpt-4o"):
+            params["prompt"] = prompt or DEFAULT_PROMPT
+        result = client.audio.transcriptions.create(**params)
+        return result.text
+    finally:
+        params["file"].close()
+
+
+# ------------------------- motor local -------------------------
+
+_local_model_cache = {}
+_local_lock = threading.Lock()
+
+
+def _transcribe_local(file_path, language, model_size):
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise RuntimeError(
+            "faster-whisper no está instalado. Instálalo con:\n"
+            "  pip install faster-whisper"
+        )
+
+    with _local_lock:
+        if model_size not in _local_model_cache:
+            _local_model_cache[model_size] = WhisperModel(
+                model_size, device="auto", compute_type="int8"
+            )
+        model = _local_model_cache[model_size]
+
+    segments, _info = model.transcribe(
+        file_path,
+        language=language or None,
+        vad_filter=True,
+        beam_size=5,
+    )
+    return " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+
+
+# ------------------------- deepgram -------------------------
+
+def _transcribe_deepgram(api_key, file_path, language, model):
+    """Prerecorded REST: POST /v1/listen con el audio en el body."""
+    import urllib.parse
+    import urllib.request
+
+    key = api_key or os.environ.get("DEEPGRAM_API_KEY")
+    if not key:
+        raise RuntimeError("Falta la API key de Deepgram")
+    q = {"model": model, "punctuate": "true", "smart_format": "true"}
+    if language:
+        q["language"] = language
+    url = DEEPGRAM_REST_URL + "?" + urllib.parse.urlencode(q)
+    with open(file_path, "rb") as f:
+        body = f.read()
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Authorization": f"Token {key}", "Content-Type": "audio/wav"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Deepgram HTTP {e.code}: {e.read()[:400]!r}")
+    return (data["results"]["channels"][0]["alternatives"][0]
+            .get("transcript", ""))
+
+
+def _tag_speakers(words):
+    """Agrupa palabras contiguas por hablante y emite <S#> una vez por
+    segmento. Descarta micro-cambios de 1-2 palabras, habituales como
+    ruido de diarización dentro de una misma frase."""
+    segments = []
+    for w in words:
+        speaker = w.get("speaker", -1)
+        token = w.get("punctuated_word", w.get("word", "")).strip()
+        if not token:
+            continue
+        if segments and segments[-1][0] == speaker:
+            segments[-1][1].append(token)
+        else:
+            segments.append([speaker, [token]])
+
+    merged = []
+    for speaker, tokens in segments:
+        if merged and len(tokens) <= 2 and merged[-1][0] != speaker:
+            merged[-1][1].extend(tokens)
+        elif merged and merged[-1][0] == speaker:
+            merged[-1][1].extend(tokens)
+        else:
+            merged.append([speaker, tokens])
+
+    lines = []
+    for speaker, tokens in merged:
+        text = " ".join(tokens)
+        lines.append(text if speaker < 0 else f"<S{speaker}> {text}")
+    return "\n".join(lines)
+
+
+class DeepgramRealtime:
+    """Streaming STT vía wss://api.deepgram.com/v1/listen.
+
+    PCM16 mono crudo por frames binarios; eventos Results con is_final.
+    Flux detecta fin de turno en servidor (endpointing); sin VAD en cliente.
+    """
+
+    def __init__(self, api_key, model="flux-general-multi", language=None,
+                 on_transcript=None, on_error=None, on_status=None,
+                 diarize=False, keyterms=None):
+        self.api_key = api_key
+        self.model = model
+        self.language = language
+        self.diarize = diarize        # solo nova-3: etiquetas <S0>/<S1> por voz
+        self.keyterms = list(keyterms or [])
+        self.on_transcript = on_transcript or (lambda t, final: None)
+        self.on_error = on_error or (lambda e: None)
+        self.on_status = on_status or (lambda e: None)
+        self._ws = None
+        self._recv_thread = None
+        self._running = False
+        self._final_event = threading.Event()
+        self.sample_rate = DEEPGRAM_SAMPLE_RATE
+
+    def start(self):
+        import websocket
+        import urllib.parse
+
+        if self.model == "nova-3-multilingual":
+            self.model = "nova-3"
+            self.language = "multi"   # multilingual = nova-3 + language=multi
+
+        if self.model.startswith("flux"):
+            # Flux vive en /v2/listen con parámetros distintos a /v1.
+            q = {
+                "model": self.model,
+                "encoding": "linear16",
+                "sample_rate": DEEPGRAM_SAMPLE_RATE,
+            }
+            base = DEEPGRAM_FLUX_URL
+        else:
+            q = {
+                "model": self.model,
+                "encoding": "linear16",
+                "sample_rate": DEEPGRAM_SAMPLE_RATE,
+                "channels": 1,
+                "punctuate": "true",
+                "smart_format": "true",
+                "interim_results": "true",
+                "endpointing": 300,
+            }
+            if self.diarize:
+                q["diarize"] = "true"
+            if self.keyterms:
+                q["keyterm"] = self.keyterms   # jargon boosting (nova-3)
+            base = DEEPGRAM_URL
+            if self.language and "multi" not in self.model:
+                q["language"] = self.language   # multi detecta idiomas solo
+        url = base + "?" + urllib.parse.urlencode(q, doseq=True)
+        self._ws = websocket.create_connection(
+            url,
+            header=[f"Authorization: Token {self.api_key}"],
+            timeout=30,
+        )
+        self._running = True
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._recv_thread.start()
+
+    def send_audio(self, pcm16_bytes):
+        """Frames binarios PCM16 mono (no JSON)."""
+        if self._ws is not None:
+            self._ws.send_binary(pcm16_bytes)
+
+    def commit(self):
+        """Fuerza el fin del turno actual (v1: Finalize; v2/Flux: ForceEndTurn)."""
+        if self._ws is not None:
+            kind = "ForceEndTurn" if self.model.startswith("flux") else "Finalize"
+            self._ws.send(json.dumps({"type": kind}))
+
+    def _recv_loop(self):
+        try:
+            while self._running:
+                raw = self._ws.recv()
+                if not raw:
+                    break
+                event = json.loads(raw)
+                etype = event.get("type", "")
+                if etype == "Results":   # /v1 (nova-3): resultados por utterance
+                    alts = (event.get("channel", {})
+                            .get("alternatives") or [])
+                    alt = alts[0] if alts else {}
+                    if (self.diarize and event.get("is_final")
+                            and alt.get("words")):
+                        text = _tag_speakers(alt["words"])
+                    else:
+                        text = alt.get("transcript", "")
+                    if text:
+                        self.on_transcript(text, bool(event.get("is_final")))
+                        if event.get("is_final"):
+                            self._final_event.set()
+                elif etype == "TurnInfo":   # /v2 (flux): turnos con transcript
+                    text = event.get("transcript", "")
+                    is_final = event.get("event") == "EndOfTurn"
+                    if text:
+                        self.on_transcript(text, is_final)
+                    if is_final:
+                        self._final_event.set()
+                elif etype == "Error":
+                    self.on_error(json.dumps(event))
+                elif etype in ("Metadata", "SpeechStarted", "UtteranceEnd"):
+                    self.on_status(etype)
+        except Exception as e:
+            if self._running:
+                self.on_error(str(e))
+
+    def stop(self):
+        """CloseStream + drenaje acotado de los últimos resultados."""
+        try:
+            if self._ws is not None:
+                self._final_event.clear()
+                self._ws.send(json.dumps({"type": "CloseStream"}))
+                self._final_event.wait(1.5)
+                self._running = False
+                self._ws.close()
+        except Exception:
+            pass
+        self._running = False
+        self._ws = None
+
+
+# ------------------------- tiempo real (WebSocket) -------------------------
+
+class RealtimeTranscriber:
+    """Sesión de transcripción de la Realtime API por WebSocket.
+
+    - Envía PCM16 mono a 24 kHz con `send_audio`.
+    - Con server_vad, la API detecta turnos y emite transcripciones finales.
+    - `on_transcript(texto, es_final)` recibe deltas y resultados finales.
+    - `on_error(mensaje)` para errores; `on_status` opcional para eventos.
+    """
+
+    def __init__(self, api_key, model="gpt-4o-transcribe", language=None,
+                 prompt=None, on_transcript=None, on_error=None, on_status=None):
+        self.api_key = api_key
+        self.model = model
+        self.language = language
+        self.prompt = prompt
+        self.on_transcript = on_transcript or (lambda t, final: None)
+        self.on_error = on_error or (lambda e: None)
+        self.on_status = on_status or (lambda e: None)
+        self._ws = None
+        self._recv_thread = None
+        self._running = False
+        self._final_event = threading.Event()
+        self.sample_rate = REALTIME_SAMPLE_RATE
+
+    def start(self):
+        import websocket  # websocket-client
+
+        self._ws = websocket.create_connection(
+            REALTIME_URL,
+            header=[f"Authorization: Bearer {self.api_key}", "OpenAI-Beta: realtime=v1"],
+            timeout=30,
+        )
+        self._running = True
+        self._send_session_update()
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._recv_thread.start()
+
+    def _send_session_update(self):
+        turn_detection = {"type": "server_vad", "threshold": 0.5,
+                          "prefix_padding_ms": 300, "silence_duration_ms": 500}
+        if self.model == "gpt-live-transcribe":
+            turn_detection = None  # este modelo no admite server_vad
+
+        transcription = {"model": self.model}
+        if self.model == "gpt-live-transcribe":
+            # live usa `languages` (array) y admite delay bajo; no `language`
+            if self.language:
+                transcription["languages"] = [self.language]
+            transcription["delay"] = "low"
+        elif self.language:
+            transcription["language"] = self.language
+        if self.prompt and self.model != "gpt-4o-transcribe-diarize":
+            transcription["prompt"] = self.prompt
+
+        event = {
+            "type": "transcription_session.update",
+            "session": {
+                "type": "transcription",
+                "input_audio_format": "pcm16",
+                "input_audio_transcription": transcription,
+                "turn_detection": turn_detection,
+                "input_audio_noise_reduction": {"type": "near_field"},
+            },
+        }
+        self._ws.send(json.dumps(event))
+
+    def send_audio(self, pcm16_bytes):
+        """Envía un bloque de audio PCM16 mono 24 kHz."""
+        if self._ws is None:
+            return
+        self._ws.send(json.dumps({
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(pcm16_bytes).decode("ascii"),
+        }))
+
+    def commit(self):
+        """Fuerza el fin del turno actual (útil con gpt-live-transcribe)."""
+        if self._ws is not None:
+            self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+    def _recv_loop(self):
+        try:
+            while self._running:
+                raw = self._ws.recv()
+                if not raw:
+                    break
+                event = json.loads(raw)
+                etype = event.get("type", "")
+
+                if etype == "conversation.item.input_audio_transcription.delta":
+                    self.on_transcript(event.get("delta", ""), False)
+                elif etype == "conversation.item.input_audio_transcription.completed":
+                    self.on_transcript(event.get("transcript", ""), True)
+                    self._final_event.set()
+                elif etype == "error":
+                    self.on_error(json.dumps(event.get("error", event)))
+                elif etype in ("input_audio_buffer.speech_started",
+                               "input_audio_buffer.speech_stopped",
+                               "input_audio_buffer.committed"):
+                    self.on_status(etype.rsplit(".", 1)[-1])
+        except Exception as e:
+            if self._running:
+                self.on_error(str(e))
+
+    def stop(self):
+        """Commit el audio pendiente y espera a la última transcripción."""
+        try:
+            if self._ws is not None:
+                self._final_event.clear()
+                self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                # Espera acotada a que llegue el último turno transcrito
+                self._final_event.wait(1.5)
+                self._running = False
+                self._ws.close()
+        except Exception:
+            pass
+        self._running = False
+        self._ws = None
+
+
+def pcm16_for_realtime(audio_float, src_rate, dst_rate=REALTIME_SAMPLE_RATE):
+    """float32 (mono o estéreo) a cualquier rate -> PCM16 mono dst_rate Hz."""
+    from vad import resample_linear
+
+    audio = resample_linear(audio_float, src_rate, dst_rate)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    audio = np.clip(audio, -1.0, 1.0)
+    return (audio * 32767).astype(np.int16).tobytes()

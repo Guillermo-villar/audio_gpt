@@ -1,143 +1,111 @@
-# 🎙️ audio_gpt con PyQT
+# 🎙️ audio_gpt
 
-**audio_gpt** es una aplicación discreta para **Windows 11** que captura el **audio interno del sistema** (como conferencias, vídeos o llamadas), lo transcribe en segundo plano utilizando la **API Whisper de OpenAI**, y gestiona el flujo de trabajo mediante un sistema **productor-consumidor** basado en colas.
+Aplicación de escritorio para **Windows** que graba el **audio del sistema** (reuniones, vídeos, llamadas) o el micrófono, lo **transcribe en directo** y, opcionalmente, envía cada fragmento a un **LLM** para obtener respuestas automáticas — pensada como copiloto para entrevistas técnicas, clases y reuniones.
 
-> ⚠️ Este proyecto **solo funciona en Windows 11**, ya que depende de dispositivos de grabación internos como *Stereo Mix*.
+## ✨ Qué hay de nuevo (v2)
 
----
+- **Sin VB-Cable**: captura el audio del sistema por **loopback WASAPI** nativo (con `soundcard`). VB-Cable sigue disponible como respaldo.
+- **VAD real**: segmenta por turnos de habla con `webrtcvad` en lugar de cortes fijos — no corta palabras y no gasta API en silencio.
+- **Modelos actuales**: `whisper-1` → `gpt-4o-transcribe` (o `gpt-4o-mini-transcribe`, más barato, o `gpt-4o-transcribe-diarize` con **etiquetas de hablante**).
+- **Streaming real**: proveedor *OpenAI Realtime* — WebSocket a la Realtime API con VAD en servidor; la transcripción llega por turnos casi en directo.
+- **Alternativas gratis/baratas**: *Groq* (`whisper-large-v3-turbo`, ~$0.04/h) y *local* con `faster-whisper` (offline, privado, sin coste).
+- **GPT moderno**: la respuesta usa la **Responses API** con `gpt-6-luna` por defecto (edítalo en `gpt_config.json`; alternativas: `gpt-5-mini`, `gpt-6.1-sol`). Los modelos de razonamiento no aceptan `temperature`, así que esa opción se ignora de forma segura.
+- **Copiloto en dos pasadas**: con streaming, un *borrador* responde sobre el texto parcial mientras la persona sigue hablando, y una *revisión* con más razonamiento y contexto de la conversación aterriza al cerrar el turno.
+- **Puerta de preguntas**: una heurística local filtra muletillas y charla — solo lo que suena a pregunta/encargo técnico llega al LLM.
+- **Deepgram**: *Flux* (~20 ms fin de turno) o *Nova-3* (~1.6% WER, `diarize` para etiquetar voces en llamadas de panel y `keyterm` para reforzar jerga técnica).
+- Migrado de **PyQt5 a PySide6** (Qt6: mejor soporte de HiDPI y licencia LGPL).
 
-## 🚀 Características
+## 🚀 Requisitos
 
-- ✅ Captura el audio interno del sistema (no del micrófono).
-- 🧠 Transcribe automáticamente usando la API de Whisper (OpenAI).
-- 🔁 Usa un sistema **asíncrono de productor-consumidor** para grabar y procesar en paralelo.
-- 🪟 Aplicación discreta, pensada para ejecutarse en segundo plano en Windows.
-- 💬 Transcripciones listas para ser usadas con modelos de lenguaje como GPT-4.
-
----
-
-## 🖥️ Requisitos
-
-- Windows 11
-- Python 3.9 o superior
-- Acceso a la API de OpenAI con créditos o plan activo
-- Dispositivo de grabación tipo **Stereo Mix** (activado en el sistema)
-
----
+- Windows 10/11
+- Python 3.9+ (probado con 3.13)
+- Una API key según el proveedor elegido:
+  - **OpenAI**: <https://platform.openai.com/api-keys> — pago por uso (~$0.003–0.006/min de transcripción). *Nota: la suscripción ChatGPT Plus/Pro no incluye uso de API; son productos separados.*
+  - **Deepgram**: <https://console.deepgram.com/> — streaming Flux (~20 ms fin de turno) / Nova-3 (~250 ms, ~1.6% WER), ~$0.006–0.008/min.
+  - **Groq**: <https://console.groq.com/keys> — casi gratis.
+  - **Local**: sin clave; instala `faster-whisper` y el modelo se descarga solo (~1.6 GB para `large-v3-turbo`).
+  - Para GPT también vale **Cloudflare Workers AI**: sirve `openai/gpt-6-luna` con endpoint compatible — define `CLOUDFLARE_API_TOKEN` y `CLOUDFLARE_ACCOUNT_ID` (o `cloudflare_api_key.txt` / `cloudflare_account_id.txt`).
 
 ## 📦 Instalación
 
-1. Clona el repositorio:
-
 ```bash
-git clone https://github.com/tu-usuario/audio_gpt.git
+git clone https://github.com/Guillermo-villar/audio_gpt.git
 cd audio_gpt
-```
-
-2. Crea y activa un entorno virtual:
-
-```bash
 python -m venv venv
 venv\Scripts\activate
-```
-
-3. Instala las dependencias:
-
-```bash
 pip install -r requirements.txt
+# opcional, para transcripción local gratuita:
+pip install faster-whisper
 ```
 
-4. Crea un archivo `.env` con tu clave de OpenAI:
+Crea un `.env` con tu clave (o déjalo y la app te la pedirá la primera vez):
 
 ```env
-OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_API_KEY=sk-...
+GROQ_API_KEY=gsk_...        # solo si usas Groq
+DEEPGRAM_API_KEY=...        # solo si usas Deepgram
 ```
 
----
-
-## 🧠 ¿Cómo funciona?
-
-El sistema se basa en dos componentes principales:
-
-### 🎤 Productor
-
-- Graba fragmentos de audio del sistema cada `X` segundos.
-- Coloca los fragmentos en una cola para ser transcritos.
-- Funciona en segundo plano continuamente.
-
-### 🧾 Consumidor
-
-- Toma fragmentos de audio desde la cola.
-- Llama a la **API de Whisper** de OpenAI.
-- Devuelve texto limpio, listo para ser mostrado, almacenado o enviado a otro modelo (GPT, etc).
-
----
-
-## 🛠️ Uso
-
-Lanza la aplicación principal:
+## ▶️ Uso
 
 ```bash
 python main.py
 ```
 
-Puedes configurar la duración de grabación, modelo Whisper (`whisper-1`, etc.), y otros parámetros desde `config.py` o como variables de entorno.
+1. **Fuente**: «Audio del sistema (loopback WASAPI)» — graba lo que suena sin tocar la configuración de Windows. Alternativas: micrófono, **«Loopback + micro (2 carriles)»** — captura dos canales independientes y etiqueta `Entrevistador:` (loopback) y `Tú:` (micro) como hace Granola — o VB-Cable.
+2. **Proveedor/modelo**: OpenAI `gpt-4o-transcribe` recomendado; `…-diarize` para reuniones con varios hablantes; *Deepgram* (`flux-general-multi`, el más rápido del mercado ~20 ms fin de turno; `nova-3-multilingual` si prefieres precisión ~1.6% WER) para latencia mínima; *OpenAI Realtime* (`gpt-live-transcribe`) como opción OpenAI-native; *Groq* o *local* para gastar (casi) nada. El modo dúo funciona con OpenAI/Groq/local/Deepgram — con Deepgram cada carril es un WebSocket propio — (no con OpenAI Realtime).
+3. Pulsa **INICIAR TRANSCRIPCIÓN CONTINUA**. La VAD detecta la voz y cada fragmento se transcribe y aparece en pantalla.
+4. Activa **«Responder con GPT automáticamente»**: la puerta de preguntas decide qué intervenciones se responden; con Deepgram verás un *[Borrador]* al vuelo y una *[Revisión]* al cerrar el turno. El motor puede ser *API OpenAI*, *Cloudflare AI (créditos CF)* o *Codex CLI (ChatGPT sub)* — este último gasta la cuota de tu suscripción en vez de la API (requiere `npm i -g @openai/codex` + `codex login`).
+5. **Opciones Deepgram**: «Diarizar (panel)» etiqueta `<S0>/<S1>` dentro de un carril (nova-3); «Términos clave» refuerza vocabulario técnico.
+6. **Grabar** (duración fija) + **Transcribir grabación** sigue disponible para uso puntual.
 
----
-
-## 📁 Estructura del proyecto
+## 📁 Estructura
 
 ```
 audio_gpt/
-├── main.py                  # Arranque del sistema productor-consumidor
-├── audio_capture.py         # Grabación de audio del sistema
-├── transcriber.py           # Conexión con la API de OpenAI (Whisper)
-├── queue_worker.py          # Gestión de la cola de tareas
-├── utils.py                 # Funciones auxiliares
-├── config.py                # Configuración del sistema
-├── .env                     # Tu clave API (no subir)
-├── requirements.txt         # Dependencias del proyecto
-└── README.md                # Este documento
+├── main.py           # Punto de entrada
+├── gui.py            # Interfaz PySide6 + hilos de captura/transcripción
+├── capture.py        # Loopback WASAPI (soundcard) y dispositivos (sounddevice)
+├── vad.py            # Segmentación por voz (webrtcvad)
+├── transcriber.py    # Motores: OpenAI, Realtime WS, Deepgram WS/REST, Groq, faster-whisper local
+├── api_client.py     # API keys, Responses API (GPT), compatibilidad
+├── recorder.py       # Diagnóstico de audio por línea de comandos
+├── gpt_config.json   # Modelo GPT, prompt de sistema, esfuerzo de razonamiento
+└── settings.json     # Última configuración elegida (autogenerado)
 ```
 
----
+## 🔐 Notas
 
-## 🧪 Ejemplo de resultado
-
-Transcripción generada desde un vídeo de conferencia:
-
-```
-"Buenos días a todos. Vamos a comenzar la presentación sobre inteligencia artificial aplicada a medicina..."
-```
-
----
-
-## 🔐 Seguridad
-
-- Usa `api_key.txt` para almacenar tu clave API de OpenAI de forma segura.
-- Asegúrate de que `api_key.txt` esté incluido en `.gitignore`!! Sino cualquiera tendrá acceso a tu clave de OpenAI.
-- Nunca subas tu clave a GitHub o compartas públicamente tu entorno.
-
----
-
-## 🧩 Ideas futuras
-
-- Transcripción en tiempo real (streaming).
-- Clasificación automática de fragmentos con GPT.
-- Exportación de texto a TXT, DOCX o PDF.
-- Interfaz gráfica opcional con PyQt para controlar grabación y procesamiento.
-
----
-
-## 🤝 Contribuciones
-
-¡Pull requests y sugerencias son bienvenidas!  
-Este proyecto está en desarrollo activo, así que cualquier mejora, refactorización o integración es bienvenida.
-
----
+- Las claves se guardan en `api_key.txt` / `<proveedor>_api_key.txt` (en `.gitignore`) o vía variables de entorno.
+- `gpt_config.json` controla el modelo y el prompt; `"reasoning_effort": "low"` da respuestas rápidas y baratas — súbelo a `"medium"` si necesitas más calidad.
 
 ## 📄 Licencia
 
-Este proyecto está licenciado bajo la [MIT License](LICENSE).
+MIT.
 
----
+## Uso durante la llamada (modo copiloto)
+
+- **Panel oculto** (`Ctrl+I`, único control de visibilidad): panel
+  semitransparente siempre encima — estado, lo que se oye en vivo y la
+  conversación con las respuestas (autoscroll a lo reciente). Crece suave
+  con el texto que llega de GPT. `Ctrl+flechas` lo mueve por la pantalla,
+  `Ctrl+±` ajusta su opacidad y también se arrastra con el ratón.
+- **Hotkeys globales** (2 teclas, funcionan con otra app enfocada — elegidas
+  para no interferir con el navegador). Cada comando deja constancia
+  visible (flash en el panel o toast flotante):
+  `Ctrl+Q` responder la última intervención del entrevistador ·
+  `Alt+G` enviar el transcript a GPT · `Ctrl+M` auto-GPT on/off ·
+  `Ctrl+I` panel · `Alt+T` start/stop transcripción.
+  Las respuestas de GPT nunca se copian solas al portapapeles.
+- **GPT solo bajo demanda** (toggle, activo por defecto): nada se envía
+  a GPT salvo orden explícita (botón «Enviar a GPT», `Ctrl+Q` o `Alt+G`);
+  el modo automático queda deshabilitado.
+- **Gate con clef-flash**: si hay credenciales de Cloudflare, cada
+  intervención se evalúa con `@cf/cloudflare/clef-flash` (9B, gratis en
+  neuronas, ~0.3s) — mejor precisión que la heurística de palabras clave,
+  que queda como fallback offline.
+- **Brief de la entrevista**: puesto, empresa, experiencia aprobada y
+  límites — va en el system prompt de cada llamada (nunca fabrica
+  experiencia que el brief no respalde).
+- **Fijar**: selecciona texto del transcript y fíjalo — requisitos y
+  decisiones entran en el contexto permanente.
