@@ -34,22 +34,38 @@ con varios hablantes.
 
 ## 3. Qué verificar (checklist de pruebas)
 
-- [ ] UI clara: toda la app en tema claro (fondo claro, campos blancos,
-      texto oscuro) aunque Windows esté en modo oscuro.
+- [ ] UI oscura: fondo grafito de bajo brillo, texto legible y campos con
+      borde oscuro; revisar ventana principal, diálogos y medidor de audio.
 - [ ] STT en vivo: DOS paneles — "Entrevistador" (voces de la llamada)
       a la izquierda y "Tú (micro)" (tu voz) a la derecha.
 - [ ] Diarización: con varias voces, aparecen etiquetas de speaker distintas
       dentro del panel Entrevistador.
 - [ ] Panel oculto: `Ctrl+I` es el ÚNICO control de visibilidad (no hay
-      botón ni doble-clic). El panel muestra la conversación con autoscroll,
-      se mueve con `Ctrl+flechas`, cambia de opacidad con `Ctrl+±` y crece
-      suave con el texto de GPT. Cada hotkey deja un ACK visible.
+      botón ni doble-clic); no roba el foco del navegador. Muestra dos líneas
+       recientes por carril y una sola respuesta Markdown: una nueva respuesta
+       raíz reemplaza la anterior. Alt+S conserva el cuerpo actual mientras
+       piensa y, al llegar texto, lo sustituye; las versiones anteriores quedan
+       plegadas arriba y se pueden desplegar. Se ancla al inicio de la respuesta,
+       crece hasta el 85 % de la pantalla y se ensancha para código visible.
+      Se mueve con `Ctrl+flechas`, cambia de opacidad con `Ctrl+±` y cada
+      hotkey deja un ACK visible.
 - [ ] Hotkeys con otra ventana enfocada (ej. el navegador):
       `Ctrl+M` conmuta auto-GPT (bloqueado si «GPT solo bajo demanda»),
       `Ctrl+Q` responde la última intervención,
+       `Alt+S` sustituye la respuesta visible por una versión completa de
+       gpt-6.1-sol; la versión anterior queda plegada arriba en una fila
+       «Anterior»,
       `Alt+G` envía el transcript a GPT,
       `Alt+T` start/stop de la captura.
-      La respuesta de GPT NUNCA se copia sola al portapapeles.
+      Los eventos de las hotkeys disparadas se consumen y no llegan al
+      navegador. La respuesta de GPT NUNCA se copia sola al portapapeles.
+- [ ] Las respuestas usan Markdown compacto: línea directa en negrita y
+      viñetas breves; código y tablas se leen bien en ambas vistas. El historial
+      muestra las versiones anteriores como filas planas plegadas, con Markdown
+      atenuado al desplegarlas; la pregunta aparece una sola vez.
+- [ ] «Invisible al compartir pantalla / grabar» excluye de las capturas
+      compatibles de Windows el panel, el ACK y la ventana principal; al
+      desactivarlo, la captura normal vuelve a mostrarlos.
 - [ ] «GPT solo bajo demanda» ON (por defecto): nada se envía a GPT hasta
       que lo ordenas con botón/Ctrl+Q/Alt+G. Al apagarlo, auto-GPT ON: al
       oír una pregunta sale un "[Borrador]" rápido y luego una

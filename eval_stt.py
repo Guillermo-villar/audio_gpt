@@ -5,7 +5,6 @@ Usage: python _eval_stt.py <video_id_or_url> [--model flux-general-multi]
 Needs DEEPGRAM_API_KEY in env. Downloads audio + captions via yt-dlp.
 """
 import argparse
-import json
 import os
 import re
 import subprocess
@@ -165,7 +164,7 @@ def main():
         print(f"      audio {len(audio)/rate:.0f}s @ {rate}Hz; subs: {bool(vtt)}")
         print(f"[2/3] streaming -> {a.model} ...")
         ev, hyp = stream_eval(audio, rate, a.model, a.diarize)
-        print(f"[3/3] resultados")
+        print("[3/3] resultados")
         print(f"      parciales: {len(ev['partials'])}  "
               f"(1º a {ev['t_partial'] or -1:.2f}s)")
         print(f"      finales:   {len(ev['finals'])}  "

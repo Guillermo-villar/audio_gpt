@@ -85,18 +85,29 @@ MIT.
 
 ## Uso durante la llamada (modo copiloto)
 
-- **Panel oculto** (`Ctrl+I`, único control de visibilidad): panel
-  semitransparente siempre encima — estado, lo que se oye en vivo y la
-  conversación con las respuestas (autoscroll a lo reciente). Crece suave
-  con el texto que llega de GPT. `Ctrl+flechas` lo mueve por la pantalla,
-  `Ctrl+±` ajusta su opacidad y también se arrastra con el ratón.
-- **Hotkeys globales** (2 teclas, funcionan con otra app enfocada — elegidas
-  para no interferir con el navegador). Cada comando deja constancia
-  visible (flash en el panel o toast flotante):
+- **Panel oculto** (`Ctrl+I`, único control de visibilidad): panel oscuro,
+  sin foco y siempre encima, con el transcript reciente por carriles y las
+  respuestas en una sola tarjeta Markdown: una respuesta de Luna reemplaza la
+  anterior al enviar una nueva. Se ancla al inicio de cada respuesta o
+  ampliación, crece hasta un 85 % de la pantalla y se ensancha para código.
+  `Ctrl+flechas` lo mueve, `Ctrl+±` ajusta su opacidad y también se arrastra.
+- **Hotkeys globales** (2 teclas, funcionan con otra app enfocada - elegidas
+  para no interferir con el navegador; las teclas disparadas se consumen y no
+  llegan al navegador). Cada comando deja constancia visible (flash en el
+  panel o toast flotante):
   `Ctrl+Q` responder la última intervención del entrevistador ·
+  `Alt+S` sustituir la respuesta visible por una versión completa de gpt-6.1-sol ·
   `Alt+G` enviar el transcript a GPT · `Ctrl+M` auto-GPT on/off ·
   `Ctrl+I` panel · `Alt+T` start/stop transcripción.
   Las respuestas de GPT nunca se copian solas al portapapeles.
+- **Formato de respuestas**: todos los motores reciben instrucciones para
+  responder en Markdown breve. `Alt+S` sustituye la respuesta visible por una
+  versión completa de Sol; la anterior queda plegada arriba en una fila
+  «Anterior» y se puede desplegar para consultar su Markdown. Otra respuesta
+  raíz sustituye la tarjeta y su historial.
+- **Privacidad visual**: activa «Invisible al compartir pantalla / grabar»
+  para excluir el panel, las confirmaciones y la ventana principal de las
+  capturas compatibles de Windows.
 - **GPT solo bajo demanda** (toggle, activo por defecto): nada se envía
   a GPT salvo orden explícita (botón «Enviar a GPT», `Ctrl+Q` o `Alt+G`);
   el modo automático queda deshabilitado.

@@ -7,7 +7,6 @@ Env: DEEPGRAM_API_KEY, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
 """
 import argparse
 import os
-import sys
 import threading
 import time
 from collections import deque
@@ -75,7 +74,6 @@ def main():
     os.makedirs("_test_audio", exist_ok=True)
     wav = "_test_audio/pipeline.wav"
     if not os.path.exists(wav):
-        import soundfile as sf
         raw = "_test_audio/raw.mp3"
         eval_stt.sh(["curl", "-sL", "-o", raw, a.url])
         eval_stt.sh(["ffmpeg", "-y", "-i", raw, "-ar", "16000", "-ac", "1",
