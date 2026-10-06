@@ -49,7 +49,7 @@ import vad
 from api_client import (
     ApiKeyManager, TranscriptionThread, WhisperService, GptClient,
     GptQueryThread, SmartQueryThread, CodexCliThread, looks_like_question,
-    clef_question, CODEX_MODEL, DEFAULT_GPT_CONFIG,
+    clef_question, CODEX_MODEL, DEFAULT_GPT_CONFIG, build_smart_request,
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -193,9 +193,9 @@ def _install_ll_hook(dispatch):
 # ---------------------------------------------------------------------------
 
 
-def render_markdown(doc, text, font_px=13):
+def render_markdown(doc, text, font_px=13, color="#d4d6d9"):
     doc.setDefaultStyleSheet(
-        f"body {{ color: #d4d6d9; font-size: {font_px}px; }}"
+        f"body {{ color: {color}; font-size: {font_px}px; }}"
         "a { color: #8ab4f8; }"
         "table { border-collapse: collapse; }"
         "th, td { border: 1px solid #3a3d42; padding: 3px 6px; }"
@@ -205,6 +205,11 @@ def render_markdown(doc, text, font_px=13):
         | QTextDocument.MarkdownFeature.MarkdownNoHTML
     )
     doc.setMarkdown(text or "", features)
+    base_format = QTextCharFormat()
+    base_format.setForeground(QColor(color))
+    default_cursor = QTextCursor(doc)
+    default_cursor.select(QTextCursor.SelectionType.Document)
+    default_cursor.mergeCharFormat(base_format)
     code_fence = getattr(QTextFormat.Property, "BlockCodeFence", None)
     code_language = getattr(QTextFormat.Property, "BlockCodeLanguage", None)
     block = doc.begin()
@@ -246,6 +251,8 @@ def render_markdown(doc, text, font_px=13):
                 if char_format.fontFixedPitch():
                     fmt.setBackground(QColor("#2a2d33"))
                     fmt.setForeground(QColor("#d6d6d6"))
+                if char_format.font().strikeOut():
+                    fmt.setForeground(QColor("#9aa0a6"))
                 if fmt.hasProperty(QTextFormat.Property.ForegroundBrush) or \
                         fmt.hasProperty(QTextFormat.Property.BackgroundBrush):
                     fragment_cursor = QTextCursor(doc)
@@ -301,6 +308,9 @@ class AnswerCard(QFrame):
         self.text = ""
         self.done = False
         self.ok = True
+        self.body_color = "#d4d6d9"
+        self._root_dimmed = False
+        self.sections = []
         self.started_at = time.monotonic()
         self._status_message = ""
         self._last_render = 0.0
@@ -349,6 +359,11 @@ class AnswerCard(QFrame):
         self.body.document().setDocumentMargin(0)
         self.body.height_changed.connect(self._body_height_changed)
         layout.addWidget(self.body)
+        self.sections_container = QWidget()
+        self.sections_layout = QVBoxLayout(self.sections_container)
+        self.sections_layout.setContentsMargins(0, 0, 0, 0)
+        self.sections_layout.setSpacing(6)
+        layout.addWidget(self.sections_container)
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._refresh_elapsed)
         self._elapsed_timer.start(100)
@@ -402,12 +417,38 @@ class AnswerCard(QFrame):
             self._pending_text = None
 
     def _render_text(self, text):
-        render_markdown(self.body.document(), text, self.font_px)
-        if not self.ok:
-            self.body.document().setDefaultStyleSheet(
-                f"body {{ color: #e57373; font-size: {self.font_px}px; }}")
+        color = self.body_color if self.ok else "#e57373"
+        render_markdown(
+            self.body.document(), text, self.font_px, color=color)
         self._last_render = time.monotonic()
         self.body.recompute_height()
+        self.updateGeometry()
+        self.content_changed.emit()
+
+    def add_followup_section(self, key, model_label):
+        section = SolSection(key, model_label, self.font_px, self)
+        section.content_changed.connect(
+            lambda current=section: self._section_changed(current))
+        self.sections.append(section)
+        self.sections_layout.addWidget(section)
+        self.updateGeometry()
+        return section
+
+    def set_section_only(self):
+        self.done = True
+        self._elapsed_timer.stop()
+        for widget in (
+                self.header_label, self.status_label, self.question_label,
+                self.body):
+            widget.hide()
+        self.updateGeometry()
+
+    def _section_changed(self, section):
+        if (not self._root_dimmed and self.ok and section.ok
+                and section.has_rendered_content()):
+            self._root_dimmed = True
+            self.body_color = "#a3a7ad"
+            self._render_text(self.text)
         self.updateGeometry()
         self.content_changed.emit()
 
@@ -416,13 +457,289 @@ class AnswerCard(QFrame):
         self.content_changed.emit()
 
     def has_code_block(self):
-        return bool(re.search(r"```[^\n]*\n", self.text))
+        return any(
+            re.search(r"```[^\n]*\n", text)
+            for text in [self.text] + [section.text for section in self.sections])
 
     def longest_code_line(self):
-        blocks = re.findall(r"```[^\n]*\n(.*?)(?:```|$)", self.text, re.S)
+        texts = [self.text] + [section.text for section in self.sections]
+        blocks = [
+            block
+            for text in texts
+            for block in re.findall(r"```[^\n]*\n(.*?)(?:```|$)", text, re.S)
+        ]
         return max(
             (len(line) for block in blocks for line in block.splitlines()),
             default=0)
+
+
+_SOL_TAG_PATTERN = re.compile(
+    r"^\s*(?:[-*]\s+)?\[(MEJOR|NUEVO|CORRIGE|CÓDIGO|CODIGO|FUENTE)\]\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_sol_segments(text, keep_trailing_empty=False):
+    lines = (text or "").splitlines()
+    segments = []
+    prefix_lines = []
+    current_tag = None
+    current_lines = []
+    in_fence = False
+
+    def append_segment(tag, content, keep_empty=False):
+        markdown = "\n".join(content).strip()
+        if markdown or keep_empty:
+            segments.append((tag, markdown))
+
+    for line in lines:
+        match = None if in_fence else _SOL_TAG_PATTERN.match(line)
+        if match:
+            if current_tag is None:
+                append_segment("NUEVO", prefix_lines)
+            else:
+                append_segment(current_tag, current_lines)
+            current_tag = match.group(1).upper()
+            if current_tag == "CODIGO":
+                current_tag = "CÓDIGO"
+            rest = match.group(2)
+            current_lines = [rest] if rest else []
+            continue
+
+        if current_tag is None:
+            prefix_lines.append(line)
+        else:
+            current_lines.append(line)
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+
+    if current_tag is None:
+        append_segment("NUEVO", prefix_lines)
+    else:
+        append_segment(
+            current_tag, current_lines, keep_empty=keep_trailing_empty)
+    return segments
+
+
+class SolSegmentBlock(QFrame):
+    content_changed = Signal()
+
+    _STYLES = {
+        "MEJOR": ("Mejor frase", "#b08cff", "rgba(176,140,255,0.08)"),
+        "NUEVO": ("Nuevo", "#81c995", "rgba(129,201,149,0.07)"),
+        "CORRIGE": ("Corrige", "#fdd663", "rgba(253,214,99,0.07)"),
+        "CÓDIGO": ("Código", "#8ab4f8", "rgba(138,180,248,0.06)"),
+        "FUENTE": ("Fuente", "#9aa0a6", "transparent"),
+    }
+
+    def __init__(self, tag, markdown, font_px, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SolSegmentBlock")
+        self.font_px = font_px
+        self.tag = None
+        self.markdown = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(7, 5, 7, 5)
+        layout.setSpacing(3)
+        self.chip = QLabel()
+        self.body = _AutoHeightBrowser(self)
+        self.body.setReadOnly(True)
+        self.body.setOpenExternalLinks(False)
+        self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.body.setFrameShape(QFrame.NoFrame)
+        self.body.setStyleSheet(
+            "QTextBrowser { background: transparent; border: none; }")
+        self.body.document().setDocumentMargin(0)
+        self.body.height_changed.connect(self._body_height_changed)
+        layout.addWidget(self.chip)
+        layout.addWidget(self.body)
+        self.set_segment(tag, markdown)
+
+    def set_segment(self, tag, markdown):
+        markdown = markdown or ""
+        font_changed = False
+        if tag != self.tag:
+            self.tag = tag
+            title, color, background = self._STYLES[tag]
+            self.setStyleSheet(
+                "QFrame#SolSegmentBlock {"
+                f" background-color: {background};"
+                f" border: 1px solid #303238; border-left: 3px solid {color};"
+                " border-radius: 6px; }"
+                "QLabel { background: transparent; }"
+            )
+            self.chip.setText(title)
+            self.chip.setStyleSheet(
+                f"color: {color}; font-size: 10px; font-weight: bold;")
+            font_px = 11 if tag == "FUENTE" else self.font_px
+            font_changed = getattr(self, "body_font_px", None) != font_px
+            self.body_font_px = font_px
+
+        if markdown != self.markdown or font_changed:
+            self.markdown = markdown
+            body_font = QFont("Segoe UI")
+            body_font.setPixelSize(self.body_font_px)
+            self.body.setFont(body_font)
+            render_markdown(
+                self.body.document(), markdown, self.body_font_px)
+            self.body.recompute_height()
+            self.updateGeometry()
+            self.content_changed.emit()
+
+    def _body_height_changed(self):
+        self.updateGeometry()
+        self.content_changed.emit()
+
+
+class SolSection(QFrame):
+    content_changed = Signal()
+
+    def __init__(self, key, model_label, font_px, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.card = parent
+        self.model_label = model_label
+        self.font_px = font_px
+        self.text = ""
+        self.ok = True
+        self.done = False
+        self.started_at = time.monotonic()
+        self._status_message = ""
+        self._last_render = 0.0
+        self._pending_text = None
+        self.segment_blocks = []
+        self.setObjectName("SolSection")
+        self.setStyleSheet(
+            "QFrame#SolSection { background: transparent; border: none; }"
+            "QLabel { background: transparent; }")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 2, 0, 0)
+        layout.setSpacing(4)
+        header = QHBoxLayout()
+        self.header_label = QLabel(f"▲ Ampliación · {model_label}")
+        self.header_label.setStyleSheet(
+            "color: #b08cff; font-size: 11px; font-weight: bold;")
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            "color: #9aa0a6; font-size: 10px;")
+        header.addWidget(self.header_label, 1)
+        header.addWidget(self.status_label)
+        layout.addLayout(header)
+
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet(
+            "color: #e57373; font-size: 11px;")
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+
+        self.segments_container = QWidget(self)
+        self.segments_layout = QVBoxLayout(self.segments_container)
+        self.segments_layout.setContentsMargins(0, 0, 0, 0)
+        self.segments_layout.setSpacing(5)
+        layout.addWidget(self.segments_container)
+
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._refresh_elapsed)
+        self._elapsed_timer.start(100)
+        self._refresh_elapsed()
+
+    def _refresh_elapsed(self):
+        elapsed = time.monotonic() - self.started_at
+        suffix = f"{elapsed:.1f}s"
+        if self.done:
+            self.status_label.setText(suffix)
+        elif self._status_message:
+            self.status_label.setText(self._status_message)
+        else:
+            self.status_label.setText(f"pensando… {suffix}")
+
+    def set_status(self, text):
+        self._status_message = text
+        self._refresh_elapsed()
+
+    def set_stream_text(self, text, final=False, ok=True):
+        self.text = text or ""
+        self.ok = ok
+        if not final:
+            remaining = 0.05 - (time.monotonic() - self._last_render)
+            if remaining > 0:
+                self._pending_text = self.text
+                if not hasattr(self, "_render_timer"):
+                    self._render_timer = QTimer(self)
+                    self._render_timer.setSingleShot(True)
+                    self._render_timer.timeout.connect(self._render_pending)
+                if not self._render_timer.isActive():
+                    self._render_timer.start(max(1, int(remaining * 1000) + 1))
+                self._status_message = ""
+                self._refresh_elapsed()
+                return
+
+        if hasattr(self, "_render_timer"):
+            self._render_timer.stop()
+        self._pending_text = None
+        if final:
+            self.done = True
+            self._elapsed_timer.stop()
+            self._status_message = ""
+            if not ok:
+                self._render_error(self.text)
+                self._refresh_elapsed()
+                return
+        self.error_label.hide()
+        self._render_text(self.text, keep_trailing_empty=not final)
+        if final:
+            self._refresh_elapsed()
+
+    def _render_pending(self):
+        if self._pending_text is not None:
+            self._render_text(self._pending_text, keep_trailing_empty=True)
+            self._pending_text = None
+
+    def _render_text(self, text, keep_trailing_empty):
+        segments = parse_sol_segments(
+            text, keep_trailing_empty=keep_trailing_empty)
+        for index, (tag, markdown) in enumerate(segments):
+            if index == len(self.segment_blocks):
+                block = SolSegmentBlock(
+                    tag, markdown, self.font_px, self.segments_container)
+                block.content_changed.connect(self._segment_changed)
+                self.segment_blocks.append(block)
+                self.segments_layout.addWidget(block)
+            else:
+                self.segment_blocks[index].set_segment(tag, markdown)
+
+        while len(self.segment_blocks) > len(segments):
+            block = self.segment_blocks.pop()
+            self.segments_layout.removeWidget(block)
+            block.setParent(None)
+            block.deleteLater()
+        self._last_render = time.monotonic()
+        self.updateGeometry()
+        self.content_changed.emit()
+
+    def _render_error(self, text):
+        for block in self.segment_blocks:
+            self.segments_layout.removeWidget(block)
+            block.setParent(None)
+            block.deleteLater()
+        self.segment_blocks.clear()
+        self.error_label.setText(text or "Error al generar la ampliación")
+        self.error_label.show()
+        self._last_render = time.monotonic()
+        self.updateGeometry()
+        self.content_changed.emit()
+
+    def _segment_changed(self):
+        self.updateGeometry()
+        self.content_changed.emit()
+
+    def has_rendered_content(self):
+        return self.ok and any(block.markdown.strip()
+                               for block in self.segment_blocks)
+
 
 class AnswerFeed(QScrollArea):
     content_changed = Signal()
@@ -456,36 +773,44 @@ class AnswerFeed(QScrollArea):
             self._release_anchor)
 
     def start(self, key, kind, model_label, question):
+        self.clear()
         card = AnswerCard(
             kind, model_label, question, self.font_px, parent=self.container)
         card.content_changed.connect(self._schedule_content_changed)
         self._cards.append((key, card))
         self._by_key[key] = card
         self.layout.insertWidget(self.layout.count() - 1, card)
-        while len(self._cards) > 40:
-            old_key, old_card = self._cards.pop(0)
-            self._by_key.pop(old_key, None)
-            old_card.setParent(None)
-            old_card.deleteLater()
         self._anchor = card
         self._schedule_content_changed()
         return card
 
+    def start_followup(self, parent_key, key, model_label):
+        parent = self._by_key.get(parent_key)
+        card = parent.card if isinstance(parent, SolSection) else parent
+        if not isinstance(card, AnswerCard):
+            card = self.start(key, "Más a fondo", model_label, "")
+            card.set_section_only()
+        section = card.add_followup_section(key, model_label)
+        self._by_key[key] = section
+        self._anchor = section
+        self._schedule_content_changed()
+        return section
+
     def update(self, key, text):
-        card = self._by_key.get(key)
-        if card:
-            card.set_stream_text(text)
+        target = self._by_key.get(key)
+        if target:
+            target.set_stream_text(text)
             self._schedule_content_changed()
 
     def status(self, key, text):
-        card = self._by_key.get(key)
-        if card:
-            card.set_status(text)
+        target = self._by_key.get(key)
+        if target:
+            target.set_status(text)
 
     def finish(self, key, ok, text):
-        card = self._by_key.get(key)
-        if card:
-            card.set_stream_text(text, final=True, ok=ok)
+        target = self._by_key.get(key)
+        if target:
+            target.set_stream_text(text, final=True, ok=ok)
             self._schedule_content_changed()
 
     def clear(self):
@@ -2135,7 +2460,9 @@ class WhisperApp(QMainWindow):
         previous = []
         current = target
         while current is not None:
-            previous.append((current["model"], current["text"]))
+            previous.append((
+                current["model"], current["text"],
+                current.get("parent") is not None))
             current = (self._answer_for_key(current["parent"])
                        if current.get("parent") is not None else None)
         previous.reverse()
@@ -2148,35 +2475,8 @@ class WhisperApp(QMainWindow):
         brief = self.brief_input.toPlainText().strip()
         effort = ("high" if "sol" in target["model"].lower()
                   else config.get("smart_reasoning_effort", "medium"))
-        instructions = config.get("system_prompt", "Eres un asistente útil.")
-        if brief:
-            instructions += (
-                "\n\nContexto de la entrevista — experiencia APROBADA del "
-                "candidato y límites; úsala para adaptar cada respuesta:\n"
-                + brief +
-                "\nNunca conviertas requisitos del puesto ni notas de empresa "
-                "en experiencia del candidato ni inventes métricas o historias "
-                "que el brief no respalde; ante falta de evidencia, responde "
-                "en hipotético."
-            )
-        for key in ("format_prompt", "smart_prompt"):
-            if config.get(key):
-                instructions += "\n\n" + config[key]
-        prev_blocks = "\n\n".join(
-            f"Respuesta anterior de {model} (marcada como NO útil por el candidato):\n"
-            f"<<<\n{text}\n>>>"
-            for model, text in previous
-        )
-        user_input = (
-            "Transcript completo de la llamada (Entrevistador = voces de la llamada, "
-            "Tú = el candidato; puede tener errores de transcripción):\n"
-            f"{context}\n\n"
-            "Intervención del entrevistador a la que hay que responder:\n"
-            f"{question}\n\n"
-            "Lo que el candidato (Tú) ha dicho desde esa intervención:\n"
-            f"{mine or '(nada todavía)'}\n\n"
-            f"{prev_blocks}"
-        )
+        instructions, user_input = build_smart_request(
+            question, previous, context, mine, brief, config)
 
         if engine == "codex":
             model = config.get("smart_model", "gpt-6.1-sol")
@@ -2453,8 +2753,12 @@ class WhisperApp(QMainWindow):
             "manual": manual,
         }
         self._answers.append(answer)
-        self.gpt_output.start(thread, kind, model_label, question)
-        self.overlay.feed.start(thread, kind, model_label, question)
+        if parent is None:
+            self.gpt_output.start(thread, kind, model_label, question)
+            self.overlay.feed.start(thread, kind, model_label, question)
+        else:
+            self.gpt_output.start_followup(parent, thread, model_label)
+            self.overlay.feed.start_followup(parent, thread, model_label)
         if hasattr(thread, "query_delta"):
             thread.query_delta.connect(
                 lambda text, key=thread: self._update_answer(key, text))

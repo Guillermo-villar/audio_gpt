@@ -87,22 +87,24 @@ MIT.
 
 - **Panel oculto** (`Ctrl+I`, único control de visibilidad): panel oscuro,
   sin foco y siempre encima, con el transcript reciente por carriles y las
-  respuestas en tarjetas Markdown. Se ancla al inicio de cada respuesta,
-  crece hasta un 85 % de la pantalla y se ensancha para código. `Ctrl+flechas`
-  lo mueve, `Ctrl+±` ajusta su opacidad y también se arrastra con el ratón.
+  respuestas en una sola tarjeta Markdown: una respuesta de Luna reemplaza la
+  anterior al enviar una nueva. Se ancla al inicio de cada respuesta o
+  ampliación, crece hasta un 85 % de la pantalla y se ensancha para código.
+  `Ctrl+flechas` lo mueve, `Ctrl+±` ajusta su opacidad y también se arrastra.
 - **Hotkeys globales** (2 teclas, funcionan con otra app enfocada - elegidas
   para no interferir con el navegador; las teclas disparadas se consumen y no
   llegan al navegador). Cada comando deja constancia visible (flash en el
   panel o toast flotante):
   `Ctrl+Q` responder la última intervención del entrevistador ·
-  `Alt+S` pedir una versión más a fondo a gpt-6.1-sol ·
+  `Alt+S` añadir debajo una ampliación de gpt-6.1-sol con lo nuevo o corregido ·
   `Alt+G` enviar el transcript a GPT · `Ctrl+M` auto-GPT on/off ·
   `Ctrl+I` panel · `Alt+T` start/stop transcripción.
   Las respuestas de GPT nunca se copian solas al portapapeles.
 - **Formato de respuestas**: todos los motores reciben instrucciones para
-  responder en Markdown breve. Cada tarjeta muestra el modelo, el estado y
-  la pregunta asociada; el formato se renderiza en una vista legible durante
-  la llamada.
+  responder en Markdown breve. `Alt+S` conserva la respuesta de Luna y añade
+  debajo una sección «Ampliación» con etiquetas «Mejor frase», «Nuevo»,
+  «Corrige», «Código» y «Fuente»; la respuesta de Luna se atenúa cuando llega
+  contenido de Sol. Una nueva respuesta raíz sustituye toda la tarjeta.
 - **Privacidad visual**: activa «Invisible al compartir pantalla / grabar»
   para excluir el panel, las confirmaciones y la ventana principal de las
   capturas compatibles de Windows.

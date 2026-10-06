@@ -316,13 +316,39 @@ DEFAULT_GPT_CONFIG = {
         "- Sin introducciones, sin despedidas y sin repetir la pregunta."
     ),
     "smart_prompt": (
-        "MODO «MÁS A FONDO»: un modelo rápido (gpt-6-luna) ya respondió a esta intervención y el candidato ha marcado esa respuesta como NO útil (pulsó «más a fondo» en mitad de la entrevista). Tu trabajo es darle una respuesta claramente mejor.\n"
-        "- Antes de escribir, diagnostica en silencio por qué falló la respuesta anterior: ¿malinterpretó la pregunta por errores de transcripción?, ¿fue superficial o genérica?, ¿le faltó código, un ejemplo concreto, datos actuales o el trade-off clave?, ¿no encajaba con lo que el candidato ya ha dicho o con el brief?\n"
-        "- Razona más a fondo que el modelo rápido. Si la pregunta depende de datos recientes, de una empresa/producto concreto o de algo verificable, usa la búsqueda web y cita la fuente en una línea al final.\n"
-        "- No repitas ni menciones la respuesta anterior: entrega directamente la versión mejorada, lista para usar.\n"
-        "- Ten en cuenta lo que el candidato ya ha dicho en voz alta (carril «Tú») para que la respuesta continúe con naturalidad y no lo contradiga.\n"
-        "- Si la intervención es ambigua, responde primero a la interpretación más probable y añade la alternativa en una sola línea.\n"
-        "- Mismo formato Markdown y mismo idioma que la pregunta."
+        "MODO «MÁS A FONDO»: un modelo rápido (gpt-6-luna) ya respondió a esta "
+        "intervención; el candidato tiene esa respuesta en pantalla pero la ha "
+        "marcado como insuficiente (pulsó «más a fondo» en mitad de la "
+        "entrevista). Lo que escribas se mostrará DEBAJO de esa respuesta, en "
+        "la misma tarjeta, así que aporta SOLO lo que cambia o falta.\n"
+        "- Antes de escribir, diagnostica en silencio por qué se quedó corta: "
+        "¿malinterpretó la pregunta por errores de transcripción?, ¿fue "
+        "superficial o genérica?, ¿le faltó código, un ejemplo concreto, datos "
+        "actuales o el trade-off clave?, ¿no encajaba con lo que el candidato "
+        "ya ha dicho o con el brief?\n"
+        "- Razona más a fondo que el modelo rápido. Si la pregunta depende de "
+        "datos recientes, de una empresa/producto concreto o de algo verificable, "
+        "usa la búsqueda web.\n"
+        "- Ten en cuenta lo que el candidato ya ha dicho en voz alta (carril "
+        "«Tú») para que pueda continuar con naturalidad sin contradecirse.\n"
+        "- Si la intervención es ambigua, responde a la interpretación más "
+        "probable y añade la alternativa en una sola línea.\n"
+        "\n"
+        "FORMATO OBLIGATORIO (Markdown, mismo idioma que la pregunta). Cada "
+        "bloque empieza, al principio de la línea, con una de estas etiquetas:\n"
+        "[MEJOR] — solo si la frase principal anterior no sirve, y siempre "
+        "como primer bloque: la nueva frase para decir en voz alta, en "
+        "**negrita**.\n"
+        "[NUEVO] — un punto, dato, ejemplo o trade-off que la respuesta "
+        "anterior no tenía (una idea por bloque, 1-2 líneas).\n"
+        "[CORRIGE] — algo de la respuesta anterior incorrecto o engañoso, así: "
+        "~~lo que decía~~ → lo correcto.\n"
+        "[CÓDIGO] — código nuevo o corregido en un bloque ``` con el lenguaje, "
+        "completo (no un diff), líneas de como mucho ~80 caracteres.\n"
+        "[FUENTE] — al final, una línea por URL si usaste la web.\n"
+        "No repitas nada que la respuesta anterior ya dijera bien, sin "
+        "introducciones ni despedidas. Si ya era correcta y completa, devuelve "
+        "un único [NUEVO] con el matiz más útil que añadirías."
     ),
     "smart_model": "gpt-6.1-sol",
     "smart_reasoning_effort": "medium",
@@ -335,6 +361,48 @@ DEFAULT_GPT_CONFIG = {
     "web_search_results": 3,
     "web_search_timeout": 4,
 }
+
+
+def build_smart_request(question, previous, context, mine, brief, config):
+    instructions = config.get("system_prompt", "Eres un asistente útil.")
+    if brief:
+        instructions += (
+            "\n\nContexto de la entrevista — experiencia APROBADA del "
+            "candidato y límites; úsala para adaptar cada respuesta:\n"
+            + brief +
+            "\nNunca conviertas requisitos del puesto ni notas de empresa "
+            "en experiencia del candidato ni inventes métricas o historias "
+            "que el brief no respalde; ante falta de evidencia, responde "
+            "en hipotético."
+        )
+    smart_prompt = config.get("smart_prompt", "")
+    if smart_prompt:
+        instructions += "\n\n" + smart_prompt
+
+    previous_blocks = []
+    for answer in previous:
+        model, text, *followup = answer
+        if followup and followup[0]:
+            heading = (
+                f"Ampliación anterior de {model} (también en pantalla; "
+                "el candidato pide todavía más):")
+        else:
+            heading = (
+                f"Respuesta anterior de {model} (en pantalla, marcada como "
+                "insuficiente por el candidato):")
+        previous_blocks.append(f"{heading}\n<<<\n{text}\n>>>")
+
+    user_input = (
+        "Transcript completo de la llamada (Entrevistador = voces de la llamada, "
+        "Tú = el candidato; puede tener errores de transcripción):\n"
+        f"{context}\n\n"
+        "Intervención del entrevistador a la que hay que responder:\n"
+        f"{question}\n\n"
+        "Lo que el candidato (Tú) ha dicho desde esa intervención:\n"
+        f"{mine or '(nada todavía)'}\n\n"
+        + "\n\n".join(previous_blocks)
+    )
+    return instructions, user_input
 
 
 class GptClient:
@@ -553,36 +621,8 @@ class GptClient:
         if not config:
             return False, "Error al cargar la configuración de GPT"
 
-        instructions = config.get("system_prompt", "Eres un asistente útil.")
-        if brief:
-            instructions += (
-                "\n\nContexto de la entrevista — experiencia APROBADA del "
-                "candidato y límites; úsala para adaptar cada respuesta:\n"
-                + brief +
-                "\nNunca conviertas requisitos del puesto ni notas de empresa "
-                "en experiencia del candidato ni inventes métricas o historias "
-                "que el brief no respalde; ante falta de evidencia, responde "
-                "en hipotético."
-            )
-        for key in ("format_prompt", "smart_prompt"):
-            if config.get(key):
-                instructions += "\n\n" + config[key]
-
-        previous_blocks = "\n\n".join(
-            f"Respuesta anterior de {model} (marcada como NO útil por el candidato):\n"
-            f"<<<\n{text}\n>>>"
-            for model, text in previous
-        )
-        user_input = (
-            "Transcript completo de la llamada (Entrevistador = voces de la llamada, "
-            "Tú = el candidato; puede tener errores de transcripción):\n"
-            f"{context}\n\n"
-            "Intervención del entrevistador a la que hay que responder:\n"
-            f"{question}\n\n"
-            "Lo que el candidato (Tú) ha dicho desde esa intervención:\n"
-            f"{mine or '(nada todavía)'}\n\n"
-            f"{previous_blocks}"
-        )
+        instructions, user_input = build_smart_request(
+            question, previous, context, mine, brief, config)
         kwargs = {
             "model": config.get("smart_model", "gpt-6.1-sol"),
             "instructions": instructions,
@@ -716,35 +756,8 @@ class GptClient:
     def send_smarter_cloudflare(question, previous, context, mine, brief,
                                 on_delta=None):
         config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
-        instructions = config.get("system_prompt", "Eres un asistente útil.")
-        if brief:
-            instructions += (
-                "\n\nContexto de la entrevista — experiencia APROBADA del "
-                "candidato y límites; úsala para adaptar cada respuesta:\n"
-                + brief +
-                "\nNunca conviertas requisitos del puesto ni notas de empresa "
-                "en experiencia del candidato ni inventes métricas o historias "
-                "que el brief no respalde; ante falta de evidencia, responde "
-                "en hipotético."
-            )
-        for key in ("format_prompt", "smart_prompt"):
-            if config.get(key):
-                instructions += "\n\n" + config[key]
-        previous_blocks = "\n\n".join(
-            f"Respuesta anterior de {model} (marcada como NO útil por el candidato):\n"
-            f"<<<\n{text}\n>>>"
-            for model, text in previous
-        )
-        user_input = (
-            "Transcript completo de la llamada (Entrevistador = voces de la llamada, "
-            "Tú = el candidato; puede tener errores de transcripción):\n"
-            f"{context}\n\n"
-            "Intervención del entrevistador a la que hay que responder:\n"
-            f"{question}\n\n"
-            "Lo que el candidato (Tú) ha dicho desde esa intervención:\n"
-            f"{mine or '(nada todavía)'}\n\n"
-            f"{previous_blocks}"
-        )
+        instructions, user_input = build_smart_request(
+            question, previous, context, mine, brief, config)
         if config.get("smart_web_search", True):
             web_context = exa_search(question)
             if web_context:
