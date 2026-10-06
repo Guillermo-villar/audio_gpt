@@ -46,27 +46,32 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
 
-# Hotkeys globales (teclas F sueltas, sin combos) — vía GetAsyncKeyState,
-# sin permisos de admin ni dependencias. F9 responder última · F10 auto-GPT
-# · F8 overlay · F7 copiar respuesta · F2 start/stop. Funcionan con la app
-# abierta aunque otra ventana tenga el foco.
+# Hotkeys globales de 2 teclas, vía GetAsyncKeyState — sin admin ni deps.
+# Elegidas porque NO hacen nada en Chrome/Edge/Firefox ni ES-keyboards:
+# Ctrl+Q responder · Ctrl+M auto-GPT · Ctrl+I overlay · Alt+C copiar ·
+# Alt+T start/stop. (Ojo: nunca Ctrl+Alt — AltGr en teclado ES = Ctrl+Alt
+# y escribir «@» dispararía el hotkey.)
 HOTKEYS = {
-    "f9": (0x78, "answer_last", "responder última intervención"),
-    "f10": (0x79, "toggle_auto", "auto-GPT on/off"),
-    "f8": (0x77, "toggle_compact", "modo compacto"),
-    "f7": (0x76, "copy_answer", "copiar última respuesta"),
-    "f2": (0x71, "toggle_capture", "start/stop transcripción"),
+    "ctrl+q": (0x11, 0x51, "answer_last", "responder última intervención"),
+    "ctrl+m": (0x11, 0x4D, "toggle_auto", "auto-GPT on/off"),
+    "ctrl+i": (0x11, 0x49, "toggle_compact", "modo compacto"),
+    "alt+c": (0x12, 0x43, "copy_answer", "copiar última respuesta"),
+    "alt+t": (0x12, 0x54, "toggle_capture", "start/stop transcripción"),
 }
 
 
-def _combo_pressed(key):
-    """True si la tecla está pulsada ahora mismo o se pulsó desde la
-    última consulta (Windows). 0x8001 = down ahora | press reciente —
-    un tap de F-key dura menos que el poll y solo el bit bajo lo pilla."""
+def _combo_pressed(combo):
+    """True si el combo está activo o se pulsó desde la última consulta
+    (Windows). 0x8001 en la tecla = down ahora | press reciente — un tap
+    dura menos que el poll y solo el bit bajo lo pilla."""
     if sys.platform != "win32":
         return False
-    vk = HOTKEYS[key][0]
-    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8001)
+    mod_vk, key_vk, _, _ = HOTKEYS[combo]
+    u32 = ctypes.windll.user32
+    return bool(
+        u32.GetAsyncKeyState(mod_vk) & 0x8000
+        and u32.GetAsyncKeyState(key_vk) & 0x8001
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +119,7 @@ class CompactOverlay(QWidget):
         self.answer_box.setPlaceholderText("última respuesta…")
         panel_layout.addWidget(self.answer_box, 1)
 
-        legend = QLabel("F9 responder · F10 auto · F8 dock · F7 copiar · F2 start/stop")
+        legend = QLabel("Ctrl+Q responder · Ctrl+M auto · Ctrl+I dock · Alt+C copiar · Alt+T start/stop")
         legend.setStyleSheet("color: #777; font-size: 10px;")
         panel_layout.addWidget(legend)
 
@@ -790,7 +795,7 @@ class WhisperApp(QMainWindow):
         self._draft_state = {}            # carril -> interim ya respondido
         self._gate_pending = set()        # carriles con gate clef en vuelo
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
-        self._last_answer = ""            # para F7 (copiar respuesta)
+        self._last_answer = ""            # para Alt+C (copiar respuesta)
         self._hk_prev = set()             # hotkeys actualmente pulsados
 
         self.init_ui()
@@ -1305,14 +1310,14 @@ class WhisperApp(QMainWindow):
     # ------------------------- hotkeys globales / overlay ------------------
 
     def _hotkey_tick(self):
-        """Detecta flancos de subida de cada Ctrl+Alt+tecla y despacha."""
-        for letter, (_, action, _) in HOTKEYS.items():
-            down = _combo_pressed(letter)
-            if down and letter not in self._hk_prev:
-                self._hk_prev.add(letter)
+        """Detecta flancos de subida de cada combo y despacha."""
+        for combo, (_, _, action, _) in HOTKEYS.items():
+            down = _combo_pressed(combo)
+            if down and combo not in self._hk_prev:
+                self._hk_prev.add(combo)
                 getattr(self, "_hk_" + action)()
             elif not down:
-                self._hk_prev.discard(letter)
+                self._hk_prev.discard(combo)
 
     def _hk_answer_last(self):
         """Rescate: responder la última intervención del entrevistador aunque
