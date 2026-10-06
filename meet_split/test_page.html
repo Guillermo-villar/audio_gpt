@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html><body>
+<h3>meet-split test: 2 "asistentes" WebRTC sintéticos</h3>
+<pre id="log">arrancando…</pre>
+<script>
+const log = (m) => document.getElementById("log").textContent += "\n" + m;
+window.onerror = (m, s, l, c, e) => log("ERR " + m + " " + (e && e.stack || ""));
+const TARGET_RATE = 16000;
+const sockets = new Map();
+
+function pipeTrack(track, streamId, pcId) {
+  try {
+    const ctx = new AudioContext();
+    ctx.resume().then(() => log("pipe ctx " + ctx.state));
+    const src = ctx.createMediaStreamSource(new MediaStream([track]));
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    const mute = ctx.createGain(); mute.gain.value = 0;
+    src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+    const inRate = ctx.sampleRate;
+    let ws = null, peak = 0, chunks = 0;
+    proc.onaudioprocess = (e) => {
+      const inBuf = e.inputBuffer.getChannelData(0);
+      const ratio = inRate / TARGET_RATE;
+      const n = Math.floor(inBuf.length / ratio);
+      const out = new Int16Array(n);
+      for (let i = 0; i < n; i++) {
+        const s = inBuf[Math.floor(i * ratio)];
+        if (Math.abs(s) > peak) peak = Math.abs(s);
+        out[i] = Math.max(-32768, Math.min(32767, s * 32768));
+      }
+      if (++chunks % 100 === 0) log(pcId + " peak=" + peak.toFixed(3));
+      if (!ws) {
+        ws = new WebSocket("ws://127.0.0.1:8765");
+        ws.binaryType = "arraybuffer";
+        ws.onopen = () => { ws.send(JSON.stringify({
+          trackId: track.id, streamId, pcId, rate: TARGET_RATE,
+          page: location.href })); };
+        sockets.set(track.id, ws);
+      }
+      if (ws.readyState === 1) ws.send(out.buffer);
+    };
+    log("pipe " + pcId + " -> " + track.id.slice(0, 12));
+  } catch (err) { log("pipe ERR " + err); }
+}
+
+const OrigPC = window.RTCPeerConnection;
+let pcCount = 0;
+window.RTCPeerConnection = function(...a) {
+  const pc = new OrigPC(...a);
+  const pcId = "pc" + (++pcCount);
+  pc.addEventListener("track", (e) => {
+    log("WRAP " + pcId + " kind=" + e.track.kind + " streams=" + e.streams.length);
+    if (e.track.kind === "audio")
+      pipeTrack(e.track, (e.streams[0] && e.streams[0].id) || "-", pcId);
+  });
+  return pc;
+};
+
+async function voiceTrack(url) {
+  // voz real sin <audio>: decodifica el mp3 y lo enchufa a un MediaStreamDestination
+  const ctx = new AudioContext();
+  await ctx.resume();
+  log("voice ctx " + ctx.state);
+  const buf = await (await fetch(url)).arrayBuffer();
+  const audio = await ctx.decodeAudioData(buf);
+  const dest = ctx.createMediaStreamDestination();
+  const node = ctx.createBufferSource();
+  node.buffer = audio; node.loop = true;
+  node.connect(dest); node.start();
+  // nivel en la fuente: ¿el BufferSource da audio real antes de WebRTC?
+  const an = ctx.createAnalyser();
+  node.connect(an);
+  const buf8 = new Uint8Array(an.fftSize);
+  setInterval(() => {
+    an.getByteTimeDomainData(buf8);
+    let p = 0; for (const v of buf8) p = Math.max(p, Math.abs(v - 128));
+    log(url.slice(-10) + " src peak=" + p);
+  }, 4000);
+  return dest.stream.getAudioTracks()[0];
+}
+
+(async () => {
+  try {
+    const pcA = new RTCPeerConnection();
+    const pcB = new RTCPeerConnection();
+    pcA.onicecandidate = e => e.candidate && pcB.addIceCandidate(e.candidate);
+    pcB.onicecandidate = e => e.candidate && pcA.addIceCandidate(e.candidate);
+    pcA.ontrack = e => log("pcA track in: " + e.track.id.slice(0,12));
+    pcB.ontrack = e => log("pcB track in: " + e.track.id.slice(0,12));
+
+    const tA = await voiceTrack("/_test_audio/clipA.mp3");
+    const tB = await voiceTrack("/_test_audio/clipB.mp3");
+    log("voice tracks listos");
+    pcA.addTrack(tA);
+    pcB.addTrack(tB);
+    // bypass WebRTC: pipear las fuentes directas como si fueran los "asistentes"
+    pipeTrack(tA, "srcA", "srcA");
+    pipeTrack(tB, "srcB", "srcB");
+
+    const offer = await pcA.createOffer();
+    await pcA.setLocalDescription(offer);
+    await pcB.setRemoteDescription(offer);
+    const answer = await pcB.createAnswer();
+    await pcB.setLocalDescription(answer);
+    await pcA.setRemoteDescription(answer);
+    log("handshake done");
+  } catch (e) { log("ERR " + e.message + "\n" + e.stack); }
+})();
+</script>
+</body></html>
