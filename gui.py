@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QSpinBox, QTextEdit, QLineEdit, QComboBox,
     QProgressBar, QFileDialog, QMessageBox, QGroupBox, QStatusBar,
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
-    QPlainTextEdit, QScrollArea, QTextBrowser,
+    QPlainTextEdit, QScrollArea, QTextBrowser, QToolButton, QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, Slot, QMutex, QTimer, QRect,
@@ -296,57 +296,41 @@ class _AutoHeightBrowser(QTextBrowser):
         self.recompute_height()
 
 
-class AnswerCard(QFrame):
-    content_changed = Signal()
-
-    def __init__(self, kind, model_label, question, font_px=13, parent=None):
-        super().__init__(parent)
-        self.kind = kind
+class AnswerVersion:
+    def __init__(self, key, model_label, font_px, card):
+        self.key = key
+        self.card = card
         self.model_label = model_label
-        self.font_px = font_px
-        self.question = question or "(transcript completo)"
         self.text = ""
         self.done = False
         self.ok = True
-        self.body_color = "#d4d6d9"
-        self._root_dimmed = False
-        self.sections = []
+        self.error_text = ""
+        self.status_message = ""
         self.started_at = time.monotonic()
-        self._status_message = ""
+        self.finished_at = None
+        self.expanded = False
         self._last_render = 0.0
-        self._pending_text = None
-        self._sol = "sol" in model_label.lower()
-        self.setObjectName("AnswerCard")
-        self.setStyleSheet(
-            "QFrame#AnswerCard { background: #202226; border: 1px solid #303238;"
-            f" border-left: 3px solid {'#b08cff' if self._sol else '#ffd166'};"
-            " border-radius: 7px; }"
-            "QLabel { background: transparent; }"
-        )
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(9, 7, 9, 7)
-        layout.setSpacing(3)
-        header = QHBoxLayout()
-        self.header_label = QLabel()
-        self.header_label.setStyleSheet(
-            f"color: #d4d6d9; font-weight: 600; "
-            f"font-size: {11 + (font_px > 13)}px;")
-        self.status_label = QLabel()
-        self.status_label.setStyleSheet(
-            "color: #9aa0a6; font-size: 10px;")
-        header.addWidget(self.header_label, 1)
-        header.addWidget(self.status_label)
-        layout.addLayout(header)
-        short_question = self.question.strip()
-        if len(short_question) > 140:
-            short_question = short_question[:137].rstrip() + "…"
-        self.question_label = QLabel(f"«…» {short_question}")
-        self.question_label.setWordWrap(False)
-        self.question_label.setStyleSheet(
-            f"color: #9aa0a6; font-style: italic; "
-            f"font-size: {10 + (font_px > 13)}px;")
-        layout.addWidget(self.question_label)
-        self.body = _AutoHeightBrowser()
+        self._pending_render = False
+
+        self.row = QWidget(card)
+        self.row_layout = QVBoxLayout(self.row)
+        self.row_layout.setContentsMargins(0, 0, 0, 0)
+        self.row_layout.setSpacing(1)
+        self.button = QToolButton(self.row)
+        self.button.setAutoRaise(True)
+        self.button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.button.setCursor(Qt.PointingHandCursor)
+        self.button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.button.setStyleSheet(
+            "QToolButton { border: none; background: transparent;"
+            " color: #8e9297; font-size: 11px; text-align: left; padding: 0; }"
+            "QToolButton:hover { color: #c4c7cc; }")
+        self.button.clicked.connect(
+            lambda _checked=False, version_key=key:
+            card.toggle_version(version_key))
+        self.row_layout.addWidget(self.button)
+
+        self.body = _AutoHeightBrowser(self.row)
         body_font = QFont("Segoe UI")
         body_font.setPixelSize(font_px)
         self.body.setFont(body_font)
@@ -355,100 +339,266 @@ class AnswerCard(QFrame):
         self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.body.setFrameShape(QFrame.NoFrame)
-        self.body.setStyleSheet("QTextBrowser { background: transparent; border: none; }")
+        self.body.setStyleSheet(
+            "QTextBrowser { background: transparent; border: none; }")
         self.body.document().setDocumentMargin(0)
-        self.body.height_changed.connect(self._body_height_changed)
-        layout.addWidget(self.body)
-        self.sections_container = QWidget()
-        self.sections_layout = QVBoxLayout(self.sections_container)
-        self.sections_layout.setContentsMargins(0, 0, 0, 0)
-        self.sections_layout.setSpacing(6)
-        layout.addWidget(self.sections_container)
-        self._elapsed_timer = QTimer(self)
-        self._elapsed_timer.timeout.connect(self._refresh_elapsed)
-        self._elapsed_timer.start(100)
-        self._refresh_elapsed()
+        self.body.height_changed.connect(card._body_height_changed)
+        self.row_layout.addWidget(self.body)
+        self.body.hide()
+        self.row.hide()
 
-    def _refresh_elapsed(self):
-        elapsed = time.monotonic() - self.started_at
-        suffix = f"{elapsed:.1f}s"
-        if self.done:
-            self.status_label.setText(suffix)
-        elif self._status_message:
-            self.status_label.setText(self._status_message)
-        else:
-            self.status_label.setText(f"pensando… {suffix}")
-        self.header_label.setText(f"{self.kind} · {self.model_label}")
+        self._render_timer = QTimer(card)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_pending)
 
-    def set_status(self, text):
-        self._status_message = text
-        self._refresh_elapsed()
+    def elapsed(self):
+        end = self.finished_at or time.monotonic()
+        return max(0.0, end - self.started_at)
 
-    def set_stream_text(self, text, final=False, ok=True):
-        self.text = text or ""
-        self.ok = ok
-        if not final:
-            now = time.monotonic()
-            remaining = 0.05 - (now - self._last_render)
+    def elapsed_label(self):
+        return f"{self.elapsed():.1f}s"
+
+    def queue_render(self, final=False):
+        if not final and self._last_render:
+            remaining = 0.05 - (time.monotonic() - self._last_render)
             if remaining > 0:
-                self._pending_text = self.text
-                if not hasattr(self, "_render_timer"):
-                    self._render_timer = QTimer(self)
-                    self._render_timer.setSingleShot(True)
-                    self._render_timer.timeout.connect(self._render_pending)
+                self._pending_render = True
                 if not self._render_timer.isActive():
-                    self._render_timer.start(max(1, int(remaining * 1000) + 1))
-                self._status_message = ""
-                self._refresh_elapsed()
+                    self._render_timer.start(
+                        max(1, int(remaining * 1000) + 1))
                 return
-        if hasattr(self, "_render_timer"):
-            self._render_timer.stop()
-        self._pending_text = None
-        self._render_text(self.text)
-        if final:
-            self.done = True
-            self._elapsed_timer.stop()
-            self._status_message = ""
-            self._refresh_elapsed()
+        self._render_timer.stop()
+        self._pending_render = False
+        self.card._render_version(self)
 
     def _render_pending(self):
-        if self._pending_text is not None:
-            self._render_text(self._pending_text)
-            self._pending_text = None
+        if self._pending_render:
+            self._pending_render = False
+            self.card._render_version(self)
 
-    def _render_text(self, text):
-        color = self.body_color if self.ok else "#e57373"
-        render_markdown(
-            self.body.document(), text, self.font_px, color=color)
-        self._last_render = time.monotonic()
-        self.body.recompute_height()
+
+class _ElidedLabel(QLabel):
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._full_text = text
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        metrics = QFontMetrics(self.font())
+        self.setText(metrics.elidedText(
+            self._full_text, Qt.ElideRight, max(1, event.size().width())))
+
+
+class AnswerCard(QFrame):
+    content_changed = Signal()
+
+    def __init__(self, kind, model_label, question, font_px=13, parent=None,
+                 key=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.font_px = font_px
+        self.question = question or "(transcript completo)"
+        self.versions = []
+        self._versions_by_key = {}
+        self._content_version = None
+        self._main_body = None
+        self.setObjectName("AnswerCard")
+        self.setStyleSheet(
+            "QFrame#AnswerCard { background: transparent; border: none; }"
+            "QLabel { background: transparent; }")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(2)
+        self.history_container = QWidget(self)
+        self.history_layout = QVBoxLayout(self.history_container)
+        self.history_layout.setContentsMargins(0, 0, 0, 0)
+        self.history_layout.setSpacing(1)
+        layout.addWidget(self.history_container)
+
+        self.header_label = QLabel()
+        self.header_label.setStyleSheet(
+            "color: #8e9297; font-size: 11px; font-weight: normal;")
+        layout.addWidget(self.header_label)
+
+        self.question_label = _ElidedLabel(
+            f"«…» {self.question.strip()}")
+        self.question_label.setWordWrap(False)
+        self.question_label.setStyleSheet(
+            f"color: #8e9297; font-style: italic; "
+            f"font-size: {11 if font_px <= 13 else 12}px;")
+        layout.addWidget(self.question_label)
+
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._refresh_status_lines)
+        initial = self._new_version(key, model_label)
+        self._content_version = initial
+        self.body = initial.body
+        self._refresh_version_layout()
+        self._elapsed_timer.start(100)
+
+    @property
+    def current_version(self):
+        return self._content_version
+
+    @property
+    def latest_version(self):
+        return self.versions[-1]
+
+    def _new_version(self, key, model_label):
+        version = AnswerVersion(key, model_label, self.font_px, self)
+        self.versions.append(version)
+        self._versions_by_key[key] = version
+        return version
+
+    def add_version(self, key, model_label):
+        for version in self.versions:
+            version.expanded = False
+        version = self._new_version(key, model_label)
+        self._elapsed_timer.start(100)
+        self._refresh_version_layout()
+        self._refresh_status_lines()
+        return version
+
+    def _refresh_version_layout(self):
+        while self.history_layout.count():
+            item = self.history_layout.takeAt(0)
+            if item.widget():
+                item.widget().hide()
+
+        current = self._content_version
+        if self._main_body is not current.body:
+            previous = next(
+                (version for version in self.versions
+                 if version.body is self._main_body),
+                None)
+            if previous is not None:
+                self.layout().removeWidget(previous.body)
+                previous.body.setParent(previous.row)
+                previous.row_layout.addWidget(previous.body)
+            current.row_layout.removeWidget(current.body)
+            current.body.setParent(self)
+            self.layout().addWidget(current.body)
+            self._main_body = current.body
+        current.body.show()
+        self.body = current.body
+
+        current_index = self.versions.index(current)
+        for version in self.versions[:current_index]:
+            if not version.text.strip():
+                version.row.hide()
+                continue
+            if version.body.parent() is not version.row:
+                self.layout().removeWidget(version.body)
+                version.body.setParent(version.row)
+                version.row_layout.addWidget(version.body)
+            self._refresh_version_button(version)
+            version.button.show()
+            version.body.setVisible(version.expanded)
+            self.history_layout.addWidget(version.row)
+            version.row.show()
+
+        self.history_container.setVisible(bool(self.history_layout.count()))
+        self._refresh_status_lines()
         self.updateGeometry()
         self.content_changed.emit()
 
-    def add_followup_section(self, key, model_label):
-        section = SolSection(key, model_label, self.font_px, self)
-        section.content_changed.connect(
-            lambda current=section: self._section_changed(current))
-        self.sections.append(section)
-        self.sections_layout.addWidget(section)
-        self.updateGeometry()
-        return section
+    def _refresh_version_button(self, version):
+        arrow = "▾" if version.expanded else "▸"
+        version.button.setText(
+            f"{arrow} Anterior · {version.model_label} · "
+            f"{version.elapsed_label()}")
 
-    def set_section_only(self):
-        self.done = True
-        self._elapsed_timer.stop()
-        for widget in (
-                self.header_label, self.status_label, self.question_label,
-                self.body):
-            widget.hide()
-        self.updateGeometry()
+    def _refresh_status_lines(self):
+        latest = self.latest_version
+        if latest.error_text:
+            status = f"error: {latest.error_text}"
+            self.header_label.setStyleSheet(
+                "color: #e57373; font-size: 11px; font-weight: normal;")
+        else:
+            self.header_label.setStyleSheet(
+                "color: #8e9297; font-size: 11px; font-weight: normal;")
+            status = (
+                latest.status_message
+                or (latest.elapsed_label() if latest.done
+                    else f"pensando… {latest.elapsed_label()}"))
+        self.header_label.setText(f"{latest.model_label} · {status}")
+        for version in self.versions:
+            if version is not latest and version.text.strip():
+                self._refresh_version_button(version)
+        if not any(not version.done for version in self.versions):
+            self._elapsed_timer.stop()
 
-    def _section_changed(self, section):
-        if (not self._root_dimmed and self.ok and section.ok
-                and section.has_rendered_content()):
-            self._root_dimmed = True
-            self.body_color = "#a3a7ad"
-            self._render_text(self.text)
+    def set_status(self, key, text):
+        version = self._versions_by_key.get(key)
+        if version is None:
+            return
+        version.status_message = text or ""
+        self._refresh_status_lines()
+
+    def set_stream_text(self, key, text, final=False, ok=True):
+        version = self._versions_by_key.get(key)
+        if version is None:
+            return
+
+        if not ok:
+            version.ok = False
+            version.done = True
+            version.finished_at = time.monotonic()
+            version.status_message = ""
+            version.error_text = (text or "Error").removeprefix(
+                "Error:").strip()
+            version._render_timer.stop()
+            version._pending_render = False
+            if version.text.strip():
+                self._render_version(version)
+            self._refresh_status_lines()
+            self.updateGeometry()
+            self.content_changed.emit()
+            return
+
+        was_empty = not version.text.strip()
+        version.text = text or ""
+        version.status_message = ""
+        if final:
+            version.done = True
+            version.finished_at = time.monotonic()
+        version_index = self.versions.index(version)
+        content_index = self.versions.index(self._content_version)
+        if version.text.strip() and version_index >= content_index:
+            previous = self._content_version
+            if previous is not version:
+                self._content_version = version
+                self._refresh_version_layout()
+                if previous.text.strip():
+                    self._render_version(previous)
+        elif version.text.strip() and was_empty:
+            self._refresh_version_layout()
+
+        version.queue_render(final=final)
+        self._refresh_status_lines()
+
+    def toggle_version(self, key):
+        version = self._versions_by_key.get(key)
+        if (version is None or version is self._content_version
+                or not version.text.strip()):
+            return
+        version.expanded = not version.expanded
+        self._refresh_version_button(version)
+        version.body.setVisible(version.expanded)
+        version.row.updateGeometry()
+        self.history_container.updateGeometry()
+        self.updateGeometry()
+        self.content_changed.emit()
+
+    def _render_version(self, version):
+        color = (
+            "#d4d6d9" if version is self._content_version else "#8e9297")
+        render_markdown(
+            version.body.document(), version.text, self.font_px, color=color)
+        version._last_render = time.monotonic()
+        version.body.recompute_height()
+        version.body.updateGeometry()
         self.updateGeometry()
         self.content_changed.emit()
 
@@ -458,287 +608,25 @@ class AnswerCard(QFrame):
 
     def has_code_block(self):
         return any(
-            re.search(r"```[^\n]*\n", text)
-            for text in [self.text] + [section.text for section in self.sections])
+            re.search(r"```[^\n]*\n", version.text)
+            for version in self._visible_code_versions())
 
     def longest_code_line(self):
-        texts = [self.text] + [section.text for section in self.sections]
         blocks = [
             block
-            for text in texts
-            for block in re.findall(r"```[^\n]*\n(.*?)(?:```|$)", text, re.S)
+            for version in self._visible_code_versions()
+            for block in re.findall(
+                r"```[^\n]*\n(.*?)(?:```|$)", version.text, re.S)
         ]
         return max(
             (len(line) for block in blocks for line in block.splitlines()),
             default=0)
 
-
-_SOL_TAG_PATTERN = re.compile(
-    r"^\s*(?:[-*]\s+)?\[(MEJOR|NUEVO|CORRIGE|CÓDIGO|CODIGO|FUENTE)\]\s*(.*)$",
-    re.IGNORECASE,
-)
-
-
-def parse_sol_segments(text, keep_trailing_empty=False):
-    lines = (text or "").splitlines()
-    segments = []
-    prefix_lines = []
-    current_tag = None
-    current_lines = []
-    in_fence = False
-
-    def append_segment(tag, content, keep_empty=False):
-        markdown = "\n".join(content).strip()
-        if markdown or keep_empty:
-            segments.append((tag, markdown))
-
-    for line in lines:
-        match = None if in_fence else _SOL_TAG_PATTERN.match(line)
-        if match:
-            if current_tag is None:
-                append_segment("NUEVO", prefix_lines)
-            else:
-                append_segment(current_tag, current_lines)
-            current_tag = match.group(1).upper()
-            if current_tag == "CODIGO":
-                current_tag = "CÓDIGO"
-            rest = match.group(2)
-            current_lines = [rest] if rest else []
-            continue
-
-        if current_tag is None:
-            prefix_lines.append(line)
-        else:
-            current_lines.append(line)
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-
-    if current_tag is None:
-        append_segment("NUEVO", prefix_lines)
-    else:
-        append_segment(
-            current_tag, current_lines, keep_empty=keep_trailing_empty)
-    return segments
-
-
-class SolSegmentBlock(QFrame):
-    content_changed = Signal()
-
-    _STYLES = {
-        "MEJOR": ("Mejor frase", "#b08cff", "rgba(176,140,255,0.08)"),
-        "NUEVO": ("Nuevo", "#81c995", "rgba(129,201,149,0.07)"),
-        "CORRIGE": ("Corrige", "#fdd663", "rgba(253,214,99,0.07)"),
-        "CÓDIGO": ("Código", "#8ab4f8", "rgba(138,180,248,0.06)"),
-        "FUENTE": ("Fuente", "#9aa0a6", "transparent"),
-    }
-
-    def __init__(self, tag, markdown, font_px, parent=None):
-        super().__init__(parent)
-        self.setObjectName("SolSegmentBlock")
-        self.font_px = font_px
-        self.tag = None
-        self.markdown = None
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(7, 5, 7, 5)
-        layout.setSpacing(3)
-        self.chip = QLabel()
-        self.body = _AutoHeightBrowser(self)
-        self.body.setReadOnly(True)
-        self.body.setOpenExternalLinks(False)
-        self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.body.setFrameShape(QFrame.NoFrame)
-        self.body.setStyleSheet(
-            "QTextBrowser { background: transparent; border: none; }")
-        self.body.document().setDocumentMargin(0)
-        self.body.height_changed.connect(self._body_height_changed)
-        layout.addWidget(self.chip)
-        layout.addWidget(self.body)
-        self.set_segment(tag, markdown)
-
-    def set_segment(self, tag, markdown):
-        markdown = markdown or ""
-        font_changed = False
-        if tag != self.tag:
-            self.tag = tag
-            title, color, background = self._STYLES[tag]
-            self.setStyleSheet(
-                "QFrame#SolSegmentBlock {"
-                f" background-color: {background};"
-                f" border: 1px solid #303238; border-left: 3px solid {color};"
-                " border-radius: 6px; }"
-                "QLabel { background: transparent; }"
-            )
-            self.chip.setText(title)
-            self.chip.setStyleSheet(
-                f"color: {color}; font-size: 10px; font-weight: bold;")
-            font_px = 11 if tag == "FUENTE" else self.font_px
-            font_changed = getattr(self, "body_font_px", None) != font_px
-            self.body_font_px = font_px
-
-        if markdown != self.markdown or font_changed:
-            self.markdown = markdown
-            body_font = QFont("Segoe UI")
-            body_font.setPixelSize(self.body_font_px)
-            self.body.setFont(body_font)
-            render_markdown(
-                self.body.document(), markdown, self.body_font_px)
-            self.body.recompute_height()
-            self.updateGeometry()
-            self.content_changed.emit()
-
-    def _body_height_changed(self):
-        self.updateGeometry()
-        self.content_changed.emit()
-
-
-class SolSection(QFrame):
-    content_changed = Signal()
-
-    def __init__(self, key, model_label, font_px, parent=None):
-        super().__init__(parent)
-        self.key = key
-        self.card = parent
-        self.model_label = model_label
-        self.font_px = font_px
-        self.text = ""
-        self.ok = True
-        self.done = False
-        self.started_at = time.monotonic()
-        self._status_message = ""
-        self._last_render = 0.0
-        self._pending_text = None
-        self.segment_blocks = []
-        self.setObjectName("SolSection")
-        self.setStyleSheet(
-            "QFrame#SolSection { background: transparent; border: none; }"
-            "QLabel { background: transparent; }")
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 2, 0, 0)
-        layout.setSpacing(4)
-        header = QHBoxLayout()
-        self.header_label = QLabel(f"▲ Ampliación · {model_label}")
-        self.header_label.setStyleSheet(
-            "color: #b08cff; font-size: 11px; font-weight: bold;")
-        self.status_label = QLabel()
-        self.status_label.setStyleSheet(
-            "color: #9aa0a6; font-size: 10px;")
-        header.addWidget(self.header_label, 1)
-        header.addWidget(self.status_label)
-        layout.addLayout(header)
-
-        self.error_label = QLabel()
-        self.error_label.setWordWrap(True)
-        self.error_label.setStyleSheet(
-            "color: #e57373; font-size: 11px;")
-        self.error_label.hide()
-        layout.addWidget(self.error_label)
-
-        self.segments_container = QWidget(self)
-        self.segments_layout = QVBoxLayout(self.segments_container)
-        self.segments_layout.setContentsMargins(0, 0, 0, 0)
-        self.segments_layout.setSpacing(5)
-        layout.addWidget(self.segments_container)
-
-        self._elapsed_timer = QTimer(self)
-        self._elapsed_timer.timeout.connect(self._refresh_elapsed)
-        self._elapsed_timer.start(100)
-        self._refresh_elapsed()
-
-    def _refresh_elapsed(self):
-        elapsed = time.monotonic() - self.started_at
-        suffix = f"{elapsed:.1f}s"
-        if self.done:
-            self.status_label.setText(suffix)
-        elif self._status_message:
-            self.status_label.setText(self._status_message)
-        else:
-            self.status_label.setText(f"pensando… {suffix}")
-
-    def set_status(self, text):
-        self._status_message = text
-        self._refresh_elapsed()
-
-    def set_stream_text(self, text, final=False, ok=True):
-        self.text = text or ""
-        self.ok = ok
-        if not final:
-            remaining = 0.05 - (time.monotonic() - self._last_render)
-            if remaining > 0:
-                self._pending_text = self.text
-                if not hasattr(self, "_render_timer"):
-                    self._render_timer = QTimer(self)
-                    self._render_timer.setSingleShot(True)
-                    self._render_timer.timeout.connect(self._render_pending)
-                if not self._render_timer.isActive():
-                    self._render_timer.start(max(1, int(remaining * 1000) + 1))
-                self._status_message = ""
-                self._refresh_elapsed()
-                return
-
-        if hasattr(self, "_render_timer"):
-            self._render_timer.stop()
-        self._pending_text = None
-        if final:
-            self.done = True
-            self._elapsed_timer.stop()
-            self._status_message = ""
-            if not ok:
-                self._render_error(self.text)
-                self._refresh_elapsed()
-                return
-        self.error_label.hide()
-        self._render_text(self.text, keep_trailing_empty=not final)
-        if final:
-            self._refresh_elapsed()
-
-    def _render_pending(self):
-        if self._pending_text is not None:
-            self._render_text(self._pending_text, keep_trailing_empty=True)
-            self._pending_text = None
-
-    def _render_text(self, text, keep_trailing_empty):
-        segments = parse_sol_segments(
-            text, keep_trailing_empty=keep_trailing_empty)
-        for index, (tag, markdown) in enumerate(segments):
-            if index == len(self.segment_blocks):
-                block = SolSegmentBlock(
-                    tag, markdown, self.font_px, self.segments_container)
-                block.content_changed.connect(self._segment_changed)
-                self.segment_blocks.append(block)
-                self.segments_layout.addWidget(block)
-            else:
-                self.segment_blocks[index].set_segment(tag, markdown)
-
-        while len(self.segment_blocks) > len(segments):
-            block = self.segment_blocks.pop()
-            self.segments_layout.removeWidget(block)
-            block.setParent(None)
-            block.deleteLater()
-        self._last_render = time.monotonic()
-        self.updateGeometry()
-        self.content_changed.emit()
-
-    def _render_error(self, text):
-        for block in self.segment_blocks:
-            self.segments_layout.removeWidget(block)
-            block.setParent(None)
-            block.deleteLater()
-        self.segment_blocks.clear()
-        self.error_label.setText(text or "Error al generar la ampliación")
-        self.error_label.show()
-        self._last_render = time.monotonic()
-        self.updateGeometry()
-        self.content_changed.emit()
-
-    def _segment_changed(self):
-        self.updateGeometry()
-        self.content_changed.emit()
-
-    def has_rendered_content(self):
-        return self.ok and any(block.markdown.strip()
-                               for block in self.segment_blocks)
+    def _visible_code_versions(self):
+        return [
+            version for version in self.versions
+            if version is self._content_version or version.expanded
+        ]
 
 
 class AnswerFeed(QScrollArea):
@@ -759,7 +647,7 @@ class AnswerFeed(QScrollArea):
         self.container.setStyleSheet("background: transparent;")
         self.layout = QVBoxLayout(self.container)
         self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(7)
+        self.layout.setSpacing(2)
         self.layout.addStretch(1)
         self.setWidget(self.container)
         self._cards = []
@@ -775,7 +663,8 @@ class AnswerFeed(QScrollArea):
     def start(self, key, kind, model_label, question):
         self.clear()
         card = AnswerCard(
-            kind, model_label, question, self.font_px, parent=self.container)
+            kind, model_label, question, self.font_px, parent=self.container,
+            key=key)
         card.content_changed.connect(self._schedule_content_changed)
         self._cards.append((key, card))
         self._by_key[key] = card
@@ -785,32 +674,30 @@ class AnswerFeed(QScrollArea):
         return card
 
     def start_followup(self, parent_key, key, model_label):
-        parent = self._by_key.get(parent_key)
-        card = parent.card if isinstance(parent, SolSection) else parent
+        card = self._by_key.get(parent_key)
         if not isinstance(card, AnswerCard):
-            card = self.start(key, "Más a fondo", model_label, "")
-            card.set_section_only()
-        section = card.add_followup_section(key, model_label)
-        self._by_key[key] = section
-        self._anchor = section
+            return self.start(key, "Más a fondo", model_label, "")
+        card.add_version(key, model_label)
+        self._by_key[key] = card
+        self._anchor = card
         self._schedule_content_changed()
-        return section
+        return card
 
     def update(self, key, text):
-        target = self._by_key.get(key)
-        if target:
-            target.set_stream_text(text)
+        card = self._by_key.get(key)
+        if card:
+            card.set_stream_text(key, text)
             self._schedule_content_changed()
 
     def status(self, key, text):
-        target = self._by_key.get(key)
-        if target:
-            target.set_status(text)
+        card = self._by_key.get(key)
+        if card:
+            card.set_status(key, text)
 
     def finish(self, key, ok, text):
-        target = self._by_key.get(key)
-        if target:
-            target.set_stream_text(text, final=True, ok=ok)
+        card = self._by_key.get(key)
+        if card:
+            card.set_stream_text(key, text, final=True, ok=ok)
             self._schedule_content_changed()
 
     def clear(self):
@@ -835,7 +722,12 @@ class AnswerFeed(QScrollArea):
         self._content_change_pending = False
         self.container.updateGeometry()
         self.content_changed.emit()
+        QTimer.singleShot(0, self._emit_layout_content_changed)
         QTimer.singleShot(0, self._apply_anchor)
+
+    def _emit_layout_content_changed(self):
+        self.container.updateGeometry()
+        self.content_changed.emit()
 
     def _release_anchor(self, *_):
         if not self._setting_scroll:
@@ -856,11 +748,11 @@ class AnswerFeed(QScrollArea):
         super().wheelEvent(event)
 
     def has_code_block(self):
-        return any(card.has_code_block() for _, card in self._cards[-3:])
+        return any(card.has_code_block() for _, card in self._cards)
 
     def longest_code_line(self):
         return max((card.longest_code_line()
-                    for _, card in self._cards[-3:]), default=0)
+                    for _, card in self._cards), default=0)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -937,7 +829,9 @@ class CompactOverlay(QWidget):
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._resize_to_content)
-        self._resize_animation = None
+        self._resize_animation = QPropertyAnimation(self, b"geometry", self)
+        self._resize_animation.setDuration(240)
+        self._resize_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
 
     # ------------------------- estado / ACKs -------------------------
 
@@ -1018,14 +912,11 @@ class CompactOverlay(QWidget):
                 and abs(desired_width - self.width()) < 8
                 and (x, y) == (self.x(), self.y())):
             return
-        self._resize_animation = QPropertyAnimation(self, b"geometry", self)
-        self._resize_animation.setDuration(240)
-        self._resize_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._resize_animation.stop()
         self._resize_animation.setStartValue(self.geometry())
         self._resize_animation.setEndValue(
             QRect(x, y, desired_width, target_height))
-        self._resize_animation.start(
-            QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        self._resize_animation.start()
 
     def nudge(self, dx, dy):
         screen = self.screen().availableGeometry()

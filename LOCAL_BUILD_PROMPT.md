@@ -42,24 +42,27 @@ con varios hablantes.
       dentro del panel Entrevistador.
 - [ ] Panel oculto: `Ctrl+I` es el ÚNICO control de visibilidad (no hay
       botón ni doble-clic); no roba el foco del navegador. Muestra dos líneas
-      recientes por carril y una sola tarjeta de respuesta Markdown: una nueva
-      respuesta raíz reemplaza la anterior. Se ancla al inicio de la respuesta
-      o ampliación, crece hasta el 85 % de la pantalla y se ensancha para código.
+       recientes por carril y una sola respuesta Markdown: una nueva respuesta
+       raíz reemplaza la anterior. Alt+S conserva el cuerpo actual mientras
+       piensa y, al llegar texto, lo sustituye; las versiones anteriores quedan
+       plegadas arriba y se pueden desplegar. Se ancla al inicio de la respuesta,
+       crece hasta el 85 % de la pantalla y se ensancha para código visible.
       Se mueve con `Ctrl+flechas`, cambia de opacidad con `Ctrl+±` y cada
       hotkey deja un ACK visible.
 - [ ] Hotkeys con otra ventana enfocada (ej. el navegador):
       `Ctrl+M` conmuta auto-GPT (bloqueado si «GPT solo bajo demanda»),
       `Ctrl+Q` responde la última intervención,
-      `Alt+S` añade a la tarjeta una «Ampliación» de gpt-6.1-sol con las
-      diferencias o correcciones,
+       `Alt+S` sustituye la respuesta visible por una versión completa de
+       gpt-6.1-sol; la versión anterior queda plegada arriba en una fila
+       «Anterior»,
       `Alt+G` envía el transcript a GPT,
       `Alt+T` start/stop de la captura.
       Los eventos de las hotkeys disparadas se consumen y no llegan al
       navegador. La respuesta de GPT NUNCA se copia sola al portapapeles.
 - [ ] Las respuestas usan Markdown compacto: línea directa en negrita y
-      viñetas breves; código y tablas se leen bien en ambas vistas. Sol añade
-      bloques etiquetados «Mejor frase», «Nuevo», «Corrige», «Código» y
-      «Fuente» debajo de la respuesta de Luna, que se atenúa al llegar contenido.
+      viñetas breves; código y tablas se leen bien en ambas vistas. El historial
+      muestra las versiones anteriores como filas planas plegadas, con Markdown
+      atenuado al desplegarlas; la pregunta aparece una sola vez.
 - [ ] «Invisible al compartir pantalla / grabar» excluye de las capturas
       compatibles de Windows el panel, el ACK y la ventana principal; al
       desactivarlo, la captura normal vuelve a mostrarlos.

@@ -317,10 +317,10 @@ DEFAULT_GPT_CONFIG = {
     ),
     "smart_prompt": (
         "MODO «MÁS A FONDO»: un modelo rápido (gpt-6-luna) ya respondió a esta "
-        "intervención; el candidato tiene esa respuesta en pantalla pero la ha "
-        "marcado como insuficiente (pulsó «más a fondo» en mitad de la "
-        "entrevista). Lo que escribas se mostrará DEBAJO de esa respuesta, en "
-        "la misma tarjeta, así que aporta SOLO lo que cambia o falta.\n"
+        "intervención y al candidato no le ha servido (pulsó «más a fondo» en "
+        "mitad de la entrevista). Tu respuesta SUSTITUYE a la anterior en "
+        "pantalla: escribe la versión buena y completa, lista para usar, no un "
+        "comentario sobre la anterior.\n"
         "- Antes de escribir, diagnostica en silencio por qué se quedó corta: "
         "¿malinterpretó la pregunta por errores de transcripción?, ¿fue "
         "superficial o genérica?, ¿le faltó código, un ejemplo concreto, datos "
@@ -328,27 +328,14 @@ DEFAULT_GPT_CONFIG = {
         "ya ha dicho o con el brief?\n"
         "- Razona más a fondo que el modelo rápido. Si la pregunta depende de "
         "datos recientes, de una empresa/producto concreto o de algo verificable, "
-        "usa la búsqueda web.\n"
+        "usa la búsqueda web y cita la fuente en una línea al final.\n"
+        "- Conserva lo que la respuesta anterior tenía bien, pero no la "
+        "menciones ni escribas cosas como «a diferencia de la respuesta "
+        "anterior».\n"
         "- Ten en cuenta lo que el candidato ya ha dicho en voz alta (carril "
         "«Tú») para que pueda continuar con naturalidad sin contradecirse.\n"
         "- Si la intervención es ambigua, responde a la interpretación más "
-        "probable y añade la alternativa en una sola línea.\n"
-        "\n"
-        "FORMATO OBLIGATORIO (Markdown, mismo idioma que la pregunta). Cada "
-        "bloque empieza, al principio de la línea, con una de estas etiquetas:\n"
-        "[MEJOR] — solo si la frase principal anterior no sirve, y siempre "
-        "como primer bloque: la nueva frase para decir en voz alta, en "
-        "**negrita**.\n"
-        "[NUEVO] — un punto, dato, ejemplo o trade-off que la respuesta "
-        "anterior no tenía (una idea por bloque, 1-2 líneas).\n"
-        "[CORRIGE] — algo de la respuesta anterior incorrecto o engañoso, así: "
-        "~~lo que decía~~ → lo correcto.\n"
-        "[CÓDIGO] — código nuevo o corregido en un bloque ``` con el lenguaje, "
-        "completo (no un diff), líneas de como mucho ~80 caracteres.\n"
-        "[FUENTE] — al final, una línea por URL si usaste la web.\n"
-        "No repitas nada que la respuesta anterior ya dijera bien, sin "
-        "introducciones ni despedidas. Si ya era correcta y completa, devuelve "
-        "un único [NUEVO] con el matiz más útil que añadirías."
+        "probable y añade la alternativa en una sola línea."
     ),
     "smart_model": "gpt-6.1-sol",
     "smart_reasoning_effort": "medium",
@@ -375,6 +362,9 @@ def build_smart_request(question, previous, context, mine, brief, config):
             "que el brief no respalde; ante falta de evidencia, responde "
             "en hipotético."
         )
+    format_prompt = config.get("format_prompt", "")
+    if format_prompt:
+        instructions += "\n\n" + format_prompt
     smart_prompt = config.get("smart_prompt", "")
     if smart_prompt:
         instructions += "\n\n" + smart_prompt
@@ -383,13 +373,9 @@ def build_smart_request(question, previous, context, mine, brief, config):
     for answer in previous:
         model, text, *followup = answer
         if followup and followup[0]:
-            heading = (
-                f"Ampliación anterior de {model} (también en pantalla; "
-                "el candidato pide todavía más):")
+            heading = f"Respuesta anterior de {model} (tampoco le sirvió; profundiza más):"
         else:
-            heading = (
-                f"Respuesta anterior de {model} (en pantalla, marcada como "
-                "insuficiente por el candidato):")
+            heading = f"Respuesta anterior de {model} (no le sirvió al candidato):"
         previous_blocks.append(f"{heading}\n<<<\n{text}\n>>>")
 
     user_input = (

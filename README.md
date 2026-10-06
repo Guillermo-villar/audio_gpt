@@ -96,15 +96,15 @@ MIT.
   llegan al navegador). Cada comando deja constancia visible (flash en el
   panel o toast flotante):
   `Ctrl+Q` responder la última intervención del entrevistador ·
-  `Alt+S` añadir debajo una ampliación de gpt-6.1-sol con lo nuevo o corregido ·
+  `Alt+S` sustituir la respuesta visible por una versión completa de gpt-6.1-sol ·
   `Alt+G` enviar el transcript a GPT · `Ctrl+M` auto-GPT on/off ·
   `Ctrl+I` panel · `Alt+T` start/stop transcripción.
   Las respuestas de GPT nunca se copian solas al portapapeles.
 - **Formato de respuestas**: todos los motores reciben instrucciones para
-  responder en Markdown breve. `Alt+S` conserva la respuesta de Luna y añade
-  debajo una sección «Ampliación» con etiquetas «Mejor frase», «Nuevo»,
-  «Corrige», «Código» y «Fuente»; la respuesta de Luna se atenúa cuando llega
-  contenido de Sol. Una nueva respuesta raíz sustituye toda la tarjeta.
+  responder en Markdown breve. `Alt+S` sustituye la respuesta visible por una
+  versión completa de Sol; la anterior queda plegada arriba en una fila
+  «Anterior» y se puede desplegar para consultar su Markdown. Otra respuesta
+  raíz sustituye la tarjeta y su historial.
 - **Privacidad visual**: activa «Invisible al compartir pantalla / grabar»
   para excluir el panel, las confirmaciones y la ventana principal de las
   capturas compatibles de Windows.
