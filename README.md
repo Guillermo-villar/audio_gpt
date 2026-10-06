@@ -85,13 +85,18 @@ MIT.
 
 ## Uso durante la llamada (modo copiloto)
 
-- **Modo compacto** (botón o `Ctrl+Alt+D`): panel semitransparente siempre
+- **Modo compacto** (botón o `F8`): panel semitransparente siempre
   encima — estado, lo que se oye en vivo y la última respuesta. Anclable
   sobre cualquier ventana; doble clic para ocultarlo.
-- **Hotkeys globales** (Ctrl+Alt+letra, funcionan con otra app enfocada):
-  `G` responder la última intervención del entrevistador (rescate del gate) ·
-  `D` overlay · `A` auto-GPT on/off · `C` copiar última respuesta ·
-  `T` start/stop transcripción.
+- **Hotkeys globales** (teclas F sueltas, funcionan con otra app enfocada
+  — YouTube, Meet, Zoom…):
+  `F9` responder la última intervención del entrevistador (rescate del gate) ·
+  `F10` auto-GPT on/off · `F8` overlay · `F7` copiar última respuesta ·
+  `F2` start/stop transcripción.
+- **Gate con clef-flash**: si hay credenciales de Cloudflare, cada
+  intervención se evalúa con `@cf/cloudflare/clef-flash` (9B, gratis en
+  neuronas, ~0.3s) — mejor precisión que la heurística de palabras clave,
+  que queda como fallback offline.
 - **Brief de la entrevista**: puesto, empresa, experiencia aprobada y
   límites — va en el system prompt de cada llamada (nunca fabrica
   experiencia que el brief no respalde).

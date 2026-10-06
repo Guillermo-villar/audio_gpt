@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 
 from dotenv import load_dotenv
 from PySide6.QtCore import QThread, Signal
@@ -59,6 +60,51 @@ _TECH_TASK_HINTS = (
 
 _MARKER_RE = re.compile(
     r"\b(" + "|".join(re.escape(w) for w in _QUESTION_MARKERS) + r")\b")
+
+
+def clef_question(text, timeout=4.0):
+    """Gate real con @cf/cloudflare/clef-flash (Workers AI, neuronas).
+
+    Devuelve (es_pregunta, probabilidad) o None sin creds/error — en ese
+    caso el llamante cae a la heurística looks_like_question.
+    """
+    token, account = cloudflare_creds()
+    if not token or not account:
+        return None
+    url = (f"https://api.cloudflare.com/client/v4/accounts/{account}"
+           "/ai/run/@cf/cloudflare/clef-flash")
+    body = {
+        "model": "clef-flash",
+        "state": text,
+        "questions": {
+            "is_question": {
+                "type": "choice",
+                "instructions": (
+                    "Is this utterance a question or a task directed at the "
+                    "listener? yes only for real questions or requests "
+                    "(technical or behavioral), no for small talk, filler, "
+                    "ads, or statements not asking anything."),
+                "criteria": {
+                    "yes": "genuine question or request to answer",
+                    "no": "small talk, filler, or no question asked",
+                },
+            }
+        },
+    }
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), method="POST",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            answers = json.loads(r.read())["result"]["answers"]
+        a = answers.get("is_question", {})
+        probs = a.get("probabilities") or {}
+        p_yes = float(probs.get(
+            "yes", 1.0 if a.get("choice") == "yes" else 0.0))
+        return (a.get("choice") == "yes" or p_yes > 0.5), p_yes
+    except Exception:
+        return None
 
 
 def looks_like_question(text, min_words=4):

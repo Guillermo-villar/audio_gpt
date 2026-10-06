@@ -17,6 +17,7 @@ import uuid
 import json
 import html
 import ctypes
+import threading
 from collections import deque
 
 from PySide6.QtWidgets import (
@@ -38,37 +39,34 @@ import transcriber
 import vad
 from api_client import (
     ApiKeyManager, TranscriptionThread, WhisperService, GptClient,
-    GptQueryThread, CodexCliThread, looks_like_question,
+    GptQueryThread, CodexCliThread, looks_like_question, clef_question,
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
 
-# Hotkeys globales (Ctrl+Alt+tecla) — vía GetAsyncKeyState, sin permisos
-# de admin ni dependencias. G responder última · D overlay · A auto-GPT ·
-# C copiar respuesta · T start/stop.
+# Hotkeys globales (teclas F sueltas, sin combos) — vía GetAsyncKeyState,
+# sin permisos de admin ni dependencias. F9 responder última · F10 auto-GPT
+# · F8 overlay · F7 copiar respuesta · F2 start/stop. Funcionan con la app
+# abierta aunque otra ventana tenga el foco.
 HOTKEYS = {
-    "g": (0x47, "answer_last", "responder última intervención"),
-    "d": (0x44, "toggle_compact", "modo compacto"),
-    "a": (0x41, "toggle_auto", "auto-GPT on/off"),
-    "c": (0x43, "copy_answer", "copiar última respuesta"),
-    "t": (0x54, "toggle_capture", "start/stop transcripción"),
+    "f9": (0x78, "answer_last", "responder última intervención"),
+    "f10": (0x79, "toggle_auto", "auto-GPT on/off"),
+    "f8": (0x77, "toggle_compact", "modo compacto"),
+    "f7": (0x76, "copy_answer", "copiar última respuesta"),
+    "f2": (0x71, "toggle_capture", "start/stop transcripción"),
 }
-VK_CTRL, VK_ALT = 0x11, 0x12
 
 
-def _combo_pressed(letter):
-    """True si Ctrl+Alt+letter están pulsados ahora mismo (Windows)."""
+def _combo_pressed(key):
+    """True si la tecla está pulsada ahora mismo o se pulsó desde la
+    última consulta (Windows). 0x8001 = down ahora | press reciente —
+    un tap de F-key dura menos que el poll y solo el bit bajo lo pilla."""
     if sys.platform != "win32":
         return False
-    vk = HOTKEYS[letter][0]
-    u32 = ctypes.windll.user32
-    return bool(
-        u32.GetAsyncKeyState(VK_CTRL) & 0x8000
-        and u32.GetAsyncKeyState(VK_ALT) & 0x8000
-        and u32.GetAsyncKeyState(vk) & 0x8000
-    )
+    vk = HOTKEYS[key][0]
+    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8001)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +114,7 @@ class CompactOverlay(QWidget):
         self.answer_box.setPlaceholderText("última respuesta…")
         panel_layout.addWidget(self.answer_box, 1)
 
-        legend = QLabel("Ctrl+Alt+G responder · D dock · A auto · C copiar · T start/stop")
+        legend = QLabel("F9 responder · F10 auto · F8 dock · F7 copiar · F2 start/stop")
         legend.setStyleSheet("color: #777; font-size: 10px;")
         panel_layout.addWidget(legend)
 
@@ -764,6 +762,7 @@ class WhisperApp(QMainWindow):
     # Las señales se emiten desde hilos auxiliares y llegan encoladas a la UI.
     realtime_text = Signal(str, bool, str)   # (texto, final, carril)
     realtime_error = Signal(str)
+    gate_fired = Signal(str, str, str)       # (texto, carril, modo)
 
     CAPTURE_SOURCES = [
         ("loopback", "Audio del sistema (loopback WASAPI)"),
@@ -789,20 +788,23 @@ class WhisperApp(QMainWindow):
         self._dying_threads = []
         self._ctx = deque(maxlen=16)      # últimas intervenciones «Carril: texto»
         self._draft_state = {}            # carril -> interim ya respondido
+        self._gate_pending = set()        # carriles con gate clef en vuelo
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
-        self._last_answer = ""            # para Ctrl+Alt+C (copiar respuesta)
+        self._last_answer = ""            # para F7 (copiar respuesta)
         self._hk_prev = set()             # hotkeys actualmente pulsados
 
         self.init_ui()
         self.overlay = CompactOverlay()
         self.realtime_text.connect(self._append_transcript)
         self.realtime_error.connect(self.handle_continuous_error)
+        self.gate_fired.connect(self._on_gate_fired)
         self._apply_settings()
 
-        # poll de hotkeys globales ~90 ms (nada de hooks de SO ni admin)
+        # poll de hotkeys globales 30 ms: una pulsación de F-key dura
+        # ~40-60 ms, con 90 ms se escapaban toques entre sondeos.
         self._hk_timer = QTimer(self)
         self._hk_timer.timeout.connect(self._hotkey_tick)
-        self._hk_timer.start(90)
+        self._hk_timer.start(30)
 
     # ------------------------- construcción de UI -------------------------
 
@@ -1361,9 +1363,36 @@ class WhisperApp(QMainWindow):
         prev = self._draft_state.get(lane)
         if prev is not None and prev in text:
             return                                # mismo turno, ya disparado
-        if looks_like_question(text):
+        self._gate_async(text, lane, "Borrador")
+
+    # ------------------------- gate clef-flash ----------------------------
+
+    def _gate_async(self, text, lane, kind):
+        """Decide el disparo en hilo: clef-flash con creds CF, heurística
+        local como fallback. _gate_pending evita llamadas por interim."""
+        if lane in self._gate_pending:
+            return
+        self._gate_pending.add(lane)
+
+        def run():
+            try:
+                verdict = clef_question(text)
+                ok = verdict[0] if verdict else looks_like_question(text)
+                if ok:
+                    self.gate_fired.emit(text, lane, kind)
+            finally:
+                self._gate_pending.discard(lane)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @Slot(str, str, str)
+    def _on_gate_fired(self, text, lane, kind):
+        if kind == "Borrador":
             self._draft_state[lane] = text
-            self._fire_gpt(text, lane, kind="Borrador")
+            self._fire_gpt(text, lane, kind=kind)
+        else:  # Revisión
+            self._fire_gpt(text, lane, kind=kind,
+                           effort=self._review_effort("medium"))
 
     def _retire_thread(self, thread):
         """Detiene un QThread sin destruirlo mientras siga corriendo.
@@ -1432,14 +1461,8 @@ class WhisperApp(QMainWindow):
         if not text.strip():
             return
         if self.auto_gpt_checkbox.isChecked() and lane != "Tú":
-            # Revisión sobre el final: misma puerta, esfuerzo mayor y
-            # contexto de las últimas intervenciones.
-            if looks_like_question(text):
-                self._fire_gpt(display, lane, kind="Revisión",
-                               effort="medium")
-            else:
-                self._ctx.append(display)
-                return
+            # Revisión sobre el final: mismo gate, esfuerzo mayor.
+            self._gate_async(display, lane, "Revisión")
         self._ctx.append(display)
 
     def _review_effort(self, base):
