@@ -34,8 +34,12 @@ con varios hablantes.
 
 ## 3. Qué verificar (checklist de pruebas)
 
-- [ ] STT en vivo: transcript con "Entrevistador:" azul / "Tú:" verde.
-- [ ] Diarización: con varias voces, aparecen etiquetas de speaker distintas.
+- [ ] UI clara: toda la app en tema claro (fondo claro, campos blancos,
+      texto oscuro) aunque Windows esté en modo oscuro.
+- [ ] STT en vivo: DOS paneles — "Entrevistador" (voces de la llamada)
+      a la izquierda y "Tú (micro)" (tu voz) a la derecha.
+- [ ] Diarización: con varias voces, aparecen etiquetas de speaker distintas
+      dentro del panel Entrevistador.
 - [ ] Modo compacto: `Ctrl+I` abre el overlay siempre encima (arrastrable,
       doble-clic oculta). Repítelo para cerrar.
 - [ ] Hotkeys con otra ventana enfocada (ej. el navegador):
