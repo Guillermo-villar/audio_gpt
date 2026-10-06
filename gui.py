@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
 )
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex, QTimer
-from PySide6.QtGui import QPainter, QColor, QPen, QFont, QTextCursor
+from PySide6.QtGui import QPainter, QColor, QPen, QFont, QTextCursor, QPalette
 
 import numpy as np
 import sounddevice as sd
@@ -1678,8 +1678,31 @@ class WhisperApp(QMainWindow):
         super().closeEvent(event)
 
 
+def _force_light_palette(app):
+    """Tema claro garantizado: ignora el modo oscuro del SO."""
+    app.setStyle("Fusion")
+    p = QPalette()
+    text, base, win = QColor("#1a1a1a"), QColor("#ffffff"), QColor("#f4f4f4")
+    p.setColor(QPalette.Window, win)
+    p.setColor(QPalette.WindowText, text)
+    p.setColor(QPalette.Base, base)
+    p.setColor(QPalette.AlternateBase, QColor("#f0f0f0"))
+    p.setColor(QPalette.Text, text)
+    p.setColor(QPalette.Button, win)
+    p.setColor(QPalette.ButtonText, text)
+    p.setColor(QPalette.ToolTipBase, QColor("#ffffdc"))
+    p.setColor(QPalette.ToolTipText, text)
+    p.setColor(QPalette.Highlight, QColor("#2f6fed"))
+    p.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    p.setColor(QPalette.PlaceholderText, QColor("#888888"))
+    for role in (QPalette.Text, QPalette.ButtonText, QPalette.WindowText):
+        p.setColor(QPalette.Disabled, role, QColor("#999999"))
+    app.setPalette(p)
+
+
 def main():
     app = QApplication(sys.argv)
+    _force_light_palette(app)
     window = WhisperApp()
     window.show()
     sys.exit(app.exec())
