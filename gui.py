@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QSpinBox, QTextEdit, QLineEdit, QComboBox,
     QProgressBar, QFileDialog, QMessageBox, QGroupBox, QStatusBar,
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
-    QPlainTextEdit, QScrollArea, QTextBrowser, QToolButton, QSizePolicy,
+    QPlainTextEdit, QScrollArea, QTextBrowser, QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, Slot, QMutex, QTimer, QRect,
@@ -215,14 +215,28 @@ def render_markdown(doc, text, font_px=13, color="#d4d6d9"):
     block = doc.begin()
     while block.isValid():
         block_format = block.blockFormat()
-        block_char_format = block.charFormat()
-        fenced = bool(block_char_format.fontFixedPitch())
+        fragments = []
+        iterator = block.begin()
+        while not iterator.atEnd():
+            fragment = iterator.fragment()
+            if fragment.isValid():
+                fragments.append((
+                    fragment.position(), fragment.length(),
+                    fragment.charFormat()))
+            iterator += 1
+
+        fenced = False
         if code_fence is not None:
-            fenced = fenced or bool(block_format.property(code_fence))
+            fenced = block_format.hasProperty(code_fence)
         if code_language is not None:
             fenced = fenced or bool(block_format.property(code_language))
+        all_fixed_pitch = bool(fragments) and all(
+            char_format.fontFixedPitch()
+            for _, _, char_format in fragments)
+        if code_fence is None and code_language is None:
+            fenced = all_fixed_pitch
+
         cursor = QTextCursor(block)
-        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
         if fenced:
             block_format.setBackground(QColor("#15171a"))
             block_format.setLeftMargin(8)
@@ -233,17 +247,11 @@ def render_markdown(doc, text, font_px=13, color="#d4d6d9"):
             fmt.setFontFixedPitch(True)
             fmt.setForeground(QColor("#d6d6d6"))
             fmt.setBackground(QColor("#15171a"))
+            cursor.movePosition(
+                QTextCursor.MoveOperation.EndOfBlock,
+                QTextCursor.MoveMode.KeepAnchor)
             cursor.mergeCharFormat(fmt)
         else:
-            fragments = []
-            iterator = block.begin()
-            while not iterator.atEnd():
-                fragment = iterator.fragment()
-                if fragment.isValid():
-                    fragments.append((
-                        fragment.position(), fragment.length(),
-                        fragment.charFormat()))
-                iterator += 1
             for position, length, char_format in fragments:
                 fmt = QTextCharFormat()
                 if char_format.isAnchor():
@@ -296,6 +304,50 @@ class _AutoHeightBrowser(QTextBrowser):
         self.recompute_height()
 
 
+class _VersionHistoryLabel(QLabel):
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pressed = False
+        self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setTextFormat(Qt.PlainText)
+        self.setStyleSheet(
+            "QLabel { border: none; background: transparent; "
+            "color: #8e9297; font-size: 11px; padding: 0; }"
+            "QLabel:hover { color: #c4c7cc; }")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._pressed = True
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        pressed = self._pressed
+        self._pressed = False
+        if (pressed and event.button() == Qt.LeftButton
+                and self.rect().contains(event.position().toPoint())):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def click(self):
+        self.clicked.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class AnswerVersion:
     def __init__(self, key, model_label, font_px, card):
         self.key = key
@@ -316,15 +368,7 @@ class AnswerVersion:
         self.row_layout = QVBoxLayout(self.row)
         self.row_layout.setContentsMargins(0, 0, 0, 0)
         self.row_layout.setSpacing(1)
-        self.button = QToolButton(self.row)
-        self.button.setAutoRaise(True)
-        self.button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.button.setCursor(Qt.PointingHandCursor)
-        self.button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.button.setStyleSheet(
-            "QToolButton { border: none; background: transparent;"
-            " color: #8e9297; font-size: 11px; text-align: left; padding: 0; }"
-            "QToolButton:hover { color: #c4c7cc; }")
+        self.button = _VersionHistoryLabel(self.row)
         self.button.clicked.connect(
             lambda _checked=False, version_key=key:
             card.toggle_version(version_key))
@@ -415,6 +459,12 @@ class AnswerCard(QFrame):
         self.history_layout.setContentsMargins(0, 0, 0, 0)
         self.history_layout.setSpacing(1)
         layout.addWidget(self.history_container)
+
+        self.pending_label = QLabel()
+        self.pending_label.setStyleSheet(
+            "color: #8e9297; font-size: 11px; font-weight: normal;")
+        self.pending_label.hide()
+        layout.addWidget(self.pending_label)
 
         self.header_label = QLabel()
         self.header_label.setStyleSheet(
@@ -511,18 +561,39 @@ class AnswerCard(QFrame):
 
     def _refresh_status_lines(self):
         latest = self.latest_version
-        if latest.error_text:
-            status = f"error: {latest.error_text}"
+        pending = latest is not self._content_version and not latest.text.strip()
+        if pending:
+            if latest.error_text:
+                pending_status = f"error: {latest.error_text}"
+                self.pending_label.setStyleSheet(
+                    "color: #e57373; font-size: 11px; font-weight: normal;")
+            else:
+                self.pending_label.setStyleSheet(
+                    "color: #8e9297; font-size: 11px; font-weight: normal;")
+                pending_status = (
+                    latest.status_message
+                    or (latest.elapsed_label() if latest.done
+                        else f"pensando… {latest.elapsed_label()}"))
+            self.pending_label.setText(
+                f"{latest.model_label} · {pending_status}")
+            self.pending_label.show()
+            visible = self._content_version
+        else:
+            self.pending_label.hide()
+            visible = latest
+
+        if visible.error_text:
+            status = f"error: {visible.error_text}"
             self.header_label.setStyleSheet(
                 "color: #e57373; font-size: 11px; font-weight: normal;")
         else:
             self.header_label.setStyleSheet(
                 "color: #8e9297; font-size: 11px; font-weight: normal;")
             status = (
-                latest.status_message
-                or (latest.elapsed_label() if latest.done
-                    else f"pensando… {latest.elapsed_label()}"))
-        self.header_label.setText(f"{latest.model_label} · {status}")
+                visible.status_message
+                or (visible.elapsed_label() if visible.done
+                    else f"pensando… {visible.elapsed_label()}"))
+        self.header_label.setText(f"{visible.model_label} · {status}")
         for version in self.versions:
             if version is not latest and version.text.strip():
                 self._refresh_version_button(version)
