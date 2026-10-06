@@ -306,6 +306,29 @@ DEFAULT_GPT_CONFIG = {
     "reasoning_effort": "none",   # borradores rápidos; la revisión sube a "medium"
     "service_tier": "fast",       # Fast mode (~2.5x menos latencia, ~2x precio); "auto"/"flex" alternativas
     "max_tokens": 2000,
+    "format_prompt": (
+        "FORMATO DE RESPUESTA (se muestra en un panel pequeño que el candidato lee de un vistazo mientras habla):\n"
+        "- Responde SIEMPRE en Markdown.\n"
+        "- Primera línea: la respuesta directa en **negrita**, una o dos frases que el candidato pueda decir en voz alta tal cual.\n"
+        "- Después, solo si aporta, 2-5 viñetas cortas con los puntos clave (nada de párrafos largos).\n"
+        "- Código siempre en bloques ``` con el lenguaje (```python, ```sql), con líneas de como mucho ~80 caracteres.\n"
+        "- Tablas solo para comparaciones breves. Sin encabezados grandes: como mucho ###.\n"
+        "- Sin introducciones, sin despedidas y sin repetir la pregunta."
+    ),
+    "smart_prompt": (
+        "MODO «MÁS A FONDO»: un modelo rápido (gpt-6-luna) ya respondió a esta intervención y el candidato ha marcado esa respuesta como NO útil (pulsó «más a fondo» en mitad de la entrevista). Tu trabajo es darle una respuesta claramente mejor.\n"
+        "- Antes de escribir, diagnostica en silencio por qué falló la respuesta anterior: ¿malinterpretó la pregunta por errores de transcripción?, ¿fue superficial o genérica?, ¿le faltó código, un ejemplo concreto, datos actuales o el trade-off clave?, ¿no encajaba con lo que el candidato ya ha dicho o con el brief?\n"
+        "- Razona más a fondo que el modelo rápido. Si la pregunta depende de datos recientes, de una empresa/producto concreto o de algo verificable, usa la búsqueda web y cita la fuente en una línea al final.\n"
+        "- No repitas ni menciones la respuesta anterior: entrega directamente la versión mejorada, lista para usar.\n"
+        "- Ten en cuenta lo que el candidato ya ha dicho en voz alta (carril «Tú») para que la respuesta continúe con naturalidad y no lo contradiga.\n"
+        "- Si la intervención es ambigua, responde primero a la interpretación más probable y añade la alternativa en una sola línea.\n"
+        "- Mismo formato Markdown y mismo idioma que la pregunta."
+    ),
+    "smart_model": "gpt-6.1-sol",
+    "smart_reasoning_effort": "medium",
+    "smart_service_tier": "fast",
+    "smart_web_search": True,
+    "smart_max_tokens": 6000,
     "cf_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "cf_fast_model": "@cf/meta/llama-3.1-8b-instruct-fast",
     "web_search": "auto",         # exa si hay EXA_API_KEY/exa_api_key.txt y la pregunta lo requiere
@@ -341,7 +364,7 @@ class GptClient:
     @staticmethod
     def send_to_gpt(api_key, transcription, engine="openai", context="",
                     effort=None, max_tokens=None, brief="", on_delta=None,
-                    allow_web=False, fast=False):
+                    allow_web=False, fast=False, instructions_override=None):
         """Envía la transcripción a GPT y devuelve (ok, respuesta_o_error).
 
         engine="cloudflare" usa Workers AI: modelos nativos @cf/* por chat
@@ -381,7 +404,10 @@ class GptClient:
             client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
             model = config.get("model", DEFAULT_GPT_CONFIG["model"])
 
-        instructions = config.get("system_prompt", "Eres un asistente útil.")
+        instructions = (
+            instructions_override if instructions_override is not None
+            else config.get("system_prompt", "Eres un asistente útil.")
+        )
         if brief:
             # El brief es identidad/política (system), no contenido (input):
             # experiencia aprobada + límites explícitos contra fabricación.
@@ -394,6 +420,9 @@ class GptClient:
                 "que el brief no respalde; ante falta de evidencia, responde "
                 "en hipotético."
             )
+        format_prompt = config.get("format_prompt", "")
+        if format_prompt and instructions_override is None:
+            instructions += "\n\n" + format_prompt
 
         web_context = ""
         if allow_web and config.get("web_search") in (True, "auto", "exa"):
@@ -512,6 +541,220 @@ class GptClient:
             return False, "La API no devolvió texto"
         return True, text
 
+    @staticmethod
+    def send_smarter(api_key, question, previous, context, mine, brief,
+                     on_delta=None, on_status=None, effort=None):
+        try:
+            from openai import OpenAI, BadRequestError
+        except ImportError:
+            return False, "El paquete openai no está instalado"
+
+        config = GptClient.load_config()
+        if not config:
+            return False, "Error al cargar la configuración de GPT"
+
+        instructions = config.get("system_prompt", "Eres un asistente útil.")
+        if brief:
+            instructions += (
+                "\n\nContexto de la entrevista — experiencia APROBADA del "
+                "candidato y límites; úsala para adaptar cada respuesta:\n"
+                + brief +
+                "\nNunca conviertas requisitos del puesto ni notas de empresa "
+                "en experiencia del candidato ni inventes métricas o historias "
+                "que el brief no respalde; ante falta de evidencia, responde "
+                "en hipotético."
+            )
+        for key in ("format_prompt", "smart_prompt"):
+            if config.get(key):
+                instructions += "\n\n" + config[key]
+
+        previous_blocks = "\n\n".join(
+            f"Respuesta anterior de {model} (marcada como NO útil por el candidato):\n"
+            f"<<<\n{text}\n>>>"
+            for model, text in previous
+        )
+        user_input = (
+            "Transcript completo de la llamada (Entrevistador = voces de la llamada, "
+            "Tú = el candidato; puede tener errores de transcripción):\n"
+            f"{context}\n\n"
+            "Intervención del entrevistador a la que hay que responder:\n"
+            f"{question}\n\n"
+            "Lo que el candidato (Tú) ha dicho desde esa intervención:\n"
+            f"{mine or '(nada todavía)'}\n\n"
+            f"{previous_blocks}"
+        )
+        kwargs = {
+            "model": config.get("smart_model", "gpt-6.1-sol"),
+            "instructions": instructions,
+            "input": user_input,
+            "reasoning": {
+                "effort": effort or config.get("smart_reasoning_effort", "medium")
+            },
+            "max_output_tokens": config.get("smart_max_tokens", 6000),
+        }
+        service_tier = config.get("smart_service_tier", "auto")
+        if service_tier and service_tier != "auto":
+            kwargs["service_tier"] = service_tier
+        if config.get("smart_web_search", True):
+            kwargs["tools"] = [{"type": "web_search"}]
+
+        client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
+
+        def stream_response(request_kwargs):
+            parts = []
+            stream = client.responses.create(**request_kwargs, stream=True)
+            for event in stream:
+                event_type = getattr(event, "type", "")
+                if event_type == "response.output_text.delta":
+                    delta = getattr(event, "delta", "")
+                    if delta:
+                        parts.append(delta)
+                        if on_delta:
+                            on_delta("".join(parts))
+                elif event_type in (
+                        "response.web_search_call.in_progress",
+                        "response.web_search_call.searching"):
+                    if on_status:
+                        on_status("buscando en la web…")
+                elif event_type == "response.web_search_call.completed":
+                    if on_status:
+                        on_status("leyendo resultados…")
+                elif event_type in ("response.completed", "response.done"):
+                    break
+                elif event_type == "response.error":
+                    raise RuntimeError(getattr(event, "error", event))
+            return "".join(parts)
+
+        def retry_without_unsupported(request_kwargs):
+            request_kwargs.pop("service_tier", None)
+            request_kwargs.pop("reasoning", None)
+            if on_delta:
+                text = stream_response(request_kwargs)
+                return (True, text) if text else (
+                    False, "La API no devolvió texto")
+            response = client.responses.create(**request_kwargs)
+            text = getattr(response, "output_text", None)
+            return (True, text) if text else (False, "La API no devolvió texto")
+
+        if on_delta:
+            try:
+                text = stream_response(kwargs)
+                if text:
+                    return True, text
+            except BadRequestError as error:
+                message = str(error).lower()
+                if "tools" in kwargs and any(
+                        term in message for term in
+                        ("web_search", "tools", "unsupported")):
+                    kwargs.pop("tools", None)
+                    web_context = exa_search(question)
+                    if web_context:
+                        kwargs["input"] += (
+                            "\n\nContexto web reciente (úsalo solo si es relevante; "
+                            "cita la URL brevemente al final):\n" + web_context)
+                        if on_status:
+                            on_status("web vía Exa…")
+                    try:
+                        text = stream_response(kwargs)
+                        if text:
+                            return True, text
+                    except BadRequestError as retry_error:
+                        message = str(retry_error).lower()
+                        if not any(term in message for term in
+                                   ("unsupported", "unknown", "invalid")):
+                            return False, (
+                                f"Error al comunicarse con GPT: {retry_error}")
+                        try:
+                            return retry_without_unsupported(kwargs)
+                        except Exception as final_error:
+                            return False, (
+                                f"Error al comunicarse con GPT: {final_error}")
+                    except Exception as retry_error:
+                        return False, (
+                            f"Error al comunicarse con GPT: {retry_error}")
+                elif any(term in message for term in
+                         ("unsupported", "unknown", "invalid")):
+                    try:
+                        return retry_without_unsupported(kwargs)
+                    except Exception as retry_error:
+                        return False, (
+                            f"Error al comunicarse con GPT: {retry_error}")
+                else:
+                    return False, f"Error al comunicarse con GPT: {error}"
+            except Exception as error:
+                return False, f"Error al comunicarse con GPT: {error}"
+
+        try:
+            response = client.responses.create(**kwargs)
+        except BadRequestError as error:
+            message = str(error).lower()
+            if "tools" in kwargs and any(
+                    term in message for term in
+                    ("web_search", "tools", "unsupported")):
+                kwargs.pop("tools", None)
+                web_context = exa_search(question)
+                if web_context:
+                    kwargs["input"] += (
+                        "\n\nContexto web reciente (úsalo solo si es relevante; "
+                        "cita la URL brevemente al final):\n" + web_context)
+                    if on_status:
+                        on_status("web vía Exa…")
+            if any(term in message for term in
+                   ("unsupported", "unknown", "invalid")):
+                kwargs.pop("service_tier", None)
+                kwargs.pop("reasoning", None)
+            try:
+                response = client.responses.create(**kwargs)
+            except Exception as retry_error:
+                return False, f"Error al comunicarse con GPT: {retry_error}"
+        except Exception as error:
+            return False, f"Error al comunicarse con GPT: {error}"
+        text = getattr(response, "output_text", None)
+        return (True, text) if text else (False, "La API no devolvió texto")
+
+    @staticmethod
+    def send_smarter_cloudflare(question, previous, context, mine, brief,
+                                on_delta=None):
+        config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+        instructions = config.get("system_prompt", "Eres un asistente útil.")
+        if brief:
+            instructions += (
+                "\n\nContexto de la entrevista — experiencia APROBADA del "
+                "candidato y límites; úsala para adaptar cada respuesta:\n"
+                + brief +
+                "\nNunca conviertas requisitos del puesto ni notas de empresa "
+                "en experiencia del candidato ni inventes métricas o historias "
+                "que el brief no respalde; ante falta de evidencia, responde "
+                "en hipotético."
+            )
+        for key in ("format_prompt", "smart_prompt"):
+            if config.get(key):
+                instructions += "\n\n" + config[key]
+        previous_blocks = "\n\n".join(
+            f"Respuesta anterior de {model} (marcada como NO útil por el candidato):\n"
+            f"<<<\n{text}\n>>>"
+            for model, text in previous
+        )
+        user_input = (
+            "Transcript completo de la llamada (Entrevistador = voces de la llamada, "
+            "Tú = el candidato; puede tener errores de transcripción):\n"
+            f"{context}\n\n"
+            "Intervención del entrevistador a la que hay que responder:\n"
+            f"{question}\n\n"
+            "Lo que el candidato (Tú) ha dicho desde esa intervención:\n"
+            f"{mine or '(nada todavía)'}\n\n"
+            f"{previous_blocks}"
+        )
+        if config.get("smart_web_search", True):
+            web_context = exa_search(question)
+            if web_context:
+                user_input += (
+                    "\n\nContexto web reciente (úsalo solo si es relevante; "
+                    "cita la URL brevemente al final):\n" + web_context)
+        return GptClient.send_to_gpt(
+            None, user_input, engine="cloudflare", allow_web=False,
+            instructions_override=instructions, on_delta=on_delta)
+
 
 class GptQueryThread(QThread):
     """Hilo para enviar consultas a GPT sin bloquear la interfaz."""
@@ -543,6 +786,36 @@ class GptQueryThread(QThread):
         self.query_complete.emit(success, result)
 
 
+class SmartQueryThread(QThread):
+    query_delta = Signal(str)
+    query_status = Signal(str)
+    query_complete = Signal(bool, str)
+
+    def __init__(self, api_key, question, previous, context, mine, brief,
+                 effort=None, engine="openai"):
+        super().__init__()
+        self.api_key = api_key
+        self.question = question
+        self.previous = previous
+        self.context = context
+        self.mine = mine
+        self.brief = brief
+        self.effort = effort
+        self.engine = engine
+
+    def run(self):
+        if self.engine == "cloudflare":
+            success, result = GptClient.send_smarter_cloudflare(
+                self.question, self.previous, self.context, self.mine,
+                self.brief, on_delta=self.query_delta.emit)
+        else:
+            success, result = GptClient.send_smarter(
+                self.api_key, self.question, self.previous, self.context,
+                self.mine, self.brief, on_delta=self.query_delta.emit,
+                on_status=self.query_status.emit, effort=self.effort)
+        self.query_complete.emit(success, result)
+
+
 # El modelo con más margen de uso en los planes ChatGPT (Plus: ~350-3000
 # mensajes locales / 5 h, mucho más que Sol o Astra). gpt-5.4-mini también está
 # disponible en Codex al ~30 % de cuota si se prefiere.
@@ -564,12 +837,14 @@ class CodexCliThread(QThread):
     query_complete = Signal(bool, str)
 
     def __init__(self, transcription, model=CODEX_MODEL, context="",
-                 brief=""):
+                 brief="", full_prompt=None, search=False):
         super().__init__()
         self.transcription = transcription
         self.model = model
         self.context = context
         self.brief = brief
+        self.full_prompt = full_prompt
+        self.search = search
 
     def run(self):
         exe = shutil.which("codex")
@@ -582,35 +857,49 @@ class CodexCliThread(QThread):
             )
             return
 
-        config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
-        prompt = config.get("system_prompt", "Eres un asistente útil.")
-        if self.brief:
-            prompt += (
-                "\n\nContexto de la entrevista — experiencia APROBADA del "
-                "candidato y límites; úsala para adaptar cada respuesta:\n"
-                + self.brief +
-                "\nNunca conviertas requisitos del puesto ni notas de empresa "
-                "en experiencia del candidato ni inventes métricas o historias "
-                "que el brief no respalde; ante falta de evidencia, responde "
-                "en hipotético."
-            )
-        if self.context:
-            prompt += f"\n\nContexto de la conversación:\n{self.context}"
-        prompt += "\n\nTranscription: " + self.transcription
+        if self.full_prompt is not None:
+            prompt = self.full_prompt
+        else:
+            config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+            prompt = config.get("system_prompt", "Eres un asistente útil.")
+            if self.brief:
+                prompt += (
+                    "\n\nContexto de la entrevista — experiencia APROBADA del "
+                    "candidato y límites; úsala para adaptar cada respuesta:\n"
+                    + self.brief +
+                    "\nNunca conviertas requisitos del puesto ni notas de empresa "
+                    "en experiencia del candidato ni inventes métricas o historias "
+                    "que el brief no respalde; ante falta de evidencia, responde "
+                    "en hipotético."
+                )
+            if config.get("format_prompt"):
+                prompt += "\n\n" + config["format_prompt"]
+            if self.context:
+                prompt += f"\n\nContexto de la conversación:\n{self.context}"
+            prompt += "\n\nTranscription: " + self.transcription
 
         out_path = None
         try:
             with tempfile.NamedTemporaryFile(
                     suffix=".txt", delete=False) as tf:
                 out_path = tf.name
+            args = [
+                "exec", "--skip-git-repo-check",
+                "--sandbox", "read-only",
+                "--output-last-message", out_path,
+                "-m", self.model, prompt,
+            ]
             proc = subprocess.run(
-                [exe, "exec", "--skip-git-repo-check",
-                 "--sandbox", "read-only",            # nunca edita archivos
-                 "--output-last-message", out_path,   # solo la respuesta final
-                 "-m", self.model, prompt],
+                [exe] + (["--search"] if self.search else []) + args,
                 capture_output=True, text=True, timeout=300,
-                encoding="utf-8", errors="replace",
-            )
+                encoding="utf-8", errors="replace")
+            error_text = (proc.stderr or "").lower()
+            if (self.search and proc.returncode != 0
+                    and ("unexpected argument" in error_text
+                         or "unrecognized" in error_text)):
+                proc = subprocess.run(
+                    [exe] + args, capture_output=True, text=True,
+                    timeout=300, encoding="utf-8", errors="replace")
         except Exception as e:
             self.query_complete.emit(False, f"Codex CLI: {e}")
             return

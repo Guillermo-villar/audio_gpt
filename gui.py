@@ -27,13 +27,16 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QSpinBox, QTextEdit, QLineEdit, QComboBox,
     QProgressBar, QFileDialog, QMessageBox, QGroupBox, QStatusBar,
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
-    QPlainTextEdit,
+    QPlainTextEdit, QScrollArea, QTextBrowser,
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, Slot, QMutex, QTimer, QRect,
     QPropertyAnimation, QEasingCurve,
 )
-from PySide6.QtGui import QPainter, QColor, QPen, QFont, QTextCursor, QPalette
+from PySide6.QtGui import (
+    QPainter, QColor, QPen, QFont, QTextCursor, QPalette, QTextDocument,
+    QTextFormat, QTextCharFormat, QFontMetrics,
+)
 
 import numpy as np
 import sounddevice as sd
@@ -44,7 +47,8 @@ import transcriber
 import vad
 from api_client import (
     ApiKeyManager, TranscriptionThread, WhisperService, GptClient,
-    GptQueryThread, CodexCliThread, looks_like_question, clef_question,
+    GptQueryThread, SmartQueryThread, CodexCliThread, looks_like_question,
+    clef_question, CODEX_MODEL, DEFAULT_GPT_CONFIG,
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,13 +57,14 @@ TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
 
 # Hotkeys globales de 2 teclas, vía WH_KEYBOARD_LL (eventos reales de
 # tecla, sin admin ni deps). Elegidas porque NO hacen nada en
-# Chrome/Edge/Firefox ni ES-keyboards:
-# Ctrl+Q responder · Ctrl+M auto-GPT · Ctrl+I panel (único control de
-# visibilidad) · Alt+G enviar a GPT · Alt+T start/stop.
+# Chrome/Edge/Firefox ni ES-keyboards; las teclas disparadas se consumen.
+# Ctrl+Q responder · Alt+S más a fondo · Ctrl+M auto-GPT · Ctrl+I panel
+# (único control de visibilidad) · Alt+G enviar a GPT · Alt+T start/stop.
 # (Ojo: nunca Ctrl+Alt — AltGr en teclado ES = Ctrl+Alt y escribir «@»
 # dispararía el hotkey.)
 HOTKEYS = {
     "ctrl+q": (0x11, 0x51, "answer_last", "Ctrl+Q · responder última"),
+    "alt+s": (0x12, 0x53, "smarter", "Alt+S · más a fondo"),
     "ctrl+m": (0x11, 0x4D, "toggle_auto", "Ctrl+M · auto-GPT"),
     "ctrl+i": (0x11, 0x49, "toggle_compact", "Ctrl+I · panel"),
     "alt+g": (0x12, 0x47, "send_gpt", "Alt+G · enviar a GPT"),
@@ -76,7 +81,7 @@ _OVERLAY_OPACITY_STEP = 0.05
 
 _SPEAKER_TAG_RE = re.compile(r"&lt;S(\d+)&gt;")
 _SPEAKER_COLORS = (
-    "#1a56db", "#7a3db8", "#a35c00", "#007a5e", "#a82f5b", "#4c6f91",
+    "#8ab4f8", "#c58af9", "#fdd663", "#81c995", "#f28b82", "#a8c7fa",
 )
 
 
@@ -98,6 +103,16 @@ def _mod_state_ok(mod_vk):
     ctrl = bool(u32.GetAsyncKeyState(0x11) & 0x8000)
     alt = bool(u32.GetAsyncKeyState(0x12) & 0x8000)
     return (ctrl and not alt) if mod_vk == 0x11 else (alt and not ctrl)
+
+
+def _apply_capture_exclusion(window, enabled):
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.user32.SetWindowDisplayAffinity(
+            int(window.winId()), 0x11 if enabled else 0x0)
+    except Exception:
+        pass
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -126,23 +141,41 @@ def _install_ll_hook(dispatch):
     u32 = ctypes.windll.user32
     WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
     WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
-    _fired = set()            # combos ya disparados en esta pulsación
+    _fired = set()
 
     def proc(ncode, wparam, lparam):
         try:
             if ncode == 0:
                 if wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                    vk = lparam.contents.vkCode
+                    event = lparam.contents
+                    if event.flags & 0x10:
+                        return u32.CallNextHookEx(None, ncode, wparam, lparam)
+                    vk = event.vkCode
+                    swallow = False
                     for combo, (mod, key, _, _) in HOTKEYS.items():
-                        if (vk == key and combo not in _fired
-                                and _mod_state_ok(mod)):
-                            _fired.add(combo)
-                            dispatch(combo)
+                        if vk == key and _mod_state_ok(mod):
+                            swallow = True
+                            if combo not in _fired:
+                                _fired.add(combo)
+                                dispatch(combo)
+                                if mod == 0x12:
+                                    u32.keybd_event(0xE8, 0, 0, 0)
+                                    u32.keybd_event(0xE8, 0, 0x0002, 0)
+                    if swallow:
+                        return 1
                 elif wparam in (WM_KEYUP, WM_SYSKEYUP):
-                    vk = lparam.contents.vkCode
+                    event = lparam.contents
+                    if event.flags & 0x10:
+                        return u32.CallNextHookEx(None, ncode, wparam, lparam)
+                    vk = event.vkCode
+                    swallow = False
                     for combo, (_, key, _, _) in HOTKEYS.items():
                         if vk == key:
-                            _fired.discard(combo)
+                            if combo in _fired:
+                                swallow = True
+                                _fired.discard(combo)
+                    if swallow:
+                        return 1
         except Exception:
             pass
         return u32.CallNextHookEx(None, ncode, wparam, lparam)
@@ -158,67 +191,369 @@ def _install_ll_hook(dispatch):
 # Overlay compacto — ventana anclable encima de todo durante la llamada
 # ---------------------------------------------------------------------------
 
-class CompactOverlay(QWidget):
-    """Mini-panel always-on-top (se muestra/oculta SOLO con Ctrl+I).
 
-    Estado, lo que se oye en vivo y la conversación completa con las
-    respuestas — el visor hace autoscroll y siempre deja lo reciente a
-    la vista. Ctrl+flechas lo mueve por la pantalla, Ctrl+± ajusta la
-    opacidad y la altura crece suave según llega texto de GPT.
-    """
+def render_markdown(doc, text):
+    doc.setDefaultFont(QFont("Segoe UI", 10))
+    doc.setDefaultStyleSheet(
+        "body { color: #d4d6d9; font-size: 13px; }"
+        "a { color: #8ab4f8; }"
+        "table { border-collapse: collapse; }"
+        "th, td { border: 1px solid #3a3d42; padding: 3px 6px; }"
+    )
+    features = (
+        QTextDocument.MarkdownFeature.MarkdownDialectGitHub
+        | QTextDocument.MarkdownFeature.MarkdownNoHTML
+    )
+    doc.setMarkdown(text or "", features)
+    code_fence = getattr(QTextFormat.Property, "BlockCodeFence", None)
+    code_language = getattr(QTextFormat.Property, "BlockCodeLanguage", None)
+    block = doc.begin()
+    while block.isValid():
+        block_format = block.blockFormat()
+        block_char_format = block.charFormat()
+        fenced = bool(block_char_format.fontFixedPitch())
+        if code_fence is not None:
+            fenced = fenced or bool(block_format.property(code_fence))
+        if code_language is not None:
+            fenced = fenced or bool(block_format.property(code_language))
+        cursor = QTextCursor(block)
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        if fenced:
+            block_format.setBackground(QColor("#15171a"))
+            block_format.setLeftMargin(8)
+            block_format.setRightMargin(8)
+            cursor.setBlockFormat(block_format)
+            fmt = QTextCharFormat()
+            fmt.setFontFamily("Consolas")
+            fmt.setFontFixedPitch(True)
+            fmt.setForeground(QColor("#d6d6d6"))
+            fmt.setBackground(QColor("#15171a"))
+            cursor.mergeCharFormat(fmt)
+        else:
+            fragments = []
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    fragments.append((
+                        fragment.position(), fragment.length(),
+                        fragment.charFormat()))
+                iterator += 1
+            for position, length, char_format in fragments:
+                fmt = QTextCharFormat()
+                if char_format.isAnchor():
+                    fmt.setForeground(QColor("#8ab4f8"))
+                if char_format.fontFixedPitch():
+                    fmt.setBackground(QColor("#2a2d33"))
+                    fmt.setForeground(QColor("#d6d6d6"))
+                if fmt.hasProperty(QTextFormat.Property.ForegroundBrush) or \
+                        fmt.hasProperty(QTextFormat.Property.BackgroundBrush):
+                    fragment_cursor = QTextCursor(doc)
+                    fragment_cursor.setPosition(position)
+                    fragment_cursor.setPosition(
+                        position + length,
+                        QTextCursor.MoveMode.KeepAnchor)
+                    fragment_cursor.mergeCharFormat(fmt)
+        block = block.next()
+
+
+class AnswerCard(QFrame):
+    def __init__(self, kind, model_label, question, parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.model_label = model_label
+        self.question = question or "(transcript completo)"
+        self.text = ""
+        self.done = False
+        self.ok = True
+        self.started_at = time.monotonic()
+        self._status_message = ""
+        self._last_render = 0.0
+        self._pending_text = None
+        self._sol = "sol" in model_label.lower()
+        self.setObjectName("AnswerCard")
+        self.setStyleSheet(
+            "QFrame#AnswerCard { background: #202226; border: 1px solid #303238;"
+            f" border-left: 3px solid {'#b08cff' if self._sol else '#ffd166'};"
+            " border-radius: 7px; }"
+            "QLabel { background: transparent; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(9, 7, 9, 7)
+        layout.setSpacing(3)
+        header = QHBoxLayout()
+        self.header_label = QLabel()
+        self.header_label.setStyleSheet(
+            "color: #d4d6d9; font-weight: 600; font-size: 11px;")
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            "color: #9aa0a6; font-size: 10px;")
+        header.addWidget(self.header_label, 1)
+        header.addWidget(self.status_label)
+        layout.addLayout(header)
+        short_question = self.question.strip()
+        if len(short_question) > 140:
+            short_question = short_question[:137].rstrip() + "…"
+        self.question_label = QLabel(f"«…» {short_question}")
+        self.question_label.setWordWrap(False)
+        self.question_label.setStyleSheet(
+            "color: #9aa0a6; font-style: italic; font-size: 10px;")
+        layout.addWidget(self.question_label)
+        self.body = QTextBrowser()
+        self.body.setReadOnly(True)
+        self.body.setOpenExternalLinks(False)
+        self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.body.setFrameShape(QFrame.NoFrame)
+        self.body.setStyleSheet("QTextBrowser { background: transparent; border: none; }")
+        self.body.document().setDocumentMargin(0)
+        layout.addWidget(self.body)
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._refresh_elapsed)
+        self._elapsed_timer.start(100)
+        self._refresh_elapsed()
+
+    def _refresh_elapsed(self):
+        elapsed = time.monotonic() - self.started_at
+        suffix = f"{elapsed:.1f}s"
+        if self.done:
+            self.status_label.setText(suffix)
+        elif self._status_message:
+            self.status_label.setText(self._status_message)
+        else:
+            self.status_label.setText(f"pensando… {suffix}")
+        self.header_label.setText(f"{self.kind} · {self.model_label}")
+
+    def set_status(self, text):
+        self._status_message = text
+        self._refresh_elapsed()
+
+    def set_stream_text(self, text, final=False, ok=True):
+        self.text = text or ""
+        self.ok = ok
+        if not final:
+            now = time.monotonic()
+            remaining = 0.05 - (now - self._last_render)
+            if remaining > 0:
+                self._pending_text = self.text
+                if not hasattr(self, "_render_timer"):
+                    self._render_timer = QTimer(self)
+                    self._render_timer.setSingleShot(True)
+                    self._render_timer.timeout.connect(self._render_pending)
+                if not self._render_timer.isActive():
+                    self._render_timer.start(max(1, int(remaining * 1000) + 1))
+                self._status_message = ""
+                self._refresh_elapsed()
+                return
+        if hasattr(self, "_render_timer"):
+            self._render_timer.stop()
+        self._pending_text = None
+        self._render_text(self.text)
+        if final:
+            self.done = True
+            self._elapsed_timer.stop()
+            self._status_message = ""
+            self._refresh_elapsed()
+
+    def _render_pending(self):
+        if self._pending_text is not None:
+            self._render_text(self._pending_text)
+            self._pending_text = None
+
+    def _render_text(self, text):
+        render_markdown(self.body.document(), text)
+        if not self.ok:
+            self.body.document().setDefaultStyleSheet(
+                "body { color: #e57373; font-size: 13px; }")
+        self._last_render = time.monotonic()
+        self._resize_body()
+
+    def _resize_body(self):
+        width = max(40, self.body.viewport().width())
+        self.body.document().setTextWidth(width)
+        height = int(self.body.document().size().height()) + 6
+        self.body.setFixedHeight(max(24, height))
+        self.updateGeometry()
+
+    def has_code_block(self):
+        return bool(re.search(r"```[^\n]*\n", self.text))
+
+    def longest_code_line(self):
+        blocks = re.findall(r"```[^\n]*\n(.*?)(?:```|$)", self.text, re.S)
+        return max(
+            (len(line) for block in blocks for line in block.splitlines()),
+            default=0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_body()
+
+
+class AnswerFeed(QScrollArea):
+    content_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { background: #202226; width: 8px; }"
+            "QScrollBar::handle:vertical { background: #4a4d53; border-radius: 4px; }"
+        )
+        self.container = QWidget()
+        self.container.setStyleSheet("background: transparent;")
+        self.layout = QVBoxLayout(self.container)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(7)
+        self.layout.addStretch(1)
+        self.setWidget(self.container)
+        self._cards = []
+        self._by_key = {}
+        self._anchor = None
+        self._setting_scroll = False
+        self.verticalScrollBar().actionTriggered.connect(
+            self._release_anchor)
+        self.verticalScrollBar().sliderPressed.connect(
+            self._release_anchor)
+
+    def start(self, key, kind, model_label, question):
+        card = AnswerCard(kind, model_label, question, self.container)
+        self._cards.append((key, card))
+        self._by_key[key] = card
+        self.layout.insertWidget(self.layout.count() - 1, card)
+        while len(self._cards) > 40:
+            old_key, old_card = self._cards.pop(0)
+            self._by_key.pop(old_key, None)
+            old_card.setParent(None)
+            old_card.deleteLater()
+        self._anchor = card
+        QTimer.singleShot(0, self._apply_anchor)
+        self.content_changed.emit()
+        return card
+
+    def update(self, key, text):
+        card = self._by_key.get(key)
+        if card:
+            card.set_stream_text(text)
+            self.content_changed.emit()
+            QTimer.singleShot(0, self._apply_anchor)
+
+    def status(self, key, text):
+        card = self._by_key.get(key)
+        if card:
+            card.set_status(text)
+
+    def finish(self, key, ok, text):
+        card = self._by_key.get(key)
+        if card:
+            card.set_stream_text(text, final=True, ok=ok)
+            self.content_changed.emit()
+            QTimer.singleShot(0, self._apply_anchor)
+
+    def clear(self):
+        for _, card in self._cards:
+            card.setParent(None)
+            card.deleteLater()
+        self._cards.clear()
+        self._by_key.clear()
+        self._anchor = None
+        self.content_changed.emit()
+
+    def content_height(self):
+        return self.container.sizeHint().height()
+
+    def _release_anchor(self, *_):
+        if not self._setting_scroll:
+            self._anchor = None
+
+    def _apply_anchor(self):
+        if self._anchor is None:
+            return
+        top = self._anchor.mapTo(self.container, self._anchor.rect().topLeft()).y()
+        bar = self.verticalScrollBar()
+        target = max(0, min(top, bar.maximum()))
+        self._setting_scroll = True
+        bar.setValue(target)
+        self._setting_scroll = False
+
+    def wheelEvent(self, event):
+        self._anchor = None
+        super().wheelEvent(event)
+
+    def has_code_block(self):
+        return any(card.has_code_block() for _, card in self._cards[-3:])
+
+    def longest_code_line(self):
+        return max((card.longest_code_line()
+                    for _, card in self._cards[-3:]), default=0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._apply_anchor)
+
+
+class CompactOverlay(QWidget):
+    """Panel compacto de respuestas que solo se muestra con Ctrl+I."""
 
     WIDTH = 460
     MIN_H = 200
-    MAX_H = 560
     MIN_OPACITY = 0.30
-    LOG_MAX_BLOCKS = 320          # recorte del historial interno del panel
 
     def __init__(self):
         super().__init__(
             None,
-            Qt.Window | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint,
+            Qt.Tool | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint
+            | Qt.WindowDoesNotAcceptFocus,
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.resize(self.WIDTH, 240)
         self._drag_pos = None
         self._listening = False
         self._opacity = 0.96
         self.setWindowOpacity(self._opacity)
-        self._gpt_anchors = {}     # thread -> {"start","end","header"}
+        self._hide_from_capture = True
+        self._live_lines = {"Entrevistador": [], "Tú": []}
+        self._live_partial = {}
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 8, 10, 8)
+        root.setContentsMargins(8, 8, 8, 8)
         panel = QFrame()
+        panel.setObjectName("OverlayPanel")
         panel.setStyleSheet(
-            "QFrame { background: rgba(18,18,22,235); border-radius: 10px; }"
-            "QLabel { color: #e8e8e8; }"
-            "QTextEdit { background: rgba(255,255,255,18); color: #f2f2f2;"
-            "            border: none; border-radius: 6px; }"
+            "QFrame#OverlayPanel { background: rgba(24,26,29,238);"
+            " border-radius: 10px; }"
+            "QLabel { color: #d4d6d9; }"
         )
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(10, 8, 10, 8)
-        panel_layout.setSpacing(4)
+        panel_layout.setSpacing(6)
 
         self.status_label = QLabel("● en espera")
-        self.status_label.setStyleSheet("color: #9a9a9a; font-size: 11px;")
+        self.status_label.setStyleSheet("color: #9aa0a6; font-size: 11px;")
         panel_layout.addWidget(self.status_label)
 
-        self.live_label = QLabel("")
-        self.live_label.setWordWrap(True)
-        self.live_label.setStyleSheet("color: #9ecbff; font-size: 12px;")
-        self.live_label.setMaximumHeight(34)
-        panel_layout.addWidget(self.live_label)
+        self.interviewer_live = QLabel("")
+        self.interviewer_live.setStyleSheet("color: #8ab4f8; font-size: 11px;")
+        self.interviewer_live.setMaximumHeight(34)
+        self.you_live = QLabel("")
+        self.you_live.setStyleSheet("color: #81c995; font-size: 11px;")
+        self.you_live.setMaximumHeight(34)
+        panel_layout.addWidget(self.interviewer_live)
+        panel_layout.addWidget(self.you_live)
 
-        self.convo_box = QTextEdit()
-        self.convo_box.setReadOnly(True)
-        self.convo_box.setPlaceholderText("conversación y respuestas…")
-        panel_layout.addWidget(self.convo_box, 1)
+        self.feed = AnswerFeed(panel)
+        panel_layout.addWidget(self.feed, 1)
+        self.feed.content_changed.connect(self._schedule_resize)
 
         legend = QLabel(
-            "Ctrl+Q responder · Alt+G enviar · Ctrl+M auto · Alt+T start/stop "
-            "· Ctrl+←↑→↓ mover · Ctrl+± opacidad · Ctrl+I ocultar")
+            "Ctrl+Q responder · Alt+S más a fondo · Alt+G enviar · Ctrl+M auto "
+            "· Alt+T start/stop · Ctrl+←↑→↓ mover · Ctrl+± opacidad "
+            "· Ctrl+I ocultar")
         legend.setWordWrap(True)
-        legend.setStyleSheet("color: #777; font-size: 10px;")
+        legend.setStyleSheet("color: #9aa0a6; font-size: 10px;")
         panel_layout.addWidget(legend)
 
         root.addWidget(panel)
@@ -229,11 +564,12 @@ class CompactOverlay(QWidget):
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._resize_to_content)
+        self._resize_animation = None
 
     # ------------------------- estado / ACKs -------------------------
 
     def _restore_status(self):
-        color = "#5ee07a" if self._listening else "#9a9a9a"
+        color = "#81c995" if self._listening else "#9aa0a6"
         text = "● escuchando" if self._listening else "● en espera"
         self.status_label.setText(text)
         self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
@@ -247,113 +583,78 @@ class CompactOverlay(QWidget):
         """Flash de confirmación en la línea de estado (~1.4 s): cada
         comando recibido deja constancia visible de que entró."""
         self.status_label.setText(f"✓ {text}")
-        self.status_label.setStyleSheet("color: #ffd166; font-size: 11px;")
+        self.status_label.setStyleSheet("color: #fdd663; font-size: 11px;")
         self._ack_timer.start(1400)
 
-    # ------------------------- conversación --------------------------
+    def set_live(self, lane, text, final=False):
+        lane = lane if lane in self._live_lines else "Entrevistador"
+        text = (text or "").strip()
+        if final:
+            if text:
+                self._live_lines[lane].append(text)
+                self._live_lines[lane] = self._live_lines[lane][-2:]
+            self._live_partial.pop(lane, None)
+        elif text:
+            self._live_partial[lane] = text
+        else:
+            self._live_partial.pop(lane, None)
+        self._render_live(lane)
 
-    def set_live(self, text):
-        self.live_label.setText(text[-180:] if text else "")
-
-    def _scroll_bottom(self):
-        """Autoscroll: lo último siempre visible sin tocar la rueda."""
-        bar = self.convo_box.verticalScrollBar()
-        bar.setValue(bar.maximum())
-
-    def _trim_log(self):
-        doc = self.convo_box.document()
-        excess = doc.blockCount() - self.LOG_MAX_BLOCKS
-        if excess <= 0:
-            return
-        cur = QTextCursor(doc)
-        cur.movePosition(QTextCursor.MoveOperation.Start)
-        cur.movePosition(QTextCursor.MoveOperation.Down,
-                         QTextCursor.MoveMode.KeepAnchor, excess)
-        cur.removeSelectedText()
-
-    def add_line(self, tag, text, color):
-        safe = html.escape(text, quote=False).replace("\n", "<br>")
-        self.convo_box.append(
-            f'<b style="color:{color}">{html.escape(tag)}</b> '
-            f'<span style="color:#f2f2f2">{safe}</span>')
-        self._trim_log()
-        self._scroll_bottom()
-        self._schedule_resize()
-
-    def add_transcript(self, lane, text):
-        color = "#7ee2a8" if lane == "Tú" else "#9ecbff"
-        self.add_line(f"{lane}:", text, color)
-
-    def add_note(self, text):
-        self.convo_box.append(
-            f'<span style="color:#888;font-style:italic">'
-            f'{html.escape(text, quote=False)}</span>')
-        self._scroll_bottom()
-
-    def gpt_update(self, thread, text, header=None):
-        """Bloque GPT editable en el log: el streaming reescribe el mismo
-        bloque (no acumula líneas) y el panel crece con él."""
-        cur = self.convo_box.textCursor()
-        entry = self._gpt_anchors.get(thread)
-        if entry is None:
-            cur.movePosition(QTextCursor.MoveOperation.End)
-            if self.convo_box.document().characterCount() > 1:
-                cur.insertText("\n\n")
-            entry = {"start": cur.position(), "end": cur.position(),
-                     "header": header or "▸ GPT"}
-            self._gpt_anchors[thread] = entry
-        if header:
-            entry["header"] = header
-        cur.setPosition(entry["start"])
-        cur.setPosition(entry["end"], QTextCursor.MoveMode.KeepAnchor)
-        cur.removeSelectedText()
-        body = html.escape(text, quote=False).replace("\n", "<br>")
-        cur.insertHtml(
-            f'<b style="color:#ffd166">'
-            f'{html.escape(entry["header"], quote=False)}</b><br>'
-            f'<span style="color:#f2f2f2">{body}</span>')
-        new_end = cur.position()
-        shift = new_end - entry["end"]
-        entry["end"] = new_end
-        if shift:
-            for other, e in self._gpt_anchors.items():
-                if other is not thread and e["start"] > entry["start"]:
-                    e["start"] += shift
-                    e["end"] += shift
-        self._trim_log()
-        self._scroll_bottom()
-        self._schedule_resize()
-
-    def clear_log(self):
-        self.convo_box.clear()
-        self._gpt_anchors.clear()
+    def _render_live(self, lane):
+        label = (self.you_live if lane == "Tú" else self.interviewer_live)
+        lines = self._live_lines[lane][-2:]
+        partial = self._live_partial.get(lane)
+        if partial:
+            lines = (lines + [partial])[-2:]
+        metrics = QFontMetrics(label.font())
+        max_width = max(100, self.width() - 46)
+        lane_label = "Tú: " if lane == "Tú" else "Entrevistador: "
+        text = (lane_label + "\n".join(
+            metrics.elidedText(line, Qt.TextElideMode.ElideRight, max_width)
+            for line in lines) if lines else "")
+        label.setText(text)
 
     # --------------------- tamaño / opacidad / posición ------------------
 
-    def _schedule_resize(self):
-        if not self._resize_timer.isActive():
-            self._resize_timer.start(120)
+    def _schedule_resize(self, *_):
+        self._resize_timer.start(120)
 
     def _resize_to_content(self):
-        """Altura objetivo según el contenido del visor (cap en MAX_H)."""
-        doc_h = self.convo_box.document().size().height()
-        chrome = 120           # estado + en vivo + leyenda + márgenes
-        desired_convo = min(doc_h + 16, 410)
-        target = int(max(self.MIN_H, min(chrome + desired_convo, self.MAX_H)))
-        if abs(target - self.height()) < 8:
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        max_height = int(available.height() * 0.85)
+        chrome = 164
+        target_height = int(max(
+            self.MIN_H, min(chrome + self.feed.content_height(), max_height)))
+        self.feed.setMaximumHeight(max(32, target_height - chrome))
+        longest = self.feed.longest_code_line() if self.feed.has_code_block() else 0
+        desired_width = 460
+        if longest:
+            desired_width = int(max(460, min(780, longest * 8.5 + 110)))
+        desired_width = min(desired_width, available.width())
+        x = min(max(self.x(), available.left()),
+                available.right() - desired_width + 1)
+        y = min(max(self.y(), available.top()),
+                available.bottom() - target_height + 1)
+        if (abs(target_height - self.height()) < 8
+                and abs(desired_width - self.width()) < 8
+                and (x, y) == (self.x(), self.y())):
             return
-        anim = QPropertyAnimation(self, b"geometry", self)
-        anim.setDuration(240)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.setStartValue(self.geometry())
-        anim.setEndValue(QRect(self.x(), self.y(), self.width(), target))
-        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        self._resize_animation = QPropertyAnimation(self, b"geometry", self)
+        self._resize_animation.setDuration(240)
+        self._resize_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._resize_animation.setStartValue(self.geometry())
+        self._resize_animation.setEndValue(
+            QRect(x, y, desired_width, target_height))
+        self._resize_animation.start(
+            QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
     def nudge(self, dx, dy):
         screen = self.screen().availableGeometry()
-        x = min(max(self.x() + dx, screen.left() - self.width() + 60),
-                screen.right() - 60)
-        y = min(max(self.y() + dy, screen.top()), screen.bottom() - 40)
+        x = min(max(self.x() + dx, screen.left()),
+                screen.right() - self.width() + 1)
+        y = min(max(self.y() + dy, screen.top()),
+                screen.bottom() - self.height() + 1)
         self.move(x, y)
 
     def adjust_opacity(self, delta):
@@ -372,7 +673,15 @@ class CompactOverlay(QWidget):
 
     def mouseReleaseEvent(self, e):
         self._drag_pos = None
-    # Sin doble clic: la visibilidad solo la cambia Ctrl+I.
+
+    def set_capture_exclusion(self, enabled):
+        self._hide_from_capture = enabled
+        _apply_capture_exclusion(self, enabled)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        _apply_capture_exclusion(self, self._hide_from_capture)
+        self._schedule_resize()
 
 
 class AckToast(QWidget):
@@ -387,11 +696,12 @@ class AckToast(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._hide_from_capture = True
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.label = QLabel()
         self.label.setStyleSheet(
-            "background: rgba(18,18,22,235); color: #ffd166;"
+            "background: rgba(24,26,29,238); color: #fdd663;"
             "border-radius: 12px; padding: 8px 16px; font-size: 13px;")
         layout.addWidget(self.label)
         self._timer = QTimer(self)
@@ -407,6 +717,14 @@ class AckToast(QWidget):
         self.show()
         self.raise_()
         self._timer.start(1300)
+
+    def set_capture_exclusion(self, enabled):
+        self._hide_from_capture = enabled
+        _apply_capture_exclusion(self, enabled)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        _apply_capture_exclusion(self, self._hide_from_capture)
 
 
 def _load_settings():
@@ -477,16 +795,16 @@ class AudioLevelWidget(QFrame):
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(30, 30, 30))
+        painter.fillRect(self.rect(), QColor("#25272b"))
         width = int(self.width() * self.level)
         if self.level < 0.2:
-            color = QColor(0, 180, 0)
+            color = QColor("#2e7d4f")
         elif self.level < 0.6:
-            color = QColor(180, 180, 0)
+            color = QColor("#a88732")
         else:
-            color = QColor(180, 0, 0)
+            color = QColor("#a8423a")
         painter.fillRect(0, 0, width, self.height(), color)
-        pen = QPen(QColor(100, 100, 100))
+        pen = QPen(QColor("#3a3d42"))
         painter.setPen(pen)
         for i in range(1, 10):
             x = int(self.width() * i / 10)
@@ -569,13 +887,13 @@ class AudioDeviceSetupDialog(QDialog):
         if loopback is not None:
             loop_name = capture.loopback_display_name(loopback)
             self.loop_status = QLabel(f"OK — capturando de: {loop_name}")
-            self.loop_status.setStyleSheet("color: green; font-weight: bold;")
+            self.loop_status.setStyleSheet("color: #81c995; font-weight: bold;")
         else:
             self.loop_status = QLabel(
                 "No disponible. En Windows debería aparecer automáticamente; "
                 "si no, usa VB-Cable o el micrófono."
             )
-            self.loop_status.setStyleSheet("color: red;")
+            self.loop_status.setStyleSheet("color: #e57373;")
         self.loop_status.setWordWrap(True)
         loop_layout.addWidget(self.loop_status)
         layout.addWidget(loop_group)
@@ -1013,6 +1331,7 @@ class WhisperApp(QMainWindow):
     realtime_text = Signal(str, bool, str)   # (texto, final, carril)
     realtime_error = Signal(str)
     gate_fired = Signal(str, str, str)       # (texto, carril, modo)
+    hotkey_requested = Signal(str)
 
     CAPTURE_SOURCES = [
         ("loopback", "Audio del sistema (loopback WASAPI)"),
@@ -1038,14 +1357,18 @@ class WhisperApp(QMainWindow):
         self._dying_threads = []
         self._ctx = deque()               # transcript completo «Carril: texto»
         self._draft_state = {}            # carril -> interim ya respondido
-        self._gpt_streams = {}            # thread -> bloque GPT en streaming
+        self._answers = []
         self._live_buffers = {}           # carril -> texto parcial acumulado
         self._gate_pending = set()        # carriles con gate clef en vuelo
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
+        self._hide_from_capture = self.settings.get("hide_from_capture", True)
 
         self.init_ui()
         self.overlay = CompactOverlay()
         self.toast = AckToast()
+        self.overlay.set_capture_exclusion(self._hide_from_capture)
+        self.toast.set_capture_exclusion(self._hide_from_capture)
+        self._apply_capture_setting()
         self.realtime_text.connect(self._append_transcript)
         self.realtime_error.connect(self.handle_continuous_error)
         self.gate_fired.connect(self._on_gate_fired)
@@ -1054,7 +1377,9 @@ class WhisperApp(QMainWindow):
         # Comandos por hook de teclado (eventos reales, sin falsos
         # positivos); el poll de 30 ms solo queda para los controles
         # mantenidos del panel (mover/opacidad).
-        self._ll_hook = _install_ll_hook(self._dispatch_hotkey)
+        self.hotkey_requested.connect(
+            self._dispatch_hotkey, Qt.ConnectionType.QueuedConnection)
+        self._ll_hook = _install_ll_hook(self.hotkey_requested.emit)
         self._hk_timer = QTimer(self)
         self._hk_timer.timeout.connect(self._overlay_keys_tick)
         self._hk_timer.start(30)
@@ -1065,10 +1390,11 @@ class WhisperApp(QMainWindow):
         self.setWindowTitle("audio_gpt — Transcriptor y asistente")
         self.setGeometry(100, 100, 980, 760)
         self.setStyleSheet(
-            "QTextEdit, QPlainTextEdit { background: #ffffff; color: #1a1a1a;"
-            "   border: 1px solid #c9c9c9; border-radius: 6px; }"
-            "QLineEdit, QComboBox, QSpinBox { background: #ffffff;"
-            "   color: #1a1a1a; }"
+            "QTextEdit, QPlainTextEdit { background: #25272b; color: #d4d6d9;"
+            " border: 1px solid #3a3d42; border-radius: 6px; }"
+            "QLineEdit, QComboBox, QSpinBox { background: #25272b;"
+            " color: #d4d6d9; border: 1px solid #3a3d42;"
+            " border-radius: 6px; padding: 3px; }"
         )
 
         central = QWidget()
@@ -1206,6 +1532,12 @@ class WhisperApp(QMainWindow):
         brief_layout.addWidget(self.brief_input, 1)
         tr_layout.addLayout(brief_layout)
 
+        self.hide_capture_checkbox = QCheckBox(
+            "Invisible al compartir pantalla / grabar")
+        self.hide_capture_checkbox.toggled.connect(
+            self._set_capture_exclusion)
+        tr_layout.addWidget(self.hide_capture_checkbox)
+
         top_layout.addWidget(tr_group)
         splitter.addWidget(top)
 
@@ -1229,14 +1561,14 @@ class WhisperApp(QMainWindow):
             col.addWidget(edit)
             live = QLabel("En directo: \u2014")
             live.setWordWrap(True)
-            live.setStyleSheet("color: #555; font-style: italic;")
+            live.setStyleSheet("color: #9aa0a6; font-style: italic;")
             col.addWidget(live)
             return col, edit, live
 
         col_int, self.interviewer_output, self.interviewer_live = _lane_pane(
-            "Entrevistador", "#1a56db", "Voces de la llamada…")
+            "Entrevistador", "#8ab4f8", "Voces de la llamada…")
         col_you, self.you_output, self.you_live = _lane_pane(
-            "Tú (micro)", "#0f7a3d", "Tu voz…")
+            "Tú (micro)", "#81c995", "Tu voz…")
         lanes_row.addLayout(col_int)
         lanes_row.addLayout(col_you)
         out_layout.addLayout(lanes_row)
@@ -1253,15 +1585,18 @@ class WhisperApp(QMainWindow):
         self.save_button.clicked.connect(self.save_text)
         self.clear_button.clicked.connect(self.clear_text)
         self.pin_button.clicked.connect(self.pin_selection)
-        hk_hint = QLabel("Ctrl+I panel oculto · Alt+G / Ctrl+Q enviar a GPT")
+        hk_hint = QLabel(
+            "Ctrl+I panel · Alt+G / Ctrl+Q enviar · Alt+S más a fondo")
         hk_hint.setStyleSheet("color: #888; font-size: 11px;")
         self.send_to_gpt_button = QPushButton("Enviar a GPT")
         self.send_to_gpt_button.setStyleSheet(
-            "QPushButton { background-color: #6a0dad; color: white; }"
-            "QPushButton:hover { background-color: #8a2be2; }"
+            "QPushButton { background-color: #5b4a8a; color: #d4d6d9; }"
+            "QPushButton:hover { background-color: #6d5b9e; }"
         )
         self.send_to_gpt_button.setMinimumHeight(30)
         self.send_to_gpt_button.clicked.connect(self.send_to_gpt)
+        self.smarter_button = QPushButton("Más a fondo")
+        self.smarter_button.clicked.connect(self._hk_smarter)
         text_buttons.addWidget(self.copy_button)
         text_buttons.addWidget(self.save_button)
         text_buttons.addWidget(self.clear_button)
@@ -1280,15 +1615,16 @@ class WhisperApp(QMainWindow):
         )
         text_buttons.addWidget(self.gpt_engine_combo)
         text_buttons.addWidget(self.send_to_gpt_button)
+        text_buttons.addWidget(self.smarter_button)
         out_layout.addLayout(text_buttons)
         bottom_layout.addWidget(out_group)
 
         gpt_group = QGroupBox("Respuestas GPT")
         gpt_layout = QVBoxLayout(gpt_group)
-        self.gpt_output = QTextEdit()
-        self.gpt_output.setReadOnly(True)
-        self.gpt_output.setPlaceholderText("Respuestas automáticas de GPT…")
+        self.gpt_output = AnswerFeed()
+        self.gpt_output.setMinimumHeight(120)
         gpt_layout.addWidget(self.gpt_output)
+        gpt_group.setMinimumHeight(150)
         bottom_layout.addWidget(gpt_group)
 
         splitter.addWidget(bottom)
@@ -1311,10 +1647,11 @@ class WhisperApp(QMainWindow):
 
     def _style_continuous_button(self, start):
         color, hover, pressed = (
-            ("#4CAF50", "#45a049", "#398438") if start else ("#f44336", "#e53935", "#c62828")
+            ("#2e7d4f", "#388e5b", "#276b43") if start
+            else ("#a8423a", "#bb5047", "#963a33")
         )
         self.continuous_button.setStyleSheet(
-            f"QPushButton {{ background-color: {color}; color: white; border-radius: 8px; }}"
+            f"QPushButton {{ background-color: {color}; color: #d4d6d9; border-radius: 8px; }}"
             f"QPushButton:hover {{ background-color: {hover}; }}"
             f"QPushButton:pressed {{ background-color: {pressed}; }}"
         )
@@ -1351,6 +1688,10 @@ class WhisperApp(QMainWindow):
         self.brief_input.setPlainText(s.get("interview_brief", ""))
         # Por defecto envío a GPT SOLO manual: el usuario decide cuándo.
         self.manual_gpt_checkbox.setChecked(s.get("manual_gpt_only", True))
+        self.hide_capture_checkbox.setChecked(
+            s.get("hide_from_capture", True))
+        self._hide_from_capture = self.hide_capture_checkbox.isChecked()
+        self._apply_capture_setting()
 
     def _persist_settings(self):
         _save_settings({
@@ -1363,7 +1704,21 @@ class WhisperApp(QMainWindow):
             "dg_diarize": self.diarize_checkbox.isChecked(),
             "interview_brief": self.brief_input.toPlainText().strip(),
             "manual_gpt_only": self.manual_gpt_checkbox.isChecked(),
+            "hide_from_capture": self.hide_capture_checkbox.isChecked(),
         })
+
+    def _apply_capture_setting(self):
+        _apply_capture_exclusion(self, self._hide_from_capture)
+        if hasattr(self, "overlay"):
+            self.overlay.set_capture_exclusion(self._hide_from_capture)
+        if hasattr(self, "toast"):
+            self.toast.set_capture_exclusion(self._hide_from_capture)
+
+    def _set_capture_exclusion(self, enabled):
+        self._hide_from_capture = bool(enabled)
+        self._apply_capture_setting()
+        if hasattr(self, "hide_capture_checkbox"):
+            self._persist_settings()
 
     def _on_manual_only_changed(self, on):
         """Modo manual: el envío a GPT solo ocurre bajo orden explícita."""
@@ -1686,6 +2041,98 @@ class WhisperApp(QMainWindow):
         self._ack("Alt+G · enviando a GPT…")
         self.send_to_gpt()
 
+    def _hk_smarter(self):
+        target = self._answers[-1] if self._answers else None
+        if target is None:
+            self._ack("Alt+S · nada que mejorar todavía")
+            return
+        self._ack("Alt+S · más a fondo con gpt-6.1-sol…")
+        self._launch_smarter(target)
+
+    def _launch_smarter(self, target):
+        config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+        question = target["question"]
+        previous = []
+        current = target
+        while current is not None:
+            previous.append((current["model"], current["text"]))
+            current = (self._answer_for_key(current["parent"])
+                       if current.get("parent") is not None else None)
+        previous.reverse()
+        ctx = list(self._ctx)
+        mine = "\n".join(
+            line for line in ctx[target["ctx_index"]:]
+            if line.startswith("Tú:"))
+        context = self._build_context()
+        engine = self.gpt_engine_combo.currentData()
+        brief = self.brief_input.toPlainText().strip()
+        effort = ("high" if "sol" in target["model"].lower()
+                  else config.get("smart_reasoning_effort", "medium"))
+        instructions = config.get("system_prompt", "Eres un asistente útil.")
+        if brief:
+            instructions += (
+                "\n\nContexto de la entrevista — experiencia APROBADA del "
+                "candidato y límites; úsala para adaptar cada respuesta:\n"
+                + brief +
+                "\nNunca conviertas requisitos del puesto ni notas de empresa "
+                "en experiencia del candidato ni inventes métricas o historias "
+                "que el brief no respalde; ante falta de evidencia, responde "
+                "en hipotético."
+            )
+        for key in ("format_prompt", "smart_prompt"):
+            if config.get(key):
+                instructions += "\n\n" + config[key]
+        prev_blocks = "\n\n".join(
+            f"Respuesta anterior de {model} (marcada como NO útil por el candidato):\n"
+            f"<<<\n{text}\n>>>"
+            for model, text in previous
+        )
+        user_input = (
+            "Transcript completo de la llamada (Entrevistador = voces de la llamada, "
+            "Tú = el candidato; puede tener errores de transcripción):\n"
+            f"{context}\n\n"
+            "Intervención del entrevistador a la que hay que responder:\n"
+            f"{question}\n\n"
+            "Lo que el candidato (Tú) ha dicho desde esa intervención:\n"
+            f"{mine or '(nada todavía)'}\n\n"
+            f"{prev_blocks}"
+        )
+
+        if engine == "codex":
+            model = config.get("smart_model", "gpt-6.1-sol")
+            thread = CodexCliThread(
+                question, model=model,
+                full_prompt=instructions + "\n\n" + user_input, search=True)
+        elif engine == "cloudflare":
+            openai_key = ApiKeyManager.load_api_key("openai")
+            if openai_key:
+                model = config.get("smart_model", "gpt-6.1-sol")
+                thread = SmartQueryThread(
+                    openai_key, question, previous, context, mine, brief,
+                    effort=effort)
+            else:
+                model = config.get("cf_model", DEFAULT_GPT_CONFIG["cf_model"])
+                thread = SmartQueryThread(
+                    None, question, previous, context, mine, brief,
+                    effort=effort, engine="cloudflare")
+        else:
+            openai_key = ApiKeyManager.load_api_key("openai")
+            if not openai_key:
+                self.status_bar.showMessage(
+                    "Más a fondo necesita una API key de OpenAI")
+                return
+            model = config.get("smart_model", "gpt-6.1-sol")
+            thread = SmartQueryThread(
+                openai_key, question, previous, context, mine, brief,
+                effort=effort)
+
+        model_label = model + " · web"
+        self._start_answer(
+            thread, "Más a fondo", model_label, question, context,
+            parent=target["key"])
+        self._gpt_threads.append(thread)
+        thread.start()
+
     def _hk_toggle_capture(self):
         self._ack("Alt+T · iniciando…" if not self.is_continuous_mode
                   else "Alt+T · deteniendo…")
@@ -1697,7 +2144,7 @@ class WhisperApp(QMainWindow):
         if is_final:
             self._live_buffers.pop(lane, None)
             self._set_live_transcript(lane, "")
-            self.overlay.set_live(f"{lane}: {text}")
+            self.overlay.set_live(lane, text, final=True)
             self._draft_state.pop(lane, None)   # turno cerrado: próximo borrador
             self._on_new_segment(text, lane)
             return
@@ -1706,7 +2153,7 @@ class WhisperApp(QMainWindow):
             text = self._live_buffers.get(lane, "") + text
         self._live_buffers[lane] = text
         self._set_live_transcript(lane, text)
-        self.overlay.set_live(f"{lane}: {text}")
+        self.overlay.set_live(lane, text)
         # Interim: borrador anticipado mientras la persona sigue hablando.
         if lane == "T\u00fa" or not self.auto_gpt_checkbox.isChecked():
             return
@@ -1818,6 +2265,9 @@ class WhisperApp(QMainWindow):
         self.interviewer_output.clear()
         self.you_output.clear()
         self._live_buffers.clear()
+        if hasattr(self, "overlay"):
+            self.overlay.set_live("Entrevistador", "")
+            self.overlay.set_live("Tú", "")
         self.interviewer_live.setText("En directo: \u2014")
         self.you_live.setText("En directo: \u2014")
 
@@ -1829,8 +2279,6 @@ class WhisperApp(QMainWindow):
             self.you_output.append(_format_transcript_html(text))
         else:
             self.interviewer_output.append(_format_transcript_html(text))
-        self.overlay.add_transcript(lane, text)
-
         if not text.strip():
             return
         if self.auto_gpt_checkbox.isChecked() and lane != "Tú":
@@ -1892,71 +2340,83 @@ class WhisperApp(QMainWindow):
                 allow_web=(kind != "Borrador"),
                 fast=(kind == "Borrador"))
 
-        header = f"[{kind}] {gpt_input}" if kind else gpt_input
-        self._begin_gpt_stream(thread, header)
-        self.overlay.gpt_update(thread, "…", header=header)
+        question = text
+        if lane and question.startswith(lane + ":"):
+            question = question.split(":", 1)[1].strip()
+        model_label = self._model_label(engine, kind)
+        self._start_answer(thread, kind, model_label, question, context)
         self._gpt_threads.append(thread)
-        if hasattr(thread, "query_delta"):
-            thread.query_delta.connect(
-                lambda txt, t=thread: self._update_gpt_stream(t, txt))
-        thread.query_complete.connect(
-            lambda ok, res, h=header, t=thread:
-            self._on_auto_gpt_result(ok, res, h, t))
-        thread.query_complete.connect(
-            lambda *a, t=thread: self._gpt_threads.remove(t))
         thread.start()
 
-    def _begin_gpt_stream(self, thread, header):
-        """Reserva un bloque editable al final para la respuesta parcial."""
-        cursor = self.gpt_output.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        if self.gpt_output.toPlainText().strip():
-            cursor.insertText("\n\n")
-        start = cursor.position()
-        cursor.insertText(f"{header}\n")
-        self._gpt_streams[thread] = {
-            "start": start, "end": cursor.position(), "header": header}
+    def _model_label(self, engine, kind):
+        config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+        if engine == "codex":
+            return CODEX_MODEL
+        if engine == "cloudflare":
+            key = "cf_fast_model" if kind == "Borrador" else "cf_model"
+            return config.get(key, DEFAULT_GPT_CONFIG[key])
+        return config.get("model", DEFAULT_GPT_CONFIG["model"])
 
-    def _update_gpt_stream(self, thread, text):
-        entry = self._gpt_streams.get(thread)
-        if entry is None:
+    def _start_answer(self, thread, kind, model_label, question, context,
+                      parent=None, manual=False):
+        answer = {
+            "key": thread,
+            "kind": kind,
+            "model": model_label,
+            "question": question,
+            "ctx_index": len(self._ctx),
+            "text": "",
+            "done": False,
+            "ok": True,
+            "parent": parent,
+            "manual": manual,
+        }
+        self._answers.append(answer)
+        self.gpt_output.start(thread, kind, model_label, question)
+        self.overlay.feed.start(thread, kind, model_label, question)
+        if hasattr(thread, "query_delta"):
+            thread.query_delta.connect(
+                lambda text, key=thread: self._update_answer(key, text))
+        if hasattr(thread, "query_status"):
+            thread.query_status.connect(
+                lambda text, key=thread: self._status_answer(key, text))
+        thread.query_complete.connect(
+            lambda ok, result, key=thread:
+            self._finish_answer(key, ok, result))
+        thread.query_complete.connect(
+            lambda *args, key=thread:
+            self._gpt_threads.remove(key) if key in self._gpt_threads else None)
+        return answer
+
+    def _answer_for_key(self, key):
+        return next((answer for answer in reversed(self._answers)
+                     if answer["key"] is key), None)
+
+    def _update_answer(self, key, text):
+        answer = self._answer_for_key(key)
+        if answer is None:
             return
-        cursor = self.gpt_output.textCursor()
-        cursor.setPosition(entry["start"])
-        cursor.setPosition(entry["end"], QTextCursor.MoveMode.KeepAnchor)
-        cursor.removeSelectedText()
-        cursor.insertText(f'{entry["header"]}\n{text}')
-        new_end = cursor.position()
-        shift = new_end - entry["end"]
-        entry["end"] = new_end
-        if shift:
-            for other, other_entry in self._gpt_streams.items():
-                if other is not thread and other_entry["start"] > entry["start"]:
-                    other_entry["start"] += shift
-                    other_entry["end"] += shift
-        bar = self.gpt_output.verticalScrollBar()
-        bar.setValue(bar.maximum())
-        self.overlay.gpt_update(thread, text)
+        answer["text"] = text
+        self.gpt_output.update(key, text)
+        self.overlay.feed.update(key, text)
 
-    def _finish_gpt_stream(self, thread, text):
-        self._update_gpt_stream(thread, text)
-        self._gpt_streams.pop(thread, None)
+    def _status_answer(self, key, text):
+        self.gpt_output.status(key, text)
+        self.overlay.feed.status(key, text)
 
-    def _on_auto_gpt_result(self, success, result, header="", thread=None):
-        if success:
-            block = f"{header}\n{result}" if header else result
-            if thread in self._gpt_streams:
-                self._finish_gpt_stream(thread, result)
-            else:
-                self.gpt_output.append(block)
-                self.gpt_output.append("")
-            self.overlay.gpt_update(thread, result)
-            self.status_bar.showMessage("Respuesta GPT recibida")
-        else:
-            if thread in self._gpt_streams:
-                self._finish_gpt_stream(thread, f"Error: {result}")
-            self.overlay.gpt_update(thread, f"Error: {result}")
-            self.status_bar.showMessage(f"GPT: {result}")
+    def _finish_answer(self, key, success, result):
+        answer = self._answer_for_key(key)
+        if answer is None:
+            return
+        answer["done"] = True
+        answer["ok"] = success
+        answer["text"] = result if success else f"Error: {result}"
+        self.gpt_output.finish(key, success, answer["text"])
+        self.overlay.feed.finish(key, success, answer["text"])
+        if answer.get("manual"):
+            self.send_to_gpt_button.setEnabled(True)
+        self.status_bar.showMessage(
+            "Respuesta GPT recibida" if success else f"GPT: {result}")
 
     def handle_continuous_error(self, error_msg):
         if not self.is_continuous_mode:
@@ -2020,11 +2480,18 @@ class WhisperApp(QMainWindow):
     def clear_text(self):
         self._clear_transcript_views()
         self.gpt_output.clear()
+        self.overlay.feed.clear()
         self._ctx.clear()            # estado oculto no sobrevive al «Limpiar»
         self._draft_state.clear()
         self._pinned.clear()
-        self.overlay.clear_log()
+        self._answers.clear()
         self.status_bar.showMessage("Transcripción y contexto borrados")
+
+    def _latest_interviewer_question(self):
+        for line in reversed(self._ctx):
+            if not line.startswith("Tú:"):
+                return line.split(":", 1)[1].strip() if ":" in line else line
+        return "(transcript completo)"
 
     def send_to_gpt(self):
         transcription = self._transcript_text()
@@ -2050,33 +2517,13 @@ class WhisperApp(QMainWindow):
             thread = GptQueryThread(gpt_key, transcription,
                                     context=context, brief=brief, allow_web=True)
 
-        header = "[Manual] " + transcription.replace("\n", " ")[:120]
-        self._begin_gpt_stream(thread, header)
-        self.overlay.gpt_update(thread, "…", header=header)
-        if hasattr(thread, "query_delta"):
-            thread.query_delta.connect(
-                lambda txt, t=thread: self._update_gpt_stream(t, txt))
+        self._start_answer(
+            thread, "Manual", self._model_label(engine, "Borrador"),
+            self._latest_interviewer_question(), context, manual=True)
         self._gpt_threads.append(thread)
-        thread.query_complete.connect(
-            lambda ok, res, t=thread:
-            self._handle_gpt_response(ok, res, t))
-        thread.query_complete.connect(
-            lambda *a, t=thread: self._gpt_threads.remove(t))
         self.send_to_gpt_button.setEnabled(False)
         self.status_bar.showMessage("Enviando a GPT\u2026")
         thread.start()
-
-    def _handle_gpt_response(self, success, result, thread):
-        self.send_to_gpt_button.setEnabled(True)
-        if success:
-            self._finish_gpt_stream(thread, result)
-            self.overlay.gpt_update(thread, result)
-            self.status_bar.showMessage("Respuesta GPT recibida")
-        else:
-            if thread in self._gpt_streams:
-                self._finish_gpt_stream(thread, f"Error: {result}")
-            self.overlay.gpt_update(thread, f"Error: {result}")
-            self.status_bar.showMessage(f"Error de GPT: {result}")
 
     # ------------------------- cierre -------------------------
 
@@ -2115,31 +2562,64 @@ class WhisperApp(QMainWindow):
         super().closeEvent(event)
 
 
-def _force_light_palette(app):
-    """Tema claro garantizado: ignora el modo oscuro del SO."""
+def _apply_dark_palette(app):
     app.setStyle("Fusion")
     p = QPalette()
-    text, base, win = QColor("#1a1a1a"), QColor("#ffffff"), QColor("#f4f4f4")
-    p.setColor(QPalette.Window, win)
-    p.setColor(QPalette.WindowText, text)
-    p.setColor(QPalette.Base, base)
-    p.setColor(QPalette.AlternateBase, QColor("#f0f0f0"))
-    p.setColor(QPalette.Text, text)
-    p.setColor(QPalette.Button, win)
-    p.setColor(QPalette.ButtonText, text)
-    p.setColor(QPalette.ToolTipBase, QColor("#ffffdc"))
-    p.setColor(QPalette.ToolTipText, text)
-    p.setColor(QPalette.Highlight, QColor("#2f6fed"))
-    p.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-    p.setColor(QPalette.PlaceholderText, QColor("#888888"))
-    for role in (QPalette.Text, QPalette.ButtonText, QPalette.WindowText):
-        p.setColor(QPalette.Disabled, role, QColor("#999999"))
+    roles = {
+        QPalette.ColorRole.Window: "#1e1f22",
+        QPalette.ColorRole.Base: "#25272b",
+        QPalette.ColorRole.AlternateBase: "#2b2d31",
+        QPalette.ColorRole.Text: "#d4d6d9",
+        QPalette.ColorRole.WindowText: "#d4d6d9",
+        QPalette.ColorRole.Button: "#2b2d31",
+        QPalette.ColorRole.ButtonText: "#d4d6d9",
+        QPalette.ColorRole.ToolTipBase: "#2b2d31",
+        QPalette.ColorRole.ToolTipText: "#d4d6d9",
+        QPalette.ColorRole.Highlight: "#3d6bb3",
+        QPalette.ColorRole.HighlightedText: "#f0f0f0",
+        QPalette.ColorRole.PlaceholderText: "#7c8087",
+        QPalette.ColorRole.Link: "#8ab4f8",
+        QPalette.ColorRole.Light: "#3b3d42",
+        QPalette.ColorRole.Midlight: "#313338",
+        QPalette.ColorRole.Dark: "#17181b",
+        QPalette.ColorRole.Mid: "#222428",
+        QPalette.ColorRole.Shadow: "#101114",
+    }
+    for role, color in roles.items():
+        p.setColor(role, QColor(color))
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText,
+                 QPalette.ColorRole.WindowText):
+        p.setColor(QPalette.ColorGroup.Disabled, role, QColor("#6b6f75"))
     app.setPalette(p)
+    app.setStyleSheet("""
+        QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox,
+        QDoubleSpinBox, QDateEdit, QTimeEdit {
+            background-color: #25272b;
+            color: #d4d6d9;
+            border: 1px solid #3a3d42;
+            border-radius: 6px;
+            padding: 5px;
+            selection-background-color: #3d6bb3;
+        }
+        QPushButton {
+            background-color: #2b2d31;
+            color: #d4d6d9;
+            border: 1px solid #3a3d42;
+            border-radius: 6px;
+            padding: 6px 10px;
+        }
+        QPushButton:hover { background-color: #37393e; }
+        QToolTip {
+            color: #d4d6d9;
+            background-color: #2b2d31;
+            border: 1px solid #3a3d42;
+        }
+    """)
 
 
 def main():
     app = QApplication(sys.argv)
-    _force_light_palette(app)
+    _apply_dark_palette(app)
     window = WhisperApp()
     window.show()
     sys.exit(app.exec())
