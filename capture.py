@@ -27,13 +27,39 @@ def loopback_available():
     return _SOUNDCARD_AVAILABLE and default_loopback() is not None
 
 
+def _loopback_microphones():
+    """Endpoints de salida expuestos por WASAPI como micrófonos-loopback."""
+    return [
+        mic for mic in sc.all_microphones(include_loopback=True)
+        if getattr(mic, "isloopback", False)
+    ]
+
+
+def _device_by_id(devices, device_id):
+    """Localiza un endpoint por ID sin consultar nombres de todos los endpoints."""
+    return next((device for device in devices if device.id == device_id), None)
+
+
+def loopback_display_name(mic):
+    """Nombre legible sin tocar `Microphone.name`, inestable en algunos drivers."""
+    if mic is None:
+        return ""
+    try:
+        if mic.id == sc.default_speaker().id:
+            idx = sd.default.device[1]
+            return sd.query_devices(idx)["name"]
+    except Exception:
+        pass
+    return mic.id
+
+
 def default_loopback():
     """Micrófono-loopback del altavoz predeterminado, o None."""
     if not _SOUNDCARD_AVAILABLE:
         return None
     try:
         speaker = sc.default_speaker()
-        return sc.get_microphone(speaker.name, include_loopback=True)
+        return _device_by_id(_loopback_microphones(), speaker.id)
     except Exception:
         return None
 
@@ -42,15 +68,10 @@ def list_loopback_devices():
     """Todos los dispositivos de salida capturables por loopback."""
     if not _SOUNDCARD_AVAILABLE:
         return []
-    devices = []
-    for speaker in sc.all_speakers():
-        try:
-            mic = sc.get_microphone(speaker.name, include_loopback=True)
-            if mic is not None:
-                devices.append((mic.name, mic))
-        except Exception:
-            continue
-    return devices
+    return [
+        (f"Loopback WASAPI {i + 1}", mic)
+        for i, mic in enumerate(_loopback_microphones())
+    ]
 
 
 def list_input_devices():

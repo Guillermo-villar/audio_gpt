@@ -16,6 +16,7 @@ import queue
 import uuid
 import json
 import html
+import re
 import ctypes
 import threading
 from collections import deque
@@ -58,6 +59,22 @@ HOTKEYS = {
     "alt+c": (0x12, 0x43, "copy_answer", "copiar última respuesta"),
     "alt+t": (0x12, 0x54, "toggle_capture", "start/stop transcripción"),
 }
+
+_SPEAKER_TAG_RE = re.compile(r"&lt;S(\d+)&gt;")
+_SPEAKER_COLORS = (
+    "#1a56db", "#7a3db8", "#a35c00", "#007a5e", "#a82f5b", "#4c6f91",
+)
+
+
+def _format_transcript_html(text):
+    """Escapa HTML sin convertir comillas y colorea marcas <S#>."""
+    escaped = html.escape(text, quote=False)
+
+    def repl(match):
+        speaker = int(match.group(1))
+        color = _SPEAKER_COLORS[speaker % len(_SPEAKER_COLORS)]
+        return f'<b style="color:{color}">S{speaker}:</b>'
+    return _SPEAKER_TAG_RE.sub(repl, escaped).replace("\n", "<br>")
 
 
 def _combo_pressed(combo):
@@ -314,7 +331,8 @@ class AudioDeviceSetupDialog(QDialog):
         loop_layout = QVBoxLayout(loop_group)
         loopback = capture.default_loopback()
         if loopback is not None:
-            self.loop_status = QLabel(f"OK — capturando de: {loopback.name}")
+            loop_name = capture.loopback_display_name(loopback)
+            self.loop_status = QLabel(f"OK — capturando de: {loop_name}")
             self.loop_status.setStyleSheet("color: green; font-weight: bold;")
         else:
             self.loop_status = QLabel(
@@ -793,6 +811,8 @@ class WhisperApp(QMainWindow):
         self._dying_threads = []
         self._ctx = deque()               # transcript completo «Carril: texto»
         self._draft_state = {}            # carril -> interim ya respondido
+        self._gpt_streams = {}            # thread -> bloque GPT en streaming
+        self._live_buffers = {}           # carril -> texto parcial acumulado
         self._gate_pending = set()        # carriles con gate clef en vuelo
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
         self._last_answer = ""            # para Alt+C (copiar respuesta)
@@ -966,11 +986,15 @@ class WhisperApp(QMainWindow):
             edit.setReadOnly(True)
             edit.setPlaceholderText(placeholder)
             col.addWidget(edit)
-            return col, edit
+            live = QLabel("En directo: \u2014")
+            live.setWordWrap(True)
+            live.setStyleSheet("color: #555; font-style: italic;")
+            col.addWidget(live)
+            return col, edit, live
 
-        col_int, self.interviewer_output = _lane_pane(
+        col_int, self.interviewer_output, self.interviewer_live = _lane_pane(
             "Entrevistador", "#1a56db", "Voces de la llamada…")
-        col_you, self.you_output = _lane_pane(
+        col_you, self.you_output, self.you_live = _lane_pane(
             "Tú (micro)", "#0f7a3d", "Tu voz…")
         lanes_row.addLayout(col_int)
         lanes_row.addLayout(col_you)
@@ -997,7 +1021,7 @@ class WhisperApp(QMainWindow):
         self.send_to_gpt_button.clicked.connect(self.send_to_gpt)
         self.compact_button = QPushButton("Modo compacto")
         self.compact_button.setToolTip(
-            "Panel pequeño siempre encima (Ctrl+Alt+D): estado, lo que se "
+            "Panel pequeño siempre encima (Ctrl+I): estado, lo que se "
             "oye en vivo y la última respuesta — para tenerlo anclado sobre "
             "la llamada sin la ventana entera.")
         self.compact_button.clicked.connect(self.toggle_compact)
@@ -1103,10 +1127,10 @@ class WhisperApp(QMainWindow):
         self.api_key = ApiKeyManager.load_api_key(provider)
         needs_key = meta.get("key_env") is not None
         self.change_api_button.setEnabled(needs_key)
-        if needs_key and not self.api_key:
-            dialog = ApiKeyDialog(self, provider)
-            if dialog.exec() == QDialog.Accepted:
-                self.api_key = dialog.get_api_key()
+        if needs_key and not self.api_key and hasattr(self, 'status_bar'):
+            self.status_bar.showMessage(
+                f"{meta.get('label', provider)} necesita una API key "
+                "(bot\u00f3n \u00abAPI key\u2026\u00bb)")
 
     def change_api_key(self):
         provider = self.provider_selector.currentData()
@@ -1188,7 +1212,9 @@ class WhisperApp(QMainWindow):
     def transcription_finished(self, success, result):
         self.transcribe_button.setEnabled(True)
         if success:
-            self.interviewer_output.setPlainText(result)
+            self._clear_transcript_views()
+            self._lane_widget("").setPlainText(result)
+
             self.status_bar.showMessage("Transcripción completada")
         else:
             QMessageBox.critical(self, "Error", f"Error en la transcripción: {result}")
@@ -1235,8 +1261,7 @@ class WhisperApp(QMainWindow):
         self._set_controls_enabled(False)
         self.continuous_button.setText("DETENER TRANSCRIPCIÓN CONTINUA")
         self._style_continuous_button(start=False)
-        self.interviewer_output.clear()
-        self.you_output.clear()
+        self._clear_transcript_views()
         self._persist_settings()
 
         language = self._current_language()
@@ -1284,10 +1309,18 @@ class WhisperApp(QMainWindow):
             cb = (lambda t, fin, l=lane: self.realtime_text.emit(t, fin, l))
             err = (lambda m: self.realtime_error.emit(m))
             if provider == "deepgram":
+                lane_model = model
+                lane_diarize = diarize
+                if source == "duo":
+                    if lane == "T\u00fa":
+                        lane_model = "flux-general-multi"
+                        lane_diarize = False
+                    elif lane != "Entrevistador":
+                        lane_diarize = False
                 return transcriber.DeepgramRealtime(
-                    self.api_key, model=model, language=language,
+                    self.api_key, model=lane_model, language=language,
                     on_transcript=cb, on_error=err,
-                    diarize=diarize, keyterms=keyterms)
+                    diarize=lane_diarize, keyterms=keyterms)
             return transcriber.RealtimeTranscriber(
                 self.api_key, model=model, language=language,
                 prompt=transcriber.DEFAULT_PROMPT,
@@ -1374,14 +1407,22 @@ class WhisperApp(QMainWindow):
 
     @Slot(str, bool, str)
     def _append_transcript(self, text, is_final, lane=""):
-        tag = f"{lane}: " if lane else ""
-        self.overlay.set_live(f"{tag}{text}")
+        lane = self._lane_key(lane)
         if is_final:
+            self._live_buffers.pop(lane, None)
+            self._set_live_transcript(lane, "")
+            self.overlay.set_live(f"{lane}: {text}")
             self._draft_state.pop(lane, None)   # turno cerrado: próximo borrador
             self._on_new_segment(text, lane)
             return
+
+        if self._current_provider() == "openai-realtime":
+            text = self._live_buffers.get(lane, "") + text
+        self._live_buffers[lane] = text
+        self._set_live_transcript(lane, text)
+        self.overlay.set_live(f"{lane}: {text}")
         # Interim: borrador anticipado mientras la persona sigue hablando.
-        if lane == "Tú" or not self.auto_gpt_checkbox.isChecked():
+        if lane == "T\u00fa" or not self.auto_gpt_checkbox.isChecked():
             return
         prev = self._draft_state.get(lane)
         if prev is not None and prev in text:
@@ -1470,13 +1511,38 @@ class WhisperApp(QMainWindow):
             )
             return False
 
+    def _lane_key(self, lane=""):
+        """Canal visible: loopback a la izquierda, micrófono a la derecha."""
+        if lane in ("Entrevistador", "T\u00fa"):
+            return lane
+        return "T\u00fa" if self._current_source() == "input" else "Entrevistador"
+
+    def _lane_widget(self, lane=""):
+        if self._lane_key(lane) == "T\u00fa":
+            return self.you_output
+        return self.interviewer_output
+
+    def _set_live_transcript(self, lane, text):
+        label = (self.you_live if self._lane_key(lane) == "T\u00fa"
+                 else self.interviewer_live)
+        text = text.strip()
+        label.setText(f"En directo: {text[-500:]}" if text else "En directo: \u2014")
+
+    def _clear_transcript_views(self):
+        self.interviewer_output.clear()
+        self.you_output.clear()
+        self._live_buffers.clear()
+        self.interviewer_live.setText("En directo: \u2014")
+        self.you_live.setText("En directo: \u2014")
+
     def _on_new_segment(self, text, lane=""):
         """Llamado con cada fragmento nuevo transcrito (modo continuo)."""
-        display = f"{lane}: {text}" if lane else text
+        lane = self._lane_key(lane)
+        display = f"{lane}: {text}"
         if lane == "Tú":
-            self.you_output.append(html.escape(text))
+            self.you_output.append(_format_transcript_html(text))
         else:
-            self.interviewer_output.append(html.escape(text))
+            self.interviewer_output.append(_format_transcript_html(text))
 
         if not text.strip():
             return
@@ -1524,7 +1590,8 @@ class WhisperApp(QMainWindow):
             thread = GptQueryThread(
                 None, gpt_input, engine="cloudflare",
                 context=context, effort=effort, max_tokens=max_tokens,
-                brief=brief)
+                brief=brief, allow_web=(kind != "Borrador"),
+                fast=(kind == "Borrador"))
         else:
             gpt_key = ApiKeyManager.load_api_key("openai")
             if not gpt_key:
@@ -1534,24 +1601,73 @@ class WhisperApp(QMainWindow):
                 return
             thread = GptQueryThread(
                 gpt_key, gpt_input, context=context, effort=effort,
-                max_tokens=max_tokens, brief=brief)
+                max_tokens=max_tokens, brief=brief,
+                allow_web=(kind != "Borrador"),
+                fast=(kind == "Borrador"))
 
         header = f"[{kind}] {gpt_input}" if kind else gpt_input
+        self._begin_gpt_stream(thread, header)
         self._gpt_threads.append(thread)
+        if hasattr(thread, "query_delta"):
+            thread.query_delta.connect(
+                lambda txt, t=thread: self._update_gpt_stream(t, txt))
         thread.query_complete.connect(
-            lambda ok, res, h=header: self._on_auto_gpt_result(ok, res, h))
+            lambda ok, res, h=header, t=thread:
+            self._on_auto_gpt_result(ok, res, h, t))
         thread.query_complete.connect(
             lambda *a, t=thread: self._gpt_threads.remove(t))
         thread.start()
 
-    def _on_auto_gpt_result(self, success, result, header=""):
+    def _begin_gpt_stream(self, thread, header):
+        """Reserva un bloque editable al final para la respuesta parcial."""
+        cursor = self.gpt_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self.gpt_output.toPlainText().strip():
+            cursor.insertText("\n\n")
+        start = cursor.position()
+        cursor.insertText(f"{header}\n")
+        self._gpt_streams[thread] = {
+            "start": start, "end": cursor.position(), "header": header}
+
+    def _update_gpt_stream(self, thread, text):
+        entry = self._gpt_streams.get(thread)
+        if entry is None:
+            return
+        cursor = self.gpt_output.textCursor()
+        cursor.setPosition(entry["start"])
+        cursor.setPosition(entry["end"], QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertText(f'{entry["header"]}\n{text}')
+        new_end = cursor.position()
+        shift = new_end - entry["end"]
+        entry["end"] = new_end
+        if shift:
+            for other, other_entry in self._gpt_streams.items():
+                if other is not thread and other_entry["start"] > entry["start"]:
+                    other_entry["start"] += shift
+                    other_entry["end"] += shift
+        bar = self.gpt_output.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        self.overlay.set_answer(f'{entry["header"]}\n{text}')
+
+    def _finish_gpt_stream(self, thread, text):
+        self._update_gpt_stream(thread, text)
+        self._gpt_streams.pop(thread, None)
+
+    def _on_auto_gpt_result(self, success, result, header="", thread=None):
         if success:
             self._last_answer = result
             block = f"{header}\n{result}" if header else result
-            self.gpt_output.append(block)
-            self.gpt_output.append("")
+            if thread in self._gpt_streams:
+                self._finish_gpt_stream(thread, result)
+            else:
+                self.gpt_output.append(block)
+                self.gpt_output.append("")
             self.overlay.set_answer(block)
+            self.status_bar.showMessage("Respuesta GPT recibida")
         else:
+            if thread in self._gpt_streams:
+                self._finish_gpt_stream(thread, f"Error: {result}")
             self.status_bar.showMessage(f"GPT: {result}")
 
     def handle_continuous_error(self, error_msg):
@@ -1614,8 +1730,7 @@ class WhisperApp(QMainWindow):
             f"Fijado ({len(self._pinned)} hecho(s) en contexto): {sel[:60]}")
 
     def clear_text(self):
-        self.interviewer_output.clear()
-        self.you_output.clear()
+        self._clear_transcript_views()
         self.gpt_output.clear()
         self._ctx.clear()            # estado oculto no sobrevive al «Limpiar»
         self._draft_state.clear()
@@ -1625,7 +1740,7 @@ class WhisperApp(QMainWindow):
     def send_to_gpt(self):
         transcription = self._transcript_text()
         if not transcription:
-            QMessageBox.warning(self, "Advertencia", "No hay texto para enviar a GPT")
+            self.status_bar.showMessage("No hay texto para enviar a GPT")
             return
 
         engine = self.gpt_engine_combo.currentData()
@@ -1635,42 +1750,41 @@ class WhisperApp(QMainWindow):
             thread = CodexCliThread(transcription, context=context, brief=brief)
         elif engine == "cloudflare":
             thread = GptQueryThread(None, transcription, engine="cloudflare",
-                                    context=context, brief=brief)
+                                    context=context, brief=brief, allow_web=True,
+                                    fast=True)
         else:
             gpt_key = ApiKeyManager.load_api_key("openai")
             if not gpt_key:
-                QMessageBox.warning(
-                    self, "Error",
-                    "GPT usa la API de OpenAI: configura una API key con «API key…» "
-                    "seleccionando el proveedor OpenAI."
-                )
+                self.status_bar.showMessage(
+                    "GPT necesita una API key de OpenAI (bot\u00f3n API key\u2026)")
                 return
             thread = GptQueryThread(gpt_key, transcription,
-                                    context=context, brief=brief)
+                                    context=context, brief=brief, allow_web=True)
 
-        wait_dialog = QMessageBox(self)
-        wait_dialog.setWindowTitle("Procesando")
-        wait_dialog.setText("Enviando a GPT…")
-        wait_dialog.setStandardButtons(QMessageBox.NoButton)
-        wait_dialog.setIcon(QMessageBox.Information)
-
+        header = "[Manual] " + transcription.replace("\n", " ")[:120]
+        self._begin_gpt_stream(thread, header)
+        if hasattr(thread, "query_delta"):
+            thread.query_delta.connect(
+                lambda txt, t=thread: self._update_gpt_stream(t, txt))
         self.gpt_thread = thread
         self.gpt_thread.query_complete.connect(
-            lambda ok, res: self._handle_gpt_response(ok, res, wait_dialog, transcription))
-        wait_dialog.show()
-        self.send_to_gpt_button.setEnabled(False)   # evita reemplazar el hilo en curso
+            lambda ok, res, t=thread:
+            self._handle_gpt_response(ok, res, t))
+        self.send_to_gpt_button.setEnabled(False)
+        self.status_bar.showMessage("Enviando a GPT\u2026")
         self.gpt_thread.start()
 
-    def _handle_gpt_response(self, success, result, wait_dialog, transcription):
-        wait_dialog.accept()
+    def _handle_gpt_response(self, success, result, thread):
         self.send_to_gpt_button.setEnabled(True)
         if success:
-            existing = self.gpt_output.toPlainText()
-            self.gpt_output.setPlainText(
-                f"{existing}\n\n{result}" if existing else result)
-            GptResponseDialog(self, transcription, result).exec()
+            self._last_answer = result
+            self._finish_gpt_stream(thread, result)
+            self.overlay.set_answer(result)
+            self.status_bar.showMessage("Respuesta GPT recibida")
         else:
-            QMessageBox.critical(self, "Error", f"Error de GPT: {result}")
+            if thread in self._gpt_streams:
+                self._finish_gpt_stream(thread, f"Error: {result}")
+            self.status_bar.showMessage(f"Error de GPT: {result}")
 
     # ------------------------- cierre -------------------------
 

@@ -125,6 +125,69 @@ def looks_like_question(text, min_words=4):
     return any(h in t for h in _TECH_TASK_HINTS)
 
 
+_WEB_SEARCH_HINTS = (
+    "latest", "current", "today", "news", "recent", "release", "version",
+    "price", "pricing", "stock", "who won", "documentation", "docs",
+    "look up", "search", "google", "web", "internet",
+    "última", "último", "actual", "actualidad", "hoy", "noticias",
+    "reciente", "versión", "precio", "cuánto cuesta", "quién ganó",
+    "documentación", "busca", "buscar",
+)
+
+
+def exa_api_key():
+    """EXA_API_KEY o exa_api_key.txt (cubierto por *_api_key.txt)."""
+    if os.environ.get("EXA_API_KEY"):
+        return os.environ["EXA_API_KEY"].strip()
+    try:
+        with open("exa_api_key.txt", "r") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def needs_web_search(text):
+    """Gate barato: solo busca si la pregunta pide datos externos/actuales."""
+    t = text.lower()
+    return (any(h in t for h in _WEB_SEARCH_HINTS)
+            or bool(re.search(r"\b20\d{2}\b", t)))
+
+
+def exa_search(query, max_results=3, timeout=4):
+    """Búsqueda Exa rápida: título, URL y highlights cortos para el LLM."""
+    key = exa_api_key()
+    if not key:
+        return ""
+    body = {
+        "query": query[:1000],
+        "type": "fast",
+        "numResults": max(1, min(int(max_results), 5)),
+        "contents": {"highlights": True},
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.exa.ai/search",
+            data=json.dumps(body).encode(),
+            method="POST",
+            headers={"x-api-key": key, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            results = json.loads(r.read()).get("results", [])
+    except Exception:
+        return ""
+
+    lines = []
+    for item in results:
+        title = (item.get("title") or item.get("url") or "Fuente").strip()
+        url = (item.get("url") or "").strip()
+        snippets = item.get("highlights") or []
+        if isinstance(snippets, str):
+            snippets = [snippets]
+        snippet = " ".join(s.strip() for s in snippets if s.strip())[:900]
+        lines.append(f"- {title}\n  {url}\n  {snippet}".rstrip())
+    return "\n".join(lines)
+
+
 class ApiKeyManager:
     """Gestiona el almacenamiento y recuperación de API keys por proveedor."""
 
@@ -240,9 +303,14 @@ DEFAULT_GPT_CONFIG = {
         "y directo."
     ),
     "temperature": None,          # los modelos de razonamiento (gpt-5/6) no admiten temperature
-    "reasoning_effort": "low",    # respuestas rápidas y baratas; sube a "medium" para más calidad
+    "reasoning_effort": "none",   # borradores rápidos; la revisión sube a "medium"
     "service_tier": "fast",       # Fast mode (~2.5x menos latencia, ~2x precio); "auto"/"flex" alternativas
     "max_tokens": 2000,
+    "cf_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "cf_fast_model": "@cf/meta/llama-3.1-8b-instruct-fast",
+    "web_search": "auto",         # exa si hay EXA_API_KEY/exa_api_key.txt y la pregunta lo requiere
+    "web_search_results": 3,
+    "web_search_timeout": 4,
 }
 
 
@@ -272,13 +340,14 @@ class GptClient:
 
     @staticmethod
     def send_to_gpt(api_key, transcription, engine="openai", context="",
-                    effort=None, max_tokens=None, brief=""):
+                    effort=None, max_tokens=None, brief="", on_delta=None,
+                    allow_web=False, fast=False):
         """Envía la transcripción a GPT y devuelve (ok, respuesta_o_error).
 
-        engine="cloudflare" usa Workers AI (openai/gpt-6-luna servido por CF,
-        endpoint compatible con Responses); "openai" la API normal.
-        `context` son las últimas intervenciones etiquetadas por carril.
-        `effort` sube el razonamiento para la pasada de revisión.
+        engine="cloudflare" usa Workers AI: modelos nativos @cf/* por chat
+        completions y modelos compatibles por Responses; "openai" usa la API
+        normal. `context` son las últimas intervenciones etiquetadas por
+        carril. `effort` sube el razonamiento para la pasada de revisión.
         """
         try:
             from openai import OpenAI, BadRequestError
@@ -305,7 +374,9 @@ class GptClient:
             # Workers AI nativo va en créditos/free tier; los modelos de
             # terceros (openai/*) requieren saldo en la gateway o BYOK.
             model = config.get(
-                "cf_model", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+                "cf_fast_model" if fast else "cf_model",
+                "@cf/meta/llama-3.1-8b-instruct-fast" if fast
+                else "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
         else:
             client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
             model = config.get("model", DEFAULT_GPT_CONFIG["model"])
@@ -324,12 +395,25 @@ class GptClient:
                 "en hipotético."
             )
 
-        if context:
+        web_context = ""
+        if allow_web and config.get("web_search") in (True, "auto", "exa"):
+            if needs_web_search(transcription):
+                web_context = exa_search(
+                    transcription,
+                    max_results=config.get("web_search_results", 3),
+                    timeout=config.get("web_search_timeout", 4),
+                )
+
+        if context or web_context:
             gpt_input = (
                 f"Contexto de la conversación (transcript completo de la "
                 f"llamada, solo como referencia):\n{context}\n\n"
                 f"Última intervención del entrevistador — esto es lo que "
                 f"hay que responder ahora: {transcription}")
+            if web_context:
+                gpt_input += (
+                    "\n\nContexto web reciente (úsalo solo si es relevante; "
+                    "cita la URL brevemente al final):\n" + web_context)
         else:
             gpt_input = f"Transcription: {transcription}"
 
@@ -344,7 +428,7 @@ class GptClient:
         if config.get("top_p") is not None:
             kwargs["top_p"] = config["top_p"]
         effort = effort or config.get("reasoning_effort")
-        if effort:
+        if effort and effort != "none":
             kwargs["reasoning"] = {"effort": effort}
         if (engine != "cloudflare"
                 and config.get("service_tier")
@@ -355,17 +439,57 @@ class GptClient:
             if engine == "cloudflare" and model.startswith("@cf/"):
                 # Workers AI nativo: endpoint de chat completions (el de
                 # responses no acepta modelos @cf/*).
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
+                chat_kwargs = {
+                    "model": model,
+                    "messages": [
                         {"role": "system",
                          "content": kwargs["instructions"]},
                         {"role": "user", "content": kwargs["input"]},
                     ],
-                    max_tokens=kwargs["max_output_tokens"],
-                )
+                    "max_tokens": kwargs["max_output_tokens"],
+                }
+                if on_delta:
+                    try:
+                        parts = []
+                        stream = client.chat.completions.create(
+                            **chat_kwargs, stream=True)
+                        for chunk in stream:
+                            choice = (getattr(chunk, "choices", None) or [None])[0]
+                            delta = getattr(getattr(choice, "delta", None), "content", None)
+                            if delta:
+                                parts.append(delta)
+                                on_delta("".join(parts))
+                        text = "".join(parts)
+                        if text:
+                            return True, text
+                    except Exception:
+                        pass    # si CF no permite stream, cae a respuesta completa
+                response = client.chat.completions.create(**chat_kwargs)
                 text = response.choices[0].message.content
                 return (True, text) if text else (False, "La API no devolvió texto")
+
+            if on_delta:
+                try:
+                    parts = []
+                    stream = client.responses.create(**kwargs, stream=True)
+                    for event in stream:
+                        etype = getattr(event, "type", "")
+                        if etype == "response.output_text.delta":
+                            delta = getattr(event, "delta", "")
+                            if delta:
+                                parts.append(delta)
+                                on_delta("".join(parts))
+                        elif etype in ("response.completed", "response.done"):
+                            break
+                        elif etype == "response.error":
+                            raise RuntimeError(getattr(event, "error", event))
+                    text = "".join(parts)
+                    if text:
+                        return True, text
+                except BadRequestError:
+                    pass
+                except Exception:
+                    pass
             response = client.responses.create(**kwargs)
         except BadRequestError as e:
             # Los modelos de razonamiento rechazan temperature/top_p; los no
@@ -393,9 +517,11 @@ class GptQueryThread(QThread):
     """Hilo para enviar consultas a GPT sin bloquear la interfaz."""
 
     query_complete = Signal(bool, str)
+    query_delta = Signal(str)   # texto acumulado mientras llega por streaming
 
     def __init__(self, api_key, transcription, engine="openai", context="",
-                 effort=None, max_tokens=None, brief=""):
+                 effort=None, max_tokens=None, brief="", allow_web=False,
+                 fast=False):
         super().__init__()
         self.api_key = api_key
         self.transcription = transcription
@@ -404,12 +530,16 @@ class GptQueryThread(QThread):
         self.effort = effort
         self.max_tokens = max_tokens
         self.brief = brief
+        self.allow_web = allow_web
+        self.fast = fast
 
     def run(self):
         success, result = GptClient.send_to_gpt(
             self.api_key, self.transcription, engine=self.engine,
             context=self.context, effort=self.effort,
-            max_tokens=self.max_tokens, brief=self.brief)
+            max_tokens=self.max_tokens, brief=self.brief,
+            on_delta=self.query_delta.emit, allow_web=self.allow_web,
+            fast=self.fast)
         self.query_complete.emit(success, result)
 
 

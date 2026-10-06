@@ -211,17 +211,34 @@ def _transcribe_deepgram(api_key, file_path, language, model):
 
 
 def _tag_speakers(words):
-    """Reconstruye texto con marcas <S#> en los cambios de hablante
-    (diarización dentro del carril, para llamadas de varias personas)."""
-    parts = []
-    last = None
+    """Agrupa palabras contiguas por hablante y emite <S#> una vez por
+    segmento. Descarta micro-cambios de 1-2 palabras, habituales como
+    ruido de diarización dentro de una misma frase."""
+    segments = []
     for w in words:
         speaker = w.get("speaker", -1)
-        if speaker != last:
-            parts.append(f"<S{speaker}>")
-            last = speaker
-        parts.append(w.get("punctuated_word", w.get("word", "")))
-    return " ".join(parts)
+        token = w.get("punctuated_word", w.get("word", "")).strip()
+        if not token:
+            continue
+        if segments and segments[-1][0] == speaker:
+            segments[-1][1].append(token)
+        else:
+            segments.append([speaker, [token]])
+
+    merged = []
+    for speaker, tokens in segments:
+        if merged and len(tokens) <= 2 and merged[-1][0] != speaker:
+            merged[-1][1].extend(tokens)
+        elif merged and merged[-1][0] == speaker:
+            merged[-1][1].extend(tokens)
+        else:
+            merged.append([speaker, tokens])
+
+    lines = []
+    for speaker, tokens in merged:
+        text = " ".join(tokens)
+        lines.append(text if speaker < 0 else f"<S{speaker}> {text}")
+    return "\n".join(lines)
 
 
 class DeepgramRealtime:
