@@ -20,6 +20,7 @@ import re
 import ctypes
 import threading
 from collections import deque
+from ctypes import wintypes
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -28,7 +29,10 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
     QPlainTextEdit,
 )
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex, QTimer
+from PySide6.QtCore import (
+    Qt, QThread, Signal, Slot, QMutex, QTimer, QRect,
+    QPropertyAnimation, QEasingCurve,
+)
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QTextCursor, QPalette
 
 import numpy as np
@@ -47,18 +51,28 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
 
-# Hotkeys globales de 2 teclas, vía GetAsyncKeyState — sin admin ni deps.
-# Elegidas porque NO hacen nada en Chrome/Edge/Firefox ni ES-keyboards:
-# Ctrl+Q responder · Ctrl+M auto-GPT · Ctrl+I overlay · Alt+C copiar ·
-# Alt+T start/stop. (Ojo: nunca Ctrl+Alt — AltGr en teclado ES = Ctrl+Alt
-# y escribir «@» dispararía el hotkey.)
+# Hotkeys globales de 2 teclas, vía WH_KEYBOARD_LL (eventos reales de
+# tecla, sin admin ni deps). Elegidas porque NO hacen nada en
+# Chrome/Edge/Firefox ni ES-keyboards:
+# Ctrl+Q responder · Ctrl+M auto-GPT · Ctrl+I panel (único control de
+# visibilidad) · Alt+G enviar a GPT · Alt+T start/stop.
+# (Ojo: nunca Ctrl+Alt — AltGr en teclado ES = Ctrl+Alt y escribir «@»
+# dispararía el hotkey.)
 HOTKEYS = {
-    "ctrl+q": (0x11, 0x51, "answer_last", "responder última intervención"),
-    "ctrl+m": (0x11, 0x4D, "toggle_auto", "auto-GPT on/off"),
-    "ctrl+i": (0x11, 0x49, "toggle_compact", "modo compacto"),
-    "alt+c": (0x12, 0x43, "copy_answer", "copiar última respuesta"),
-    "alt+t": (0x12, 0x54, "toggle_capture", "start/stop transcripción"),
+    "ctrl+q": (0x11, 0x51, "answer_last", "Ctrl+Q · responder última"),
+    "ctrl+m": (0x11, 0x4D, "toggle_auto", "Ctrl+M · auto-GPT"),
+    "ctrl+i": (0x11, 0x49, "toggle_compact", "Ctrl+I · panel"),
+    "alt+g": (0x12, 0x47, "send_gpt", "Alt+G · enviar a GPT"),
+    "alt+t": (0x12, 0x54, "toggle_capture", "Alt+T · start/stop"),
 }
+
+# Controles mantenidos del overlay (se repiten mientras se pulsan):
+# Ctrl+flechas lo mueve por la pantalla · Ctrl+± ajusta su opacidad.
+_ARROW_VK = {0x25: (-1, 0), 0x26: (0, -1), 0x27: (1, 0), 0x28: (0, 1)}
+_PLUS_VK = (0xBB, 0x6B)      # OEM '+' y '+' del teclado numérico
+_MINUS_VK = (0xBD, 0x6D)     # OEM '-' y '-' del teclado numérico
+_OVERLAY_MOVE_STEP = 18
+_OVERLAY_OPACITY_STEP = 0.05
 
 _SPEAKER_TAG_RE = re.compile(r"&lt;S(\d+)&gt;")
 _SPEAKER_COLORS = (
@@ -77,18 +91,67 @@ def _format_transcript_html(text):
     return _SPEAKER_TAG_RE.sub(repl, escaped).replace("\n", "<br>")
 
 
-def _combo_pressed(combo):
-    """True si el combo está activo o se pulsó desde la última consulta
-    (Windows). 0x8001 en la tecla = down ahora | press reciente — un tap
-    dura menos que el poll y solo el bit bajo lo pilla."""
-    if sys.platform != "win32":
-        return False
-    mod_vk, key_vk, _, _ = HOTKEYS[combo]
+def _mod_state_ok(mod_vk):
+    """Modificador exigido y el otro NO pulsado — excluye AltGr
+    (AltGr en teclado ES = Ctrl+Alt, y dispararía ambos)."""
     u32 = ctypes.windll.user32
-    return bool(
-        u32.GetAsyncKeyState(mod_vk) & 0x8000
-        and u32.GetAsyncKeyState(key_vk) & 0x8001
-    )
+    ctrl = bool(u32.GetAsyncKeyState(0x11) & 0x8000)
+    alt = bool(u32.GetAsyncKeyState(0x12) & 0x8000)
+    return (ctrl and not alt) if mod_vk == 0x11 else (alt and not ctrl)
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+_HOOKPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.c_int, wintypes.WPARAM,
+    ctypes.POINTER(KBDLLHOOKSTRUCT))
+
+
+def _install_ll_hook(dispatch):
+    """Hotkeys por EVENTO real de tecla (WH_KEYBOARD_LL).
+
+    El polling de GetAsyncKeyState con el bit 0x0001 («pulsada desde la
+    última llamada») colaba pulsaciones ajenas — teclear «i» y luego
+    Ctrl+C dentro del mismo sondeo disparaba Ctrl+I y el panel aparecía
+    solo. Con el hook cada pulsación llega como evento real: ni taps
+    cortos perdidos ni falsos positivos de Ctrl+C/V. Devuelve
+    (hook_handle, callback) para retener las referencias, o None.
+    """
+    if sys.platform != "win32":
+        return None
+    u32 = ctypes.windll.user32
+    WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+    WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
+    _fired = set()            # combos ya disparados en esta pulsación
+
+    def proc(ncode, wparam, lparam):
+        try:
+            if ncode == 0:
+                if wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    vk = lparam.contents.vkCode
+                    for combo, (mod, key, _, _) in HOTKEYS.items():
+                        if (vk == key and combo not in _fired
+                                and _mod_state_ok(mod)):
+                            _fired.add(combo)
+                            dispatch(combo)
+                elif wparam in (WM_KEYUP, WM_SYSKEYUP):
+                    vk = lparam.contents.vkCode
+                    for combo, (_, key, _, _) in HOTKEYS.items():
+                        if vk == key:
+                            _fired.discard(combo)
+        except Exception:
+            pass
+        return u32.CallNextHookEx(None, ncode, wparam, lparam)
+
+    cb = _HOOKPROC(proc)
+    hook = u32.SetWindowsHookExW(13, cb, None, 0)   # LL hooks: hMod=None
+    if not hook:
+        return None
+    return hook, cb          # guardar refs: sin ellas el GC mata el hook
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +159,19 @@ def _combo_pressed(combo):
 # ---------------------------------------------------------------------------
 
 class CompactOverlay(QWidget):
-    """Mini-panel always-on-top: estado, lo que se está oyendo en vivo y la
-    última respuesta. Arrastrable, semitransparente, sin bordes."""
+    """Mini-panel always-on-top (se muestra/oculta SOLO con Ctrl+I).
+
+    Estado, lo que se oye en vivo y la conversación completa con las
+    respuestas — el visor hace autoscroll y siempre deja lo reciente a
+    la vista. Ctrl+flechas lo mueve por la pantalla, Ctrl+± ajusta la
+    opacidad y la altura crece suave según llega texto de GPT.
+    """
+
+    WIDTH = 460
+    MIN_H = 200
+    MAX_H = 560
+    MIN_OPACITY = 0.30
+    LOG_MAX_BLOCKS = 320          # recorte del historial interno del panel
 
     def __init__(self):
         super().__init__(
@@ -105,8 +179,12 @@ class CompactOverlay(QWidget):
             Qt.Window | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint,
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(460, 190)
+        self.resize(self.WIDTH, 240)
         self._drag_pos = None
+        self._listening = False
+        self._opacity = 0.96
+        self.setWindowOpacity(self._opacity)
+        self._gpt_anchors = {}     # thread -> {"start","end","header"}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
@@ -131,31 +209,157 @@ class CompactOverlay(QWidget):
         self.live_label.setMaximumHeight(34)
         panel_layout.addWidget(self.live_label)
 
-        self.answer_box = QTextEdit()
-        self.answer_box.setReadOnly(True)
-        self.answer_box.setPlaceholderText("última respuesta…")
-        panel_layout.addWidget(self.answer_box, 1)
+        self.convo_box = QTextEdit()
+        self.convo_box.setReadOnly(True)
+        self.convo_box.setPlaceholderText("conversación y respuestas…")
+        panel_layout.addWidget(self.convo_box, 1)
 
-        legend = QLabel("Ctrl+Q responder · Ctrl+M auto · Ctrl+I dock · Alt+C copiar · Alt+T start/stop")
+        legend = QLabel(
+            "Ctrl+Q responder · Alt+G enviar · Ctrl+M auto · Alt+T start/stop "
+            "· Ctrl+←↑→↓ mover · Ctrl+± opacidad · Ctrl+I ocultar")
+        legend.setWordWrap(True)
         legend.setStyleSheet("color: #777; font-size: 10px;")
         panel_layout.addWidget(legend)
 
         root.addWidget(panel)
 
+        self._ack_timer = QTimer(self)
+        self._ack_timer.setSingleShot(True)
+        self._ack_timer.timeout.connect(self._restore_status)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._resize_to_content)
+
+    # ------------------------- estado / ACKs -------------------------
+
+    def _restore_status(self):
+        color = "#5ee07a" if self._listening else "#9a9a9a"
+        text = "● escuchando" if self._listening else "● en espera"
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
     def set_listening(self, listening):
-        self.status_label.setText(
-            "● escuchando" if listening else "● en espera")
-        self.status_label.setStyleSheet(
-            f"color: {'#5ee07a' if listening else '#9a9a9a'}; font-size: 11px;")
+        self._listening = listening
+        if not self._ack_timer.isActive():
+            self._restore_status()
+
+    def ack(self, text):
+        """Flash de confirmación en la línea de estado (~1.4 s): cada
+        comando recibido deja constancia visible de que entró."""
+        self.status_label.setText(f"✓ {text}")
+        self.status_label.setStyleSheet("color: #ffd166; font-size: 11px;")
+        self._ack_timer.start(1400)
+
+    # ------------------------- conversación --------------------------
 
     def set_live(self, text):
-        self.live_label.setText(text[-180:])
+        self.live_label.setText(text[-180:] if text else "")
 
-    def set_answer(self, text):
-        self.answer_box.setPlainText(text)
-        cur = self.answer_box.textCursor()
+    def _scroll_bottom(self):
+        """Autoscroll: lo último siempre visible sin tocar la rueda."""
+        bar = self.convo_box.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _trim_log(self):
+        doc = self.convo_box.document()
+        excess = doc.blockCount() - self.LOG_MAX_BLOCKS
+        if excess <= 0:
+            return
+        cur = QTextCursor(doc)
         cur.movePosition(QTextCursor.MoveOperation.Start)
-        self.answer_box.setTextCursor(cur)
+        cur.movePosition(QTextCursor.MoveOperation.Down,
+                         QTextCursor.MoveMode.KeepAnchor, excess)
+        cur.removeSelectedText()
+
+    def add_line(self, tag, text, color):
+        safe = html.escape(text, quote=False).replace("\n", "<br>")
+        self.convo_box.append(
+            f'<b style="color:{color}">{html.escape(tag)}</b> '
+            f'<span style="color:#f2f2f2">{safe}</span>')
+        self._trim_log()
+        self._scroll_bottom()
+        self._schedule_resize()
+
+    def add_transcript(self, lane, text):
+        color = "#7ee2a8" if lane == "Tú" else "#9ecbff"
+        self.add_line(f"{lane}:", text, color)
+
+    def add_note(self, text):
+        self.convo_box.append(
+            f'<span style="color:#888;font-style:italic">'
+            f'{html.escape(text, quote=False)}</span>')
+        self._scroll_bottom()
+
+    def gpt_update(self, thread, text, header=None):
+        """Bloque GPT editable en el log: el streaming reescribe el mismo
+        bloque (no acumula líneas) y el panel crece con él."""
+        cur = self.convo_box.textCursor()
+        entry = self._gpt_anchors.get(thread)
+        if entry is None:
+            cur.movePosition(QTextCursor.MoveOperation.End)
+            if self.convo_box.document().characterCount() > 1:
+                cur.insertText("\n\n")
+            entry = {"start": cur.position(), "end": cur.position(),
+                     "header": header or "▸ GPT"}
+            self._gpt_anchors[thread] = entry
+        if header:
+            entry["header"] = header
+        cur.setPosition(entry["start"])
+        cur.setPosition(entry["end"], QTextCursor.MoveMode.KeepAnchor)
+        cur.removeSelectedText()
+        body = html.escape(text, quote=False).replace("\n", "<br>")
+        cur.insertHtml(
+            f'<b style="color:#ffd166">'
+            f'{html.escape(entry["header"], quote=False)}</b><br>'
+            f'<span style="color:#f2f2f2">{body}</span>')
+        new_end = cur.position()
+        shift = new_end - entry["end"]
+        entry["end"] = new_end
+        if shift:
+            for other, e in self._gpt_anchors.items():
+                if other is not thread and e["start"] > entry["start"]:
+                    e["start"] += shift
+                    e["end"] += shift
+        self._trim_log()
+        self._scroll_bottom()
+        self._schedule_resize()
+
+    def clear_log(self):
+        self.convo_box.clear()
+        self._gpt_anchors.clear()
+
+    # --------------------- tamaño / opacidad / posición ------------------
+
+    def _schedule_resize(self):
+        if not self._resize_timer.isActive():
+            self._resize_timer.start(120)
+
+    def _resize_to_content(self):
+        """Altura objetivo según el contenido del visor (cap en MAX_H)."""
+        doc_h = self.convo_box.document().size().height()
+        chrome = 120           # estado + en vivo + leyenda + márgenes
+        desired_convo = min(doc_h + 16, 410)
+        target = int(max(self.MIN_H, min(chrome + desired_convo, self.MAX_H)))
+        if abs(target - self.height()) < 8:
+            return
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(240)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(QRect(self.x(), self.y(), self.width(), target))
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def nudge(self, dx, dy):
+        screen = self.screen().availableGeometry()
+        x = min(max(self.x() + dx, screen.left() - self.width() + 60),
+                screen.right() - 60)
+        y = min(max(self.y() + dy, screen.top()), screen.bottom() - 40)
+        self.move(x, y)
+
+    def adjust_opacity(self, delta):
+        self._opacity = min(1.0, max(self.MIN_OPACITY, self._opacity + delta))
+        self.setWindowOpacity(self._opacity)
+        self.ack(f"opacidad {int(self._opacity * 100)} %")
 
     # arrastrar la ventana sin barra de título
     def mousePressEvent(self, e):
@@ -168,9 +372,41 @@ class CompactOverlay(QWidget):
 
     def mouseReleaseEvent(self, e):
         self._drag_pos = None
+    # Sin doble clic: la visibilidad solo la cambia Ctrl+I.
 
-    def mouseDoubleClickEvent(self, e):
-        self.hide()                       # doble clic = cerrar overlay
+
+class AckToast(QWidget):
+    """Píldora flotante para confirmar comandos cuando el panel está
+    oculto: todo hotkey deja constancia visible aunque nada más se vea."""
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.Window | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint
+            | Qt.Tool | Qt.WindowDoesNotAcceptFocus,
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel()
+        self.label.setStyleSheet(
+            "background: rgba(18,18,22,235); color: #ffd166;"
+            "border-radius: 12px; padding: 8px 16px; font-size: 13px;")
+        layout.addWidget(self.label)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+
+    def show_ack(self, text):
+        self.label.setText(f"✓ {text}")
+        self.adjustSize()
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(screen.center().x() - self.width() // 2,
+                  screen.top() + 36)
+        self.show()
+        self.raise_()
+        self._timer.start(1300)
 
 
 def _load_settings():
@@ -461,23 +697,14 @@ class GptResponseDialog(QDialog):
         layout.addWidget(splitter)
 
         button_layout = QHBoxLayout()
-        self.copy_button = QPushButton("Copiar respuesta")
-        self.copy_button.clicked.connect(self.copy_response)
         self.save_button = QPushButton("Guardar respuesta")
         self.save_button.clicked.connect(self.save_response)
         self.close_button = QPushButton("Cerrar")
         self.close_button.clicked.connect(self.accept)
-        button_layout.addWidget(self.copy_button)
         button_layout.addWidget(self.save_button)
         button_layout.addStretch()
         button_layout.addWidget(self.close_button)
         layout.addLayout(button_layout)
-
-    def copy_response(self):
-        text = self.response_text.toPlainText()
-        if text:
-            QApplication.clipboard().setText(text)
-            QMessageBox.information(self, "Información", "Respuesta copiada al portapapeles")
 
     def save_response(self):
         text = self.response_text.toPlainText()
@@ -815,20 +1042,21 @@ class WhisperApp(QMainWindow):
         self._live_buffers = {}           # carril -> texto parcial acumulado
         self._gate_pending = set()        # carriles con gate clef en vuelo
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
-        self._last_answer = ""            # para Alt+C (copiar respuesta)
-        self._hk_prev = set()             # hotkeys actualmente pulsados
 
         self.init_ui()
         self.overlay = CompactOverlay()
+        self.toast = AckToast()
         self.realtime_text.connect(self._append_transcript)
         self.realtime_error.connect(self.handle_continuous_error)
         self.gate_fired.connect(self._on_gate_fired)
         self._apply_settings()
 
-        # poll de hotkeys globales 30 ms: una pulsación de F-key dura
-        # ~40-60 ms, con 90 ms se escapaban toques entre sondeos.
+        # Comandos por hook de teclado (eventos reales, sin falsos
+        # positivos); el poll de 30 ms solo queda para los controles
+        # mantenidos del panel (mover/opacidad).
+        self._ll_hook = _install_ll_hook(self._dispatch_hotkey)
         self._hk_timer = QTimer(self)
-        self._hk_timer.timeout.connect(self._hotkey_tick)
+        self._hk_timer.timeout.connect(self._overlay_keys_tick)
         self._hk_timer.start(30)
 
     # ------------------------- construcción de UI -------------------------
@@ -937,6 +1165,13 @@ class WhisperApp(QMainWindow):
         manual_layout.addWidget(self.transcribe_button)
         self.auto_gpt_checkbox = QCheckBox("Responder con GPT automáticamente")
         manual_layout.addWidget(self.auto_gpt_checkbox)
+        self.manual_gpt_checkbox = QCheckBox("GPT solo bajo demanda")
+        self.manual_gpt_checkbox.setToolTip(
+            "Nada se envía a GPT salvo orden tuya: botón «Enviar a GPT», "
+            "Ctrl+Q o Alt+G. Con esto activo el modo automático queda "
+            "apagado y deshabilitado.")
+        self.manual_gpt_checkbox.toggled.connect(self._on_manual_only_changed)
+        manual_layout.addWidget(self.manual_gpt_checkbox)
         self.diarize_checkbox = QCheckBox("Diarizar (panel)")
         self.diarize_checkbox.setToolTip(
             "Deepgram nova-3: etiqueta voces distintas dentro del mismo carril "
@@ -1012,6 +1247,8 @@ class WhisperApp(QMainWindow):
         self.save_button.clicked.connect(self.save_text)
         self.clear_button.clicked.connect(self.clear_text)
         self.pin_button.clicked.connect(self.pin_selection)
+        hk_hint = QLabel("Ctrl+I panel oculto · Alt+G / Ctrl+Q enviar a GPT")
+        hk_hint.setStyleSheet("color: #888; font-size: 11px;")
         self.send_to_gpt_button = QPushButton("Enviar a GPT")
         self.send_to_gpt_button.setStyleSheet(
             "QPushButton { background-color: #6a0dad; color: white; }"
@@ -1019,17 +1256,11 @@ class WhisperApp(QMainWindow):
         )
         self.send_to_gpt_button.setMinimumHeight(30)
         self.send_to_gpt_button.clicked.connect(self.send_to_gpt)
-        self.compact_button = QPushButton("Modo compacto")
-        self.compact_button.setToolTip(
-            "Panel pequeño siempre encima (Ctrl+I): estado, lo que se "
-            "oye en vivo y la última respuesta — para tenerlo anclado sobre "
-            "la llamada sin la ventana entera.")
-        self.compact_button.clicked.connect(self.toggle_compact)
         text_buttons.addWidget(self.copy_button)
         text_buttons.addWidget(self.save_button)
         text_buttons.addWidget(self.clear_button)
         text_buttons.addWidget(self.pin_button)
-        text_buttons.addWidget(self.compact_button)
+        text_buttons.addWidget(hk_hint)
         text_buttons.addStretch()
         self.gpt_engine_combo = QComboBox()
         self.gpt_engine_combo.addItem("API OpenAI", "openai")
@@ -1102,6 +1333,8 @@ class WhisperApp(QMainWindow):
         self.keyterms_input.setText(s.get("dg_keyterms", ""))
         self.diarize_checkbox.setChecked(bool(s.get("dg_diarize")))
         self.brief_input.setPlainText(s.get("interview_brief", ""))
+        # Por defecto envío a GPT SOLO manual: el usuario decide cuándo.
+        self.manual_gpt_checkbox.setChecked(s.get("manual_gpt_only", True))
 
     def _persist_settings(self):
         _save_settings({
@@ -1113,7 +1346,14 @@ class WhisperApp(QMainWindow):
             "dg_keyterms": self.keyterms_input.text().strip(),
             "dg_diarize": self.diarize_checkbox.isChecked(),
             "interview_brief": self.brief_input.toPlainText().strip(),
+            "manual_gpt_only": self.manual_gpt_checkbox.isChecked(),
         })
+
+    def _on_manual_only_changed(self, on):
+        """Modo manual: el envío a GPT solo ocurre bajo orden explícita."""
+        self.auto_gpt_checkbox.setEnabled(not on)
+        if on:
+            self.auto_gpt_checkbox.setChecked(False)
 
     # ------------------------- proveedor / api key -------------------------
 
@@ -1360,50 +1600,80 @@ class WhisperApp(QMainWindow):
 
     # ------------------------- hotkeys globales / overlay ------------------
 
-    def _hotkey_tick(self):
-        """Detecta flancos de subida de cada combo y despacha."""
-        for combo, (_, _, action, _) in HOTKEYS.items():
-            down = _combo_pressed(combo)
-            if down and combo not in self._hk_prev:
-                self._hk_prev.add(combo)
-                getattr(self, "_hk_" + action)()
-            elif not down:
-                self._hk_prev.discard(combo)
+    def _dispatch_hotkey(self, combo):
+        getattr(self, "_hk_" + HOTKEYS[combo][2])()
+
+    def _overlay_keys_tick(self):
+        """Ctrl+flechas = mover panel · Ctrl+± = opacidad. Órdenes dirigidas
+        al panel: solo actúan cuando está visible."""
+        if sys.platform != "win32" or not self.overlay.isVisible():
+            return
+        u32 = ctypes.windll.user32
+        if (not u32.GetAsyncKeyState(0x11) & 0x8000
+                or u32.GetAsyncKeyState(0x12) & 0x8000):
+            return
+        for vk, (dx, dy) in _ARROW_VK.items():
+            if u32.GetAsyncKeyState(vk) & 0x8000:
+                self.overlay.nudge(
+                    dx * _OVERLAY_MOVE_STEP, dy * _OVERLAY_MOVE_STEP)
+        for vk in _PLUS_VK:
+            if u32.GetAsyncKeyState(vk) & 0x8000:
+                self.overlay.adjust_opacity(_OVERLAY_OPACITY_STEP)
+                break
+        for vk in _MINUS_VK:
+            if u32.GetAsyncKeyState(vk) & 0x8000:
+                self.overlay.adjust_opacity(-_OVERLAY_OPACITY_STEP)
+                break
+
+    def _ack(self, text):
+        """Constancia de que el comando entró: flash en el panel si está
+        visible; si está oculto, un toast flotante; siempre en status bar."""
+        self.status_bar.showMessage(text)
+        if self.overlay.isVisible():
+            self.overlay.ack(text)
+        else:
+            self.toast.show_ack(text)
 
     def _hk_answer_last(self):
         """Rescate: responder la última intervención del entrevistador aunque
         el gate no la haya pillado."""
+        self._ack("Ctrl+Q · responder última intervención")
         last = next((x for x in reversed(self._ctx)
                      if not x.startswith("Tú:")), None)
         if not last:
-            self.status_bar.showMessage("Nada que responder todavía")
+            self._ack("Ctrl+Q · nada que responder todavía")
             return
         text = last.split(":", 1)[1].strip() if ":" in last else last
         self._fire_gpt(text, "Entrevistador", kind="Manual",
                        effort=self._review_effort("medium"))
 
     def _hk_toggle_compact(self):
-        self.toggle_compact()
-
-    def _hk_toggle_auto(self):
-        self.auto_gpt_checkbox.toggle()
-        self.status_bar.showMessage(
-            f"Auto-GPT {'ON' if self.auto_gpt_checkbox.isChecked() else 'OFF'}")
-
-    def _hk_copy_answer(self):
-        if self._last_answer:
-            QApplication.clipboard().setText(self._last_answer)
-            self.status_bar.showMessage("Última respuesta copiada")
-
-    def _hk_toggle_capture(self):
-        self.toggle_continuous_mode()
-
-    def toggle_compact(self):
+        """Ctrl+I — ÚNICO control de visibilidad del panel."""
         if self.overlay.isVisible():
-            self.overlay.hide()
+            self.overlay.ack("Ctrl+I · ocultando panel…")
+            QTimer.singleShot(450, self.overlay.hide)
         else:
             self.overlay.set_listening(self.is_continuous_mode)
             self.overlay.show()
+            self.overlay.raise_()
+            self.overlay.ack("Ctrl+I · panel visible")
+
+    def _hk_toggle_auto(self):
+        if self.manual_gpt_checkbox.isChecked():
+            self._ack("Ctrl+M · auto-GPT bloqueado (modo manual activo)")
+            return
+        self.auto_gpt_checkbox.toggle()
+        self._ack(
+            f"Ctrl+M · auto-GPT {'ON' if self.auto_gpt_checkbox.isChecked() else 'OFF'}")
+
+    def _hk_send_gpt(self):
+        self._ack("Alt+G · enviando a GPT…")
+        self.send_to_gpt()
+
+    def _hk_toggle_capture(self):
+        self._ack("Alt+T · iniciando…" if not self.is_continuous_mode
+                  else "Alt+T · deteniendo…")
+        self.toggle_continuous_mode()
 
     @Slot(str, bool, str)
     def _append_transcript(self, text, is_final, lane=""):
@@ -1543,6 +1813,7 @@ class WhisperApp(QMainWindow):
             self.you_output.append(_format_transcript_html(text))
         else:
             self.interviewer_output.append(_format_transcript_html(text))
+        self.overlay.add_transcript(lane, text)
 
         if not text.strip():
             return
@@ -1607,6 +1878,7 @@ class WhisperApp(QMainWindow):
 
         header = f"[{kind}] {gpt_input}" if kind else gpt_input
         self._begin_gpt_stream(thread, header)
+        self.overlay.gpt_update(thread, "…", header=header)
         self._gpt_threads.append(thread)
         if hasattr(thread, "query_delta"):
             thread.query_delta.connect(
@@ -1648,7 +1920,7 @@ class WhisperApp(QMainWindow):
                     other_entry["end"] += shift
         bar = self.gpt_output.verticalScrollBar()
         bar.setValue(bar.maximum())
-        self.overlay.set_answer(f'{entry["header"]}\n{text}')
+        self.overlay.gpt_update(thread, text)
 
     def _finish_gpt_stream(self, thread, text):
         self._update_gpt_stream(thread, text)
@@ -1656,18 +1928,18 @@ class WhisperApp(QMainWindow):
 
     def _on_auto_gpt_result(self, success, result, header="", thread=None):
         if success:
-            self._last_answer = result
             block = f"{header}\n{result}" if header else result
             if thread in self._gpt_streams:
                 self._finish_gpt_stream(thread, result)
             else:
                 self.gpt_output.append(block)
                 self.gpt_output.append("")
-            self.overlay.set_answer(block)
+            self.overlay.gpt_update(thread, result)
             self.status_bar.showMessage("Respuesta GPT recibida")
         else:
             if thread in self._gpt_streams:
                 self._finish_gpt_stream(thread, f"Error: {result}")
+            self.overlay.gpt_update(thread, f"Error: {result}")
             self.status_bar.showMessage(f"GPT: {result}")
 
     def handle_continuous_error(self, error_msg):
@@ -1735,6 +2007,7 @@ class WhisperApp(QMainWindow):
         self._ctx.clear()            # estado oculto no sobrevive al «Limpiar»
         self._draft_state.clear()
         self._pinned.clear()
+        self.overlay.clear_log()
         self.status_bar.showMessage("Transcripción y contexto borrados")
 
     def send_to_gpt(self):
@@ -1763,33 +2036,38 @@ class WhisperApp(QMainWindow):
 
         header = "[Manual] " + transcription.replace("\n", " ")[:120]
         self._begin_gpt_stream(thread, header)
+        self.overlay.gpt_update(thread, "…", header=header)
         if hasattr(thread, "query_delta"):
             thread.query_delta.connect(
                 lambda txt, t=thread: self._update_gpt_stream(t, txt))
-        self.gpt_thread = thread
-        self.gpt_thread.query_complete.connect(
+        self._gpt_threads.append(thread)
+        thread.query_complete.connect(
             lambda ok, res, t=thread:
             self._handle_gpt_response(ok, res, t))
+        thread.query_complete.connect(
+            lambda *a, t=thread: self._gpt_threads.remove(t))
         self.send_to_gpt_button.setEnabled(False)
         self.status_bar.showMessage("Enviando a GPT\u2026")
-        self.gpt_thread.start()
+        thread.start()
 
     def _handle_gpt_response(self, success, result, thread):
         self.send_to_gpt_button.setEnabled(True)
         if success:
-            self._last_answer = result
             self._finish_gpt_stream(thread, result)
-            self.overlay.set_answer(result)
+            self.overlay.gpt_update(thread, result)
             self.status_bar.showMessage("Respuesta GPT recibida")
         else:
             if thread in self._gpt_streams:
                 self._finish_gpt_stream(thread, f"Error: {result}")
+            self.overlay.gpt_update(thread, f"Error: {result}")
             self.status_bar.showMessage(f"Error de GPT: {result}")
 
     # ------------------------- cierre -------------------------
 
     def closeEvent(self, event):
         try:
+            if getattr(self, "_ll_hook", None):
+                ctypes.windll.user32.UnhookWindowsHookEx(self._ll_hook[0])
             self._retire_thread(self.capture_thread)
             for rt in self.realtimes.values():
                 try:

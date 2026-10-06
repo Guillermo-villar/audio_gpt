@@ -40,15 +40,20 @@ con varios hablantes.
       a la izquierda y "Tú (micro)" (tu voz) a la derecha.
 - [ ] Diarización: con varias voces, aparecen etiquetas de speaker distintas
       dentro del panel Entrevistador.
-- [ ] Modo compacto: `Ctrl+I` abre el overlay siempre encima (arrastrable,
-      doble-clic oculta). Repítelo para cerrar.
+- [ ] Panel oculto: `Ctrl+I` es el ÚNICO control de visibilidad (no hay
+      botón ni doble-clic). El panel muestra la conversación con autoscroll,
+      se mueve con `Ctrl+flechas`, cambia de opacidad con `Ctrl+±` y crece
+      suave con el texto de GPT. Cada hotkey deja un ACK visible.
 - [ ] Hotkeys con otra ventana enfocada (ej. el navegador):
-      `Ctrl+M` conmuta auto-GPT (status bar dice ON/OFF),
+      `Ctrl+M` conmuta auto-GPT (bloqueado si «GPT solo bajo demanda»),
       `Ctrl+Q` responde la última intervención,
-      `Alt+C` copia la última respuesta al portapapeles,
+      `Alt+G` envía el transcript a GPT,
       `Alt+T` start/stop de la captura.
-- [ ] Auto-GPT ON: al oír una pregunta sale un "[Borrador]" rápido y luego
-      una "[Revisión]" más completa en el panel de respuestas.
+      La respuesta de GPT NUNCA se copia sola al portapapeles.
+- [ ] «GPT solo bajo demanda» ON (por defecto): nada se envía a GPT hasta
+      que lo ordenas con botón/Ctrl+Q/Alt+G. Al apagarlo, auto-GPT ON: al
+      oír una pregunta sale un "[Borrador]" rápido y luego una
+      "[Revisión]" más completa en el panel de respuestas.
 - [ ] Brief: escribe algo en "Brief de la entrevista" y comprueba que las
       respuestas se adaptan a ese contexto (menciona tu puesto/experiencia).
 - [ ] Fijar: selecciona una línea del transcript, pulsa Fijar; en la

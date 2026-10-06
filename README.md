@@ -85,14 +85,21 @@ MIT.
 
 ## Uso durante la llamada (modo copiloto)
 
-- **Modo compacto** (botón o `Ctrl+I`): panel semitransparente siempre
-  encima — estado, lo que se oye en vivo y la última respuesta. Anclable
-  sobre cualquier ventana; doble clic para ocultarlo.
+- **Panel oculto** (`Ctrl+I`, único control de visibilidad): panel
+  semitransparente siempre encima — estado, lo que se oye en vivo y la
+  conversación con las respuestas (autoscroll a lo reciente). Crece suave
+  con el texto que llega de GPT. `Ctrl+flechas` lo mueve por la pantalla,
+  `Ctrl+±` ajusta su opacidad y también se arrastra con el ratón.
 - **Hotkeys globales** (2 teclas, funcionan con otra app enfocada — elegidas
-  para no interferir con el navegador):
+  para no interferir con el navegador). Cada comando deja constancia
+  visible (flash en el panel o toast flotante):
   `Ctrl+Q` responder la última intervención del entrevistador ·
-  `Ctrl+M` auto-GPT on/off · `Ctrl+I` overlay · `Alt+C` copiar última
-  respuesta · `Alt+T` start/stop transcripción.
+  `Alt+G` enviar el transcript a GPT · `Ctrl+M` auto-GPT on/off ·
+  `Ctrl+I` panel · `Alt+T` start/stop transcripción.
+  Las respuestas de GPT nunca se copian solas al portapapeles.
+- **GPT solo bajo demanda** (toggle, activo por defecto): nada se envía
+  a GPT salvo orden explícita (botón «Enviar a GPT», `Ctrl+Q` o `Alt+G`);
+  el modo automático queda deshabilitado.
 - **Gate con clef-flash**: si hay credenciales de Cloudflare, cada
   intervención se evalúa con `@cf/cloudflare/clef-flash` (9B, gratis en
   neuronas, ~0.3s) — mejor precisión que la heurística de palabras clave,
