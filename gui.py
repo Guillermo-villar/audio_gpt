@@ -15,6 +15,7 @@ import time
 import queue
 import uuid
 import json
+import math
 import html
 import re
 import ctypes
@@ -193,7 +194,6 @@ def _install_ll_hook(dispatch):
 
 
 def render_markdown(doc, text):
-    doc.setDefaultFont(QFont("Segoe UI", 10))
     doc.setDefaultStyleSheet(
         "body { color: #d4d6d9; font-size: 13px; }"
         "a { color: #8ab4f8; }"
@@ -257,7 +257,41 @@ def render_markdown(doc, text):
         block = block.next()
 
 
+class _AutoHeightBrowser(QTextBrowser):
+    height_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._recomputing_height = False
+        self.document().documentLayout().documentSizeChanged.connect(
+            self.recompute_height)
+
+    def recompute_height(self, *_):
+        if self._recomputing_height:
+            return
+        self._recomputing_height = True
+        try:
+            margins = self.contentsMargins()
+            height = (
+                math.ceil(self.document().documentLayout().documentSize().height())
+                + margins.top() + margins.bottom()
+                + 2 * self.frameWidth() + 2
+            )
+            if self.height() != height:
+                self.setFixedHeight(height)
+                self.height_changed.emit()
+        finally:
+            self._recomputing_height = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.document().setTextWidth(self.viewport().width())
+        self.recompute_height()
+
+
 class AnswerCard(QFrame):
+    content_changed = Signal()
+
     def __init__(self, kind, model_label, question, parent=None):
         super().__init__(parent)
         self.kind = kind
@@ -299,7 +333,8 @@ class AnswerCard(QFrame):
         self.question_label.setStyleSheet(
             "color: #9aa0a6; font-style: italic; font-size: 10px;")
         layout.addWidget(self.question_label)
-        self.body = QTextBrowser()
+        self.body = _AutoHeightBrowser()
+        self.body.setFont(QFont("Segoe UI", 10))
         self.body.setReadOnly(True)
         self.body.setOpenExternalLinks(False)
         self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -307,6 +342,7 @@ class AnswerCard(QFrame):
         self.body.setFrameShape(QFrame.NoFrame)
         self.body.setStyleSheet("QTextBrowser { background: transparent; border: none; }")
         self.body.document().setDocumentMargin(0)
+        self.body.height_changed.connect(self._body_height_changed)
         layout.addWidget(self.body)
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._refresh_elapsed)
@@ -366,14 +402,13 @@ class AnswerCard(QFrame):
             self.body.document().setDefaultStyleSheet(
                 "body { color: #e57373; font-size: 13px; }")
         self._last_render = time.monotonic()
-        self._resize_body()
-
-    def _resize_body(self):
-        width = max(40, self.body.viewport().width())
-        self.body.document().setTextWidth(width)
-        height = int(self.body.document().size().height()) + 6
-        self.body.setFixedHeight(max(24, height))
+        self.body.recompute_height()
         self.updateGeometry()
+        self.content_changed.emit()
+
+    def _body_height_changed(self):
+        self.updateGeometry()
+        self.content_changed.emit()
 
     def has_code_block(self):
         return bool(re.search(r"```[^\n]*\n", self.text))
@@ -383,11 +418,6 @@ class AnswerCard(QFrame):
         return max(
             (len(line) for block in blocks for line in block.splitlines()),
             default=0)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._resize_body()
-
 
 class AnswerFeed(QScrollArea):
     content_changed = Signal()
@@ -413,6 +443,7 @@ class AnswerFeed(QScrollArea):
         self._by_key = {}
         self._anchor = None
         self._setting_scroll = False
+        self._content_change_pending = False
         self.verticalScrollBar().actionTriggered.connect(
             self._release_anchor)
         self.verticalScrollBar().sliderPressed.connect(
@@ -420,6 +451,7 @@ class AnswerFeed(QScrollArea):
 
     def start(self, key, kind, model_label, question):
         card = AnswerCard(kind, model_label, question, self.container)
+        card.content_changed.connect(self._schedule_content_changed)
         self._cards.append((key, card))
         self._by_key[key] = card
         self.layout.insertWidget(self.layout.count() - 1, card)
@@ -429,16 +461,14 @@ class AnswerFeed(QScrollArea):
             old_card.setParent(None)
             old_card.deleteLater()
         self._anchor = card
-        QTimer.singleShot(0, self._apply_anchor)
-        self.content_changed.emit()
+        self._schedule_content_changed()
         return card
 
     def update(self, key, text):
         card = self._by_key.get(key)
         if card:
             card.set_stream_text(text)
-            self.content_changed.emit()
-            QTimer.singleShot(0, self._apply_anchor)
+            self._schedule_content_changed()
 
     def status(self, key, text):
         card = self._by_key.get(key)
@@ -449,8 +479,7 @@ class AnswerFeed(QScrollArea):
         card = self._by_key.get(key)
         if card:
             card.set_stream_text(text, final=True, ok=ok)
-            self.content_changed.emit()
-            QTimer.singleShot(0, self._apply_anchor)
+            self._schedule_content_changed()
 
     def clear(self):
         for _, card in self._cards:
@@ -459,10 +488,22 @@ class AnswerFeed(QScrollArea):
         self._cards.clear()
         self._by_key.clear()
         self._anchor = None
-        self.content_changed.emit()
+        self._schedule_content_changed()
 
     def content_height(self):
         return self.container.sizeHint().height()
+
+    def _schedule_content_changed(self):
+        if self._content_change_pending:
+            return
+        self._content_change_pending = True
+        QTimer.singleShot(0, self._emit_content_changed)
+
+    def _emit_content_changed(self):
+        self._content_change_pending = False
+        self.container.updateGeometry()
+        self.content_changed.emit()
+        QTimer.singleShot(0, self._apply_anchor)
 
     def _release_anchor(self, *_):
         if not self._setting_scroll:
@@ -623,7 +664,12 @@ class CompactOverlay(QWidget):
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry()
         max_height = int(available.height() * 0.85)
-        chrome = 164
+        if self.isVisible() and self.feed.height() > 0:
+            chrome = self.height() - self.feed.height()
+        else:
+            chrome = (
+                self.layout().sizeHint().height()
+                - self.feed.sizeHint().height())
         target_height = int(max(
             self.MIN_H, min(chrome + self.feed.content_height(), max_height)))
         self.feed.setMaximumHeight(max(32, target_height - chrome))
@@ -2126,7 +2172,8 @@ class WhisperApp(QMainWindow):
                 openai_key, question, previous, context, mine, brief,
                 effort=effort)
 
-        model_label = model + " · web"
+        model_label = model + (
+            " · web" if config.get("smart_web_search", True) else "")
         self._start_answer(
             thread, "Más a fondo", model_label, question, context,
             parent=target["key"])
