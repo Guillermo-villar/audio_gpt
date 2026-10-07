@@ -1,6 +1,8 @@
 # 🎙️ audio_gpt
 
-Aplicación de escritorio para **Windows** que graba el **audio del sistema** (reuniones, vídeos, llamadas) o el micrófono, lo **transcribe en directo** y, opcionalmente, envía cada fragmento a un **LLM** para obtener respuestas automáticas — pensada como copiloto para entrevistas técnicas, clases y reuniones.
+Aplicación de escritorio para **Windows y macOS** que graba el **audio del sistema** (reuniones, vídeos, llamadas) o el micrófono, lo **transcribe en directo** y, opcionalmente, envía cada fragmento a un **LLM** para obtener respuestas automáticas — pensada como copiloto para entrevistas técnicas, clases y reuniones.
+
+> 🍎 **¿Mac?** Instalación para gente no técnica en **[INSTALAR_MAC.md](INSTALAR_MAC.md)** (.dmg + permisos paso a paso).
 
 ## ✨ Qué hay de nuevo (v2)
 

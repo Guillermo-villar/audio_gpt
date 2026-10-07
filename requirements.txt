@@ -3,11 +3,22 @@ soundfile
 numpy
 PySide6
 openai>=1.99
-comtypes
-pycaw
-soundcard          # loopback WASAPI: graba el audio del sistema sin VB-Cable
+python-dotenv
 webrtcvad-wheels   # detección de voz para segmentar por turnos de habla
 websocket-client   # sesiones de transcripción de la Realtime API
-python-dotenv
 websockets         # meet_split: servidor ws para audio por asistente (Meet PoC)
+
+# --- solo Windows ---
+comtypes; sys_platform == "win32"
+pycaw; sys_platform == "win32"
+soundcard; sys_platform == "win32"   # loopback WASAPI: graba el audio del sistema sin VB-Cable
+
+# --- solo macOS ---
+pyobjc-framework-Cocoa; sys_platform == "darwin"            # NSWindow (exclusión de captura, overlay)
+pyobjc-framework-Quartz; sys_platform == "darwin"           # CGEventTap (hotkeys globales)
+pyobjc-framework-ScreenCaptureKit; sys_platform == "darwin" # audio del sistema sin drivers
+pyobjc-framework-CoreMedia; sys_platform == "darwin"        # CMSampleBuffer -> PCM
+pyobjc-framework-ApplicationServices; sys_platform == "darwin"  # permiso de Accesibilidad
+pyobjc-framework-libdispatch; sys_platform == "darwin"      # colas para SCStream
+
 # faster-whisper   # opcional: transcripción local gratuita (pip install faster-whisper)

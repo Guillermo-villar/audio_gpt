@@ -17,3 +17,10 @@ _ui_demo.py
 _smart_probe.py
 
 meet_split/out/
+
+# macOS
+.venv-*/
+build/
+dist/
+*.dmg
+.transcripts/
