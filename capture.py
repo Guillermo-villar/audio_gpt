@@ -4,9 +4,15 @@ En Windows se usa el loopback WASAPI vía `soundcard`, que permite grabar
 directamente lo que suena por el altavoz/auriculares — sin instalar
 VB-Cable ni cambiar el dispositivo de salida predeterminado.
 
+En macOS se usa ScreenCaptureKit (macOS 13+) vía `capture_mac`, que
+captura la mezcla de audio del sistema sin drivers; como respaldo sirve
+un dispositivo virtual (BlackHole) seleccionado como entrada.
+
 `sounddevice` queda como respaldo para micrófono y para equipos donde
 soundcard no esté disponible.
 """
+
+import sys
 
 import numpy as np
 
@@ -22,9 +28,51 @@ import sounddevice as sd
 DEFAULT_SAMPLERATE = 48000
 
 
+def make_loopback_recorder(samplerate=DEFAULT_SAMPLERATE, channels=2,
+                           block_ms=100):
+    """Grabador del audio del sistema según la plataforma.
+
+    Windows: LoopbackRecorder (WASAPI). macOS: SystemAudioRecorder
+    (ScreenCaptureKit). Ambos exponen start()/read()/blocks()/close()
+    y devuelven float32 a `samplerate` Hz con `channels` canales.
+    """
+    if sys.platform == "darwin":
+        import capture_mac
+        return capture_mac.SystemAudioRecorder(
+            samplerate=samplerate, channels=channels, block_ms=block_ms)
+    return LoopbackRecorder(samplerate=samplerate, channels=channels,
+                            block_ms=block_ms)
+
+
 def loopback_available():
-    """True si hay un endpoint de loopback WASAPI usable (Windows)."""
+    """True si hay captura de audio del sistema usable en esta plataforma."""
+    if sys.platform == "darwin":
+        try:
+            import capture_mac
+            return capture_mac.sck_available()
+        except Exception:
+            return False
     return _SOUNDCARD_AVAILABLE and default_loopback() is not None
+
+
+def loopback_unavailable_hint():
+    """Mensaje de error (español) cuando el audio del sistema no se puede
+    capturar en esta plataforma."""
+    if sys.platform == "darwin":
+        try:
+            import capture_mac
+            if not capture_mac.sck_available():
+                return ("ScreenCaptureKit no está disponible: instala los "
+                        "paquetes pyobjc de requirements.txt (macOS 13+), "
+                        "o usa el micrófono / BlackHole como entrada.")
+        except Exception:
+            pass
+        return ("No se puede capturar el audio del sistema. Concede "
+                "«Grabación de pantalla y audio del sistema» en Ajustes "
+                "del Sistema → Privacidad y seguridad, o usa el micrófono "
+                "/ BlackHole como entrada.")
+    return ("El loopback WASAPI no está disponible. "
+            "Prueba con micrófono o VB-Cable.")
 
 
 def _loopback_microphones():

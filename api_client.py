@@ -10,6 +10,7 @@ import os
 import json
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 import urllib.request
@@ -398,6 +399,11 @@ class GptClient:
     def load_config():
         """Carga gpt_config.json; si no existe lo crea con valores actuales."""
         config_path = os.path.join(os.path.dirname(__file__), "gpt_config.json")
+        if getattr(sys, "frozen", False) and sys.platform == "darwin":
+            # El bundle .app es de solo lectura: la config del usuario vive
+            # en el directorio de datos escribible.
+            import paths
+            config_path = os.path.join(paths.data_dir(), "gpt_config.json")
 
         if not os.path.exists(config_path):
             with open(config_path, "w", encoding="utf-8") as f:

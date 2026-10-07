@@ -44,6 +44,7 @@ import sounddevice as sd
 import soundfile as sf
 
 import capture
+import paths
 import transcriber
 import vad
 from api_client import (
@@ -52,9 +53,17 @@ from api_client import (
     clef_question, CODEX_MODEL, DEFAULT_GPT_CONFIG, build_smart_request,
 )
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
-TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
+if sys.platform == "darwin":
+    try:
+        import platform_mac
+    except Exception:
+        platform_mac = None
+else:
+    platform_mac = None
+
+APP_DIR = paths.APP_DIR
+SETTINGS_PATH = os.path.join(paths.data_dir(), "settings.json")
+TRANSCRIPTS_DIR = os.path.join(paths.data_dir(), "transcripts")
 
 # Hotkeys globales de 2 teclas, vía WH_KEYBOARD_LL (eventos reales de
 # tecla, sin admin ni deps). Elegidas porque NO hacen nada en
@@ -107,6 +116,10 @@ def _mod_state_ok(mod_vk):
 
 
 def _apply_capture_exclusion(window, enabled):
+    if sys.platform == "darwin":
+        if platform_mac is not None:
+            platform_mac.set_capture_exclusion(window, enabled)
+        return
     if sys.platform != "win32":
         return
     try:
@@ -116,15 +129,15 @@ def _apply_capture_exclusion(window, enabled):
         pass
 
 
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
-                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+if sys.platform == "win32":
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
 
-
-_HOOKPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_long, ctypes.c_int, wintypes.WPARAM,
-    ctypes.POINTER(KBDLLHOOKSTRUCT))
+    _HOOKPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_int, wintypes.WPARAM,
+        ctypes.POINTER(KBDLLHOOKSTRUCT))
 
 
 def _install_ll_hook(dispatch):
@@ -848,6 +861,7 @@ class CompactOverlay(QWidget):
         self.resize(self.WIDTH, 240)
         self._drag_pos = None
         self._listening = False
+        self._mac_tuned = False
         self._opacity = 0.96
         self.setWindowOpacity(self._opacity)
         self._hide_from_capture = True
@@ -1021,6 +1035,9 @@ class CompactOverlay(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         _apply_capture_exclusion(self, self._hide_from_capture)
+        if platform_mac is not None and not self._mac_tuned:
+            self._mac_tuned = True
+            platform_mac.tune_overlay_window(self)
         self._schedule_resize()
 
 
@@ -1065,6 +1082,8 @@ class AckToast(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         _apply_capture_exclusion(self, self._hide_from_capture)
+        if platform_mac is not None:
+            platform_mac.tune_overlay_window(self)
 
 
 def _load_settings():
@@ -1220,22 +1239,40 @@ class AudioDeviceSetupDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # Estado del loopback WASAPI (la vía principal en Windows)
-        loop_group = QGroupBox("Audio del sistema (loopback WASAPI)")
-        loop_layout = QVBoxLayout(loop_group)
-        loopback = capture.default_loopback()
-        if loopback is not None:
-            loop_name = capture.loopback_display_name(loopback)
-            self.loop_status = QLabel(f"OK — capturando de: {loop_name}")
-            self.loop_status.setStyleSheet("color: #81c995; font-weight: bold;")
+        # Estado del audio del sistema (la vía principal en cada SO)
+        if sys.platform == "darwin":
+            loop_group = QGroupBox("Audio del sistema (ScreenCaptureKit)")
+            loop_layout = QVBoxLayout(loop_group)
+            try:
+                import capture_mac
+                ok = capture_mac.screen_capture_preflight()
+                status = capture_mac.status_text()
+            except Exception:
+                ok, status = False, (
+                    "ScreenCaptureKit no disponible (faltan paquetes "
+                    "pyobjc). Instala requirements.txt.")
+            self.loop_status = QLabel(status)
+            self.loop_status.setStyleSheet(
+                "color: #81c995; font-weight: bold;" if ok
+                else "color: #e57373;")
+            self.loop_status.setWordWrap(True)
+            loop_layout.addWidget(self.loop_status)
         else:
-            self.loop_status = QLabel(
-                "No disponible. En Windows debería aparecer automáticamente; "
-                "si no, usa VB-Cable o el micrófono."
-            )
-            self.loop_status.setStyleSheet("color: #e57373;")
-        self.loop_status.setWordWrap(True)
-        loop_layout.addWidget(self.loop_status)
+            loop_group = QGroupBox("Audio del sistema (loopback WASAPI)")
+            loop_layout = QVBoxLayout(loop_group)
+            loopback = capture.default_loopback()
+            if loopback is not None:
+                loop_name = capture.loopback_display_name(loopback)
+                self.loop_status = QLabel(f"OK — capturando de: {loop_name}")
+                self.loop_status.setStyleSheet("color: #81c995; font-weight: bold;")
+            else:
+                self.loop_status = QLabel(
+                    "No disponible. En Windows debería aparecer automáticamente; "
+                    "si no, usa VB-Cable o el micrófono."
+                )
+                self.loop_status.setStyleSheet("color: #e57373;")
+            self.loop_status.setWordWrap(True)
+            loop_layout.addWidget(self.loop_status)
         layout.addWidget(loop_group)
 
         input_group = QGroupBox("Dispositivos de entrada (grabación)")
@@ -1407,8 +1444,9 @@ class AudioRecorderThread(QThread):
     def _open_stream(self):
         """Devuelve (read_fn, close_fn, channels). read_fn(n) -> np.float32."""
         if self.source == "loopback":
-            rec = capture.LoopbackRecorder(samplerate=self.samplerate,
-                                           channels=self.channels, block_ms=100)
+            rec = capture.make_loopback_recorder(
+                samplerate=self.samplerate, channels=self.channels,
+                block_ms=100)
             rec.start()
             return (lambda n: rec.read(), rec.close, self.channels)
         if self.source == "vbcable":
@@ -1517,8 +1555,9 @@ class ContinuousCaptureThread(QThread):
         Granola: loopback = «ellos», micro = «tú». Un solo carril sin nombre
         en las fuentes simples."""
         if self.source in ("loopback", "duo"):
-            rec = capture.LoopbackRecorder(samplerate=self.samplerate,
-                                           channels=self.channels, block_ms=100)
+            rec = capture.make_loopback_recorder(
+                samplerate=self.samplerate, channels=self.channels,
+                block_ms=100)
             them = rec.blocks(running=lambda: self.running)
             if self.source == "loopback":
                 return [("", them)]
@@ -1673,12 +1712,19 @@ class WhisperApp(QMainWindow):
     gate_fired = Signal(str, str, str)       # (texto, carril, modo)
     hotkey_requested = Signal(str)
 
-    CAPTURE_SOURCES = [
-        ("loopback", "Audio del sistema (loopback WASAPI)"),
-        ("input", "Micrófono / dispositivo de entrada"),
-        ("duo", "Loopback + micro (2 carriles: entrevistador / tú)"),
-        ("vbcable", "VB-Cable (legacy)"),
-    ]
+    if sys.platform == "darwin":
+        CAPTURE_SOURCES = [
+            ("loopback", "Audio del sistema (ScreenCaptureKit)"),
+            ("input", "Micrófono / BlackHole (dispositivo de entrada)"),
+            ("duo", "Sistema + micro (2 carriles: entrevistador / tú)"),
+        ]
+    else:
+        CAPTURE_SOURCES = [
+            ("loopback", "Audio del sistema (loopback WASAPI)"),
+            ("input", "Micrófono / dispositivo de entrada"),
+            ("duo", "Loopback + micro (2 carriles: entrevistador / tú)"),
+            ("vbcable", "VB-Cable (legacy)"),
+        ]
 
     def __init__(self):
         super().__init__()
@@ -1720,7 +1766,17 @@ class WhisperApp(QMainWindow):
         # mantenidos del panel (mover/opacidad).
         self.hotkey_requested.connect(
             self._dispatch_hotkey, Qt.ConnectionType.QueuedConnection)
-        self._ll_hook = _install_ll_hook(self.hotkey_requested.emit)
+        if platform_mac is not None:
+            platform_mac.set_overlay_active(lambda: self.overlay.isVisible())
+            self._ll_hook = platform_mac.install_hotkeys(
+                self.hotkey_requested.emit)
+            if self._ll_hook is None:
+                self.status_bar.showMessage(
+                    "Sin hotkeys globales: falta el permiso de "
+                    "Accesibilidad. " + platform_mac.ACCESSIBILITY_HINT)
+                platform_mac.request_accessibility()
+        else:
+            self._ll_hook = _install_ll_hook(self.hotkey_requested.emit)
         self._hk_timer = QTimer(self)
         self._hk_timer.timeout.connect(self._overlay_keys_tick)
         self._hk_timer.start(30)
@@ -1875,6 +1931,11 @@ class WhisperApp(QMainWindow):
 
         self.hide_capture_checkbox = QCheckBox(
             "Invisible al compartir pantalla / grabar")
+        if sys.platform == "darwin":
+            self.hide_capture_checkbox.setToolTip(
+                "Aplica NSWindowSharingNone. Ojo: desde macOS 15.4 "
+                "ScreenCaptureKit ignora este ajuste — la ventana puede "
+                "seguir viéndose al compartir pantalla en apps modernas.")
         self.hide_capture_checkbox.toggled.connect(
             self._set_capture_exclusion)
         tr_layout.addWidget(self.hide_capture_checkbox)
@@ -2231,9 +2292,7 @@ class WhisperApp(QMainWindow):
             return
         if source in ("loopback", "duo") and not capture.loopback_available():
             QMessageBox.warning(
-                self, "Error",
-                "El loopback WASAPI no está disponible. Prueba con micrófono o VB-Cable."
-            )
+                self, "Error", capture.loopback_unavailable_hint())
             return
 
         self._set_controls_enabled(False)
@@ -2344,6 +2403,16 @@ class WhisperApp(QMainWindow):
     def _overlay_keys_tick(self):
         """Ctrl+flechas = mover panel · Ctrl+± = opacidad. Órdenes dirigidas
         al panel: solo actúan cuando está visible."""
+        if platform_mac is not None:
+            if not self.overlay.isVisible():
+                return
+            dx, dy, dop = platform_mac.overlay_controls()
+            if dx or dy:
+                self.overlay.nudge(dx * _OVERLAY_MOVE_STEP,
+                                   dy * _OVERLAY_MOVE_STEP)
+            if dop:
+                self.overlay.adjust_opacity(dop * _OVERLAY_OPACITY_STEP)
+            return
         if sys.platform != "win32" or not self.overlay.isVisible():
             return
         u32 = ctypes.windll.user32
@@ -2877,7 +2946,11 @@ class WhisperApp(QMainWindow):
     def closeEvent(self, event):
         try:
             if getattr(self, "_ll_hook", None):
-                ctypes.windll.user32.UnhookWindowsHookEx(self._ll_hook[0])
+                if platform_mac is not None:
+                    platform_mac.stop_hotkeys(self._ll_hook)
+                elif sys.platform == "win32":
+                    ctypes.windll.user32.UnhookWindowsHookEx(
+                        self._ll_hook[0])
             self._retire_thread(self.capture_thread)
             for rt in self.realtimes.values():
                 try:
@@ -2965,6 +3038,10 @@ def _apply_dark_palette(app):
 
 
 def main():
+    if paths.is_frozen_mac():
+        # En el .app el bundle es de solo lectura: claves, settings y
+        # temporales van a ~/Library/Application Support/audio_gpt.
+        os.chdir(paths.data_dir())
     app = QApplication(sys.argv)
     _apply_dark_palette(app)
     window = WhisperApp()

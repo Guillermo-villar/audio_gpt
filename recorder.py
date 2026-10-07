@@ -18,13 +18,21 @@ import vad
 def list_audio_devices():
     devices = sd.query_devices()
     print("\n=== DISPOSITIVOS DE AUDIO ===")
-    print("Loopback WASAPI (audio del sistema):")
-    loopbacks = capture.list_loopback_devices()
-    if loopbacks:
-        for name, _ in loopbacks:
-            print(f"  {name}")
+    if capture.sys.platform == "darwin":
+        print("Audio del sistema (ScreenCaptureKit):")
+        try:
+            import capture_mac
+            print("  " + capture_mac.status_text())
+        except Exception as e:
+            print(f"  no disponible: {e}")
     else:
-        print("  (ninguno detectado)")
+        print("Loopback WASAPI (audio del sistema):")
+        loopbacks = capture.list_loopback_devices()
+        if loopbacks:
+            for name, _ in loopbacks:
+                print(f"  {name}")
+        else:
+            print("  (ninguno detectado)")
 
     print("\nEntradas (grabación):")
     for i, d in enumerate(devices):
@@ -55,11 +63,13 @@ def verificar_audio(filename):
 
 
 def record_system_audio(filename, duration=5, samplerate=48000):
-    """Graba `duration` segundos del audio del sistema por loopback WASAPI."""
+    """Graba `duration` segundos del audio del sistema (loopback WASAPI en
+    Windows, ScreenCaptureKit en macOS)."""
     try:
-        rec = capture.LoopbackRecorder(samplerate=samplerate, block_ms=100)
+        rec = capture.make_loopback_recorder(samplerate=samplerate,
+                                             block_ms=100)
     except RuntimeError as e:
-        print(f"Loopback no disponible: {e}")
+        print(f"Audio del sistema no disponible: {e}")
         return False
 
     print(f"Grabando {duration} s del audio del sistema…")
