@@ -250,10 +250,11 @@ class DeepgramRealtime:
 
     def __init__(self, api_key, model="flux-general-multi", language=None,
                  on_transcript=None, on_error=None, on_status=None,
-                 diarize=False, keyterms=None):
+                 diarize=False, keyterms=None, with_meta=False):
         self.api_key = api_key
         self.model = model
         self.language = language
+        self.with_meta = with_meta
         self.diarize = diarize        # solo nova-3: etiquetas <S0>/<S1> por voz
         self.keyterms = list(keyterms or [])
         self.on_transcript = on_transcript or (lambda t, final: None)
@@ -265,8 +266,7 @@ class DeepgramRealtime:
         self._final_event = threading.Event()
         self.sample_rate = DEEPGRAM_SAMPLE_RATE
 
-    def start(self):
-        import websocket
+    def _build_url(self):
         import urllib.parse
 
         if self.model == "nova-3-multilingual":
@@ -280,6 +280,8 @@ class DeepgramRealtime:
                 "encoding": "linear16",
                 "sample_rate": DEEPGRAM_SAMPLE_RATE,
             }
+            if self.keyterms:
+                q["keyterm"] = self.keyterms
             base = DEEPGRAM_FLUX_URL
         else:
             q = {
@@ -299,7 +301,12 @@ class DeepgramRealtime:
             base = DEEPGRAM_URL
             if self.language and "multi" not in self.model:
                 q["language"] = self.language   # multi detecta idiomas solo
-        url = base + "?" + urllib.parse.urlencode(q, doseq=True)
+        return base + "?" + urllib.parse.urlencode(q, doseq=True)
+
+    def start(self):
+        import websocket
+
+        url = self._build_url()
         self._ws = websocket.create_connection(
             url,
             header=[f"Authorization: Token {self.api_key}"],
@@ -320,6 +327,59 @@ class DeepgramRealtime:
             kind = "ForceEndTurn" if self.model.startswith("flux") else "Finalize"
             self._ws.send(json.dumps({"type": kind}))
 
+    @staticmethod
+    def _norm_words(words):
+        return [{
+            "word": w.get("punctuated_word") or w.get("word", ""),
+            "start": w.get("start"),
+            "end": w.get("end"),
+            "confidence": w.get("confidence"),
+        } for w in (words or [])]
+
+    def _parse_event(self, event):
+        """(texto, es_final, meta) o None. meta solo en finales: start/end
+        (s de audio enviados) y words normalizadas."""
+        etype = event.get("type", "")
+        if etype == "Results":   # /v1 (nova-3): resultados por utterance
+            alts = (event.get("channel", {}).get("alternatives") or [])
+            alt = alts[0] if alts else {}
+            is_final = bool(event.get("is_final"))
+            if self.diarize and is_final and alt.get("words"):
+                text = _tag_speakers(alt["words"])
+            else:
+                text = alt.get("transcript", "")
+            if not text:
+                return None
+            meta = None
+            if is_final:
+                start = float(event.get("start") or 0.0)
+                meta = {
+                    "start": start,
+                    "end": start + float(event.get("duration") or 0.0),
+                    "words": self._norm_words(alt.get("words")),
+                }
+            return text, is_final, meta
+        if etype == "TurnInfo":   # /v2 (flux): turnos con transcript
+            text = event.get("transcript", "")
+            is_final = event.get("event") == "EndOfTurn"
+            if not text:
+                return None
+            meta = None
+            if is_final:
+                meta = {
+                    "start": float(event.get("audio_window_start") or 0.0),
+                    "end": float(event.get("audio_window_end") or 0.0),
+                    "words": self._norm_words(event.get("words")),
+                }
+            return text, is_final, meta
+        return None
+
+    def _emit(self, text, is_final, meta):
+        if self.with_meta:
+            self.on_transcript(text, is_final, meta)
+        else:
+            self.on_transcript(text, is_final)
+
     def _recv_loop(self):
         try:
             while self._running:
@@ -328,25 +388,14 @@ class DeepgramRealtime:
                     break
                 event = json.loads(raw)
                 etype = event.get("type", "")
-                if etype == "Results":   # /v1 (nova-3): resultados por utterance
-                    alts = (event.get("channel", {})
-                            .get("alternatives") or [])
-                    alt = alts[0] if alts else {}
-                    if (self.diarize and event.get("is_final")
-                            and alt.get("words")):
-                        text = _tag_speakers(alt["words"])
-                    else:
-                        text = alt.get("transcript", "")
-                    if text:
-                        self.on_transcript(text, bool(event.get("is_final")))
-                        if event.get("is_final"):
-                            self._final_event.set()
-                elif etype == "TurnInfo":   # /v2 (flux): turnos con transcript
-                    text = event.get("transcript", "")
-                    is_final = event.get("event") == "EndOfTurn"
-                    if text:
-                        self.on_transcript(text, is_final)
+                parsed = self._parse_event(event)
+                if parsed:
+                    text, is_final, meta = parsed
+                    self._emit(text, is_final, meta)
                     if is_final:
+                        self._final_event.set()
+                elif etype == "TurnInfo":
+                    if event.get("event") == "EndOfTurn":
                         self._final_event.set()
                 elif etype == "Error":
                     self.on_error(json.dumps(event))

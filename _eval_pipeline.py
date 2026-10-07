@@ -1,7 +1,7 @@
 """E2E pipeline eval: audio real -> Deepgram live -> gate -> draft/review LLM.
 
-Simula exactamente la logica de gui.py (_append_transcript + _fire_gpt)
-sin PySide6. Uso:
+Simula el antiguo pipeline automatico de gui.py (ya retirado: la app solo
+responde bajo orden explicita) sin PySide6. Uso:
     python _eval_pipeline.py <url_mp3> [--model flux-general-multi] [--seconds 90]
 Env: DEEPGRAM_API_KEY, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
 """

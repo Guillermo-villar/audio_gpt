@@ -50,7 +50,6 @@ con varios hablantes.
       Se mueve con `Ctrl+flechas`, cambia de opacidad con `Ctrl+±` y cada
       hotkey deja un ACK visible.
 - [ ] Hotkeys con otra ventana enfocada (ej. el navegador):
-      `Ctrl+M` conmuta auto-GPT (bloqueado si «GPT solo bajo demanda»),
       `Ctrl+Q` responde la última intervención,
        `Alt+S` sustituye la respuesta visible por una versión completa de
        gpt-6.1-sol; la versión anterior queda plegada arriba en una fila
@@ -66,19 +65,14 @@ con varios hablantes.
 - [ ] «Invisible al compartir pantalla / grabar» excluye de las capturas
       compatibles de Windows el panel, el ACK y la ventana principal; al
       desactivarlo, la captura normal vuelve a mostrarlos.
-- [ ] «GPT solo bajo demanda» ON (por defecto): nada se envía a GPT hasta
-      que lo ordenas con botón/Ctrl+Q/Alt+G. Al apagarlo, auto-GPT ON: al
-      oír una pregunta sale un "[Borrador]" rápido y luego una
-      "[Revisión]" más completa en el panel de respuestas.
+- [ ] Solo hay respuestas bajo orden: nada se genera ni se muestra hasta que
+      lo ordenas con botón «Enviar a GPT», Ctrl+Q o Alt+G (no hay detección
+      automática de preguntas).
 - [ ] Brief: escribe algo en "Brief de la entrevista" y comprueba que las
       respuestas se adaptan a ese contexto (menciona tu puesto/experiencia).
 - [ ] Fijar: selecciona una línea del transcript, pulsa Fijar; en la
       siguiente respuesta el modelo usa ese dato.
 - [ ] Guardar: "Guardar" crea `transcripts/transcripcion_*.txt` con todo.
-
-Si auto-GPT no dispara con auto-GPT ON: puede ser el gate clef-flash sin
-credenciales CF (cae a la heurística local, menos precisa) — revisar
-cloudflare_api_key.txt / cloudflare_account_id.txt.
 
 ## 4. meet_split — audio por asistente en Google Meet (PoC)
 
