@@ -273,6 +273,9 @@ def render_markdown(doc, text, font_px=13, color="#d4d6d9"):
             block_format.setBackground(QColor("#15171a"))
             block_format.setLeftMargin(8)
             block_format.setRightMargin(8)
+            # El importador de Markdown marca el código como no partible y
+            # las líneas largas se salían de la columna sin scroll.
+            block_format.setNonBreakableLines(False)
             cursor.setBlockFormat(block_format)
             fmt = QTextCharFormat()
             fmt.setFontFamily("Consolas")

@@ -64,3 +64,18 @@ class CompactMarkdownTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodeBlockWrapTests(unittest.TestCase):
+    def test_long_code_line_wraps_inside_column(self):
+        """Qt marca el código cercado como «no partible»: una línea larga se
+        salía de la columna de Luna sin barra horizontal."""
+        doc = render(
+            "Texto.\n\n```python\n"
+            "while self.hits and now - self.hits[0] >= self.window_s: pass\n"
+            "```\n")
+        doc.setTextWidth(220)
+        code = [b for b in blocks(doc) if b.text().startswith("while")]
+        self.assertEqual(len(code), 1)
+        self.assertFalse(code[0].blockFormat().nonBreakableLines())
+        self.assertLessEqual(doc.idealWidth(), 220)
