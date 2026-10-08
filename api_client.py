@@ -267,6 +267,7 @@ DEFAULT_GPT_CONFIG = {
     "fast_verbosity": "low",
     "detail_verbosity": "medium",
     "prewarm": True,
+    "prewarm_service_tier": "auto",  # los pre-cacheos no corren prisa: sin recargo Fast
     "sd_keyterms": True,
     "smart_model": "gpt-6.1-sol",
     "smart_reasoning_effort": "medium",

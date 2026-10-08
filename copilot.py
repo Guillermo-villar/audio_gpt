@@ -222,6 +222,14 @@ class PrewarmScheduler:
             state.last_signature = signature
             state.last_sent = self._clock()
 
+    def note_real_call(self, name, signature):
+        """Una llamada real escribe la misma caché que un pre-cacheo: no
+        hace falta volver a calentar ese mismo prefijo justo después."""
+        with self._lock:
+            state = self._state(name)
+            state.last_signature = signature
+            state.last_sent = self._clock()
+
     def mark_done(self, name, ok):
         with self._lock:
             state = self._state(name)

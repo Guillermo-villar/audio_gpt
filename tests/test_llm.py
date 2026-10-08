@@ -120,7 +120,7 @@ class RequestKwargsTests(unittest.TestCase):
         for profile in (self.luna, self.sol):
             real = llm.request_kwargs(profile, UTTS, TAIL)
             warm = llm.request_kwargs(profile, UTTS, TAIL, prewarm=True)
-            for key in ("model", "reasoning", "service_tier", "text",
+            for key in ("model", "reasoning", "text",
                         "tools"):
                 self.assertEqual(real.get(key), warm.get(key), key)
             self.assertEqual(real["input"][:2], warm["input"][:2])
@@ -347,3 +347,45 @@ class PrewarmTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrewarmTierTests(unittest.TestCase):
+    """Los pre-cacheos no corren prisa: por defecto van sin Fast mode (sin
+    recargo) y las llamadas reales siguen en Fast."""
+
+    def _config(self, **extra):
+        from api_client import DEFAULT_GPT_CONFIG
+        cfg = dict(DEFAULT_GPT_CONFIG)
+        cfg.update(extra)
+        return cfg
+
+    def test_prewarm_drops_fast_tier_by_default(self):
+        cfg = self._config()
+        for profile in (llm.luna_profile(cfg, ""), llm.sol_profile(cfg, "")):
+            warm = llm.request_kwargs(profile, ["Entrevistador: hola"],
+                                      prewarm=True)
+            real = llm.request_kwargs(profile, ["Entrevistador: hola"])
+            self.assertNotIn("service_tier", warm, profile.name)
+            self.assertEqual(real.get("service_tier"), "fast", profile.name)
+            self.assertTrue(warm["prompt_cache_options"]["prewarm"])
+
+    def test_prewarm_tier_configurable(self):
+        cfg = self._config(prewarm_service_tier="fast")
+        warm = llm.request_kwargs(llm.luna_profile(cfg, ""), ["a"],
+                                  prewarm=True)
+        self.assertEqual(warm["service_tier"], "fast")
+        cfg = self._config(prewarm_service_tier="flex")
+        warm = llm.request_kwargs(llm.sol_profile(cfg, ""), ["a"],
+                                  prewarm=True)
+        self.assertEqual(warm["service_tier"], "flex")
+
+    def test_prewarm_and_real_share_prefix_regardless_of_tier(self):
+        cfg = self._config()
+        profile = llm.luna_profile(cfg, "brief")
+        lines = [f"Entrevistador: línea {i}" for i in range(5)]
+        warm = llm.request_kwargs(profile, lines, prewarm=True)
+        real = llm.request_kwargs(profile, lines + ["Tú: más"],
+                                  [{"role": "user", "content": "cola"}])
+        self.assertEqual(warm["input"][0], real["input"][0])
+        self.assertEqual(warm["input"][1]["content"][:6],
+                         real["input"][1]["content"][:6])

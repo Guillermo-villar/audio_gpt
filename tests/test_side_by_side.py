@@ -66,8 +66,8 @@ class SideBySideFeedTests(unittest.TestCase):
         right_x = card.right_scroll.mapTo(card, QPoint(0, 0)).x()
         self.assertGreaterEqual(right_x, left_right_edge)
         self.assertTrue(card.separator.isVisible())
-        self.assertIn("caché 97%", card.header_label.text())
-        self.assertIn("caché 90%", card.detail.header.text())
+        self.assertIn("caché 97%", card.header_label.full_text())
+        self.assertIn("caché 90%", card.detail.header.full_text())
         self.assertTrue(card.right_header_label.isHidden())
 
     def test_content_height_is_taller_column(self):
@@ -96,7 +96,7 @@ class SideBySideFeedTests(unittest.TestCase):
         self.assertTrue(self.card.two_columns)
         self.assertFalse(self.card.right_scroll.isHidden())
         self.assertEqual(
-            self.card.detail.header.text(),
+            self.card.detail.header.full_text(),
             "gpt-6.1-sol · detalles · en cola tras gpt-6-luna…")
         self.feed.cancel_detail(self.detail)
         self.assertFalse(self.card.two_columns)
@@ -111,7 +111,7 @@ class SideBySideFeedTests(unittest.TestCase):
         pump()
         self.assertFalse(card.pending_label.isHidden())
         self.assertIn("gpt-6.1-sol · web · pensando…",
-                      card.pending_label.text())
+                      card.pending_label.full_text())
         self.assertFalse(card.detail.isHidden())
         self.feed.update(follow, "Versión mejorada")
         self.feed.finish(follow, True, "Versión mejorada")
@@ -122,12 +122,12 @@ class SideBySideFeedTests(unittest.TestCase):
         self.assertTrue(card.pending_label.isHidden())
         self.assertTrue(card.left_panel.isAncestorOf(root.body))
         self.assertIn("Di ahora", root.body.toPlainText())
-        self.assertTrue(card.header_label.text().startswith("gpt-6-luna"))
-        self.assertIn("caché 97%", card.header_label.text())
+        self.assertTrue(card.header_label.full_text().startswith("gpt-6-luna"))
+        self.assertIn("caché 97%", card.header_label.full_text())
         self.assertTrue(card.right_panel.isAncestorOf(v1.body))
         self.assertEqual(v1.body.toPlainText().strip(), "Versión mejorada")
         self.assertFalse(card.right_header_label.isHidden())
-        self.assertEqual(card.right_header_label.text(),
+        self.assertEqual(card.right_header_label.full_text(),
                          "gpt-6.1-sol · web · 9.0s · caché 80%")
         self.assertTrue(card.two_columns)
 
@@ -159,7 +159,7 @@ class SideBySideFeedTests(unittest.TestCase):
         card.toggle_version(self.root)
         self.assertFalse(root.expanded)
         self.assertIn("Di ahora", root.body.toPlainText())
-        self.assertEqual(card.right_header_label.text().split(" · ")[0],
+        self.assertEqual(card.right_header_label.full_text().split(" · ")[0],
                          "sol-b")
 
     def test_columns_scroll_independently_when_capped(self):
@@ -359,11 +359,15 @@ class OverlaySizingTests(unittest.TestCase):
         self.addCleanup(overlay.close)
         long_line = "palabra " * 60
         overlay.set_live("Entrevistador", long_line, final=True)
-        overlay.resize(500, 300)
         overlay.show()
         pump()
+        # El panel se ajusta solo al contenido (animación); fijar el ancho
+        # para medir el re-renderizado a dos anchos distintos.
+        overlay._resize_animation.stop()
+        overlay.setFixedWidth(500)
+        pump()
         narrow = overlay.interviewer_live.text()
-        overlay.resize(1400, 300)
+        overlay.setFixedWidth(1400)
         pump()
         wide = overlay.interviewer_live.text()
         self.assertGreater(len(wide), len(narrow))
@@ -371,3 +375,68 @@ class OverlaySizingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LongQuestionWidthTests(unittest.TestCase):
+    """Una pregunta larga del entrevistador no debe ensanchar las columnas
+    más que su visor: antes la línea «…» fijaba el ancho mínimo al texto
+    completo y la respuesta quedaba recortada en el panel Ctrl+I."""
+
+    QUESTION = ("Okay, so now scale it. Redis is a single point of failure "
+                "and you have fifty million users. How do you shard, what "
+                "happens on a hot key like one huge customer hammering a "
+                "single endpoint, and how do you keep the counters "
+                "consistent across regions, and what do you page on?")
+
+    def test_columns_never_wider_than_their_viewport(self):
+        feed = gui.AnswerFeed(font_px=13, side_by_side=True)
+        self.addCleanup(feed.close)
+        feed.resize(900, 600)
+        feed.show()
+        root, detail = object(), object()
+        card = feed.start(root, "Manual", "gpt-6-luna", self.QUESTION)
+        feed.update(root, LUNA)
+        feed.finish(root, True, LUNA)
+        feed.start_detail(root, detail, "gpt-6.1-sol", "cola")
+        feed.begin_detail(detail)
+        feed.update(detail, SOL)
+        feed.finish(detail, True, SOL)
+        pump(300)
+        self.assertLess(card.question_label.minimumSizeHint().width(), 100)
+        self.assertLessEqual(card.left_panel.width(),
+                             card.left_scroll.viewport().width())
+        self.assertLessEqual(card.right_panel.width(),
+                             card.right_scroll.viewport().width())
+        self.assertLessEqual(card.minimumSizeHint().width(), 400)
+        self.assertLessEqual(card.width(), feed.viewport().width())
+        self.assertTrue(card.question_label.text().endswith("…"))
+
+    def test_overlay_minimum_width_not_driven_by_question(self):
+        overlay = gui.CompactOverlay()
+        self.addCleanup(overlay.close)
+        root = object()
+        overlay.feed.start(root, "Manual", "gpt-6-luna", self.QUESTION)
+        overlay.feed.update(root, LUNA)
+        overlay.feed.finish(root, True, LUNA)
+        overlay.feed.start_detail(root, object(), "gpt-6.1-sol", "cola")
+        overlay.show()
+        pump(300)
+        self.assertLessEqual(overlay.minimumSizeHint().width(), 600)
+        self.assertLessEqual(overlay.layout().minimumSize().width(), 600)
+
+    def test_overlay_minimum_width_not_driven_by_live_transcript(self):
+        """Las líneas «en directo» se eliden al ancho actual: si fijaran el
+        mínimo del panel, este crecía hasta salirse de la pantalla."""
+        overlay = gui.CompactOverlay()
+        self.addCleanup(overlay.close)
+        overlay.show()
+        for _ in range(3):
+            overlay.set_live("Entrevistador", self.QUESTION * 2, final=True)
+            overlay.set_live("Tú", self.QUESTION, final=False)
+        pump(200)
+        self.assertLessEqual(overlay.minimumSizeHint().width(), 600)
+        self.assertLessEqual(overlay.layout().minimumSize().width(), 600)
+        self.assertLessEqual(overlay.interviewer_live.minimumSizeHint().width()
+                             if overlay.interviewer_live.sizePolicy()
+                             .horizontalPolicy() != gui.QSizePolicy.Ignored
+                             else 0, 600)

@@ -1,7 +1,6 @@
 """Segunda transcripción (gpt-transcribe) + árbitro Luna. Sin Qt."""
 
 import difflib
-import difflib
 import json
 import re
 import threading

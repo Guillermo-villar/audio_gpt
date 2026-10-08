@@ -173,8 +173,8 @@ class AppFlowTests(unittest.TestCase):
         self.assertNotIn(prompts.SECOND_EAR_HEADER, tail_text(fast[0]))
         self.assertEqual(card.body.toPlainText().strip()[:8], "Di ahora")
         self.assertIn("Sol añade", card.detail.body.toPlainText())
-        self.assertIn("caché 90%", card.header_label.text())
-        self.assertIn("caché 90%", card.detail.header.text())
+        self.assertIn("caché 90%", card.header_label.full_text())
+        self.assertIn("caché 90%", card.detail.header.full_text())
         self.assertTrue(card.verify_label.isHidden())
         self.assertTrue(self.app.send_to_gpt_button.isEnabled())
 

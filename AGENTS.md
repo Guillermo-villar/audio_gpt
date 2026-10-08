@@ -17,6 +17,15 @@ design interviews.
 - Tests run with `QT_QPA_PLATFORM=offscreen` (set by the test modules). That
   platform has no fonts: for screenshots/`grab()` use `QT_QPA_PLATFORM=windows`.
 - `python markdown_smoke.py` must keep passing.
+- Zero-cost backend: `mock_llm.py` (+ `mock_answers.py`, `mock_feed.py`)
+  replaces `llm.stream/prewarm/ping`, the arbiter and the realtime feed
+  with a simulator that mimics gpt-6-luna/gpt-6.1-sol timing, the explicit
+  prompt-cache prefix rules and failure modes. Run the app with
+  `AUDIO_GPT_MOCK=fast|slow|flaky|burst python main.py`
+  (`AUDIO_GPT_MOCK_SPEED=N` speeds everything up N×). Never add a real
+  API call to the mock path. `tests/test_meeting_pressure.py` drives a
+  real `WhisperApp` against it (hotkey races, errors, overlay toggles,
+  prewarm-vs-question); `tests/test_mock_backend.py` pins the simulator.
 - `tests/test_app_flow.py` builds a real `WhisperApp` with the keyboard hook
   and `SETTINGS_PATH` patched, and fake `llm.stream`/arbiter. Never touch the
   real `settings.json` and never call `WhisperApp.closeEvent` in tests (it

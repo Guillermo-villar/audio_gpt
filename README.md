@@ -145,6 +145,23 @@ la caché de OpenAI.
   `prewarm` de la caché de prompts: **nunca genera ni muestra nada**, solo
   hace que `Ctrl+Q` arranque ~4× más rápido. Un ping cada 30 s mantiene viva
   la conexión (no envía transcript) aunque el pre-cacheo esté desactivado.
+  Los pre-cacheos van sin Fast mode (`prewarm_service_tier: "auto"`; no
+  corren prisa y así no pagan el recargo) y una respuesta real cuenta como
+  pre-cacheo del mismo transcript, así que no se recalienta justo después de
+  preguntar. Si pulsas `Ctrl+Q` con un pre-cacheo aún en vuelo, la pregunta
+  **no espera**: sale al momento con el transcript actual y OpenAI reutiliza
+  el prefijo cacheado más largo que coincida (lo estable + las líneas ya
+  calentadas); solo las líneas nuevas van sin caché. Un pre-cacheo viejo
+  nunca cambia la respuesta.
+- **Modo simulado sin gastar tokens**: `AUDIO_GPT_MOCK=fast python main.py`
+  arranca la app con un backend local que imita los tiempos de
+  `gpt-6-luna`/`gpt-6.1-sol` (primer token, deltas, búsqueda web, caché,
+  pre-cacheo, árbitro) y una entrevista guionizada en el transcript; sirve
+  para probar `Ctrl+Q`/`Alt+S`/`Ctrl+I` sin API key. Perfiles: `fast`,
+  `slow` (latencias degradadas), `flaky` (errores 429/500, salidas vacías,
+  Sol caído) y `burst` (deltas de un carácter / una sola ráfaga).
+  `AUDIO_GPT_MOCK_SPEED=3` lo acelera 3×. En PowerShell:
+  `$env:AUDIO_GPT_MOCK="fast"; .\venv\Scripts\python main.py`.
 - **Segunda transcripción + árbitro**: con Deepgram streaming, cada turno
   final del entrevistador se vuelve a transcribir en segundo plano con
   `gpt-transcribe` (audio de un búfer circular alineado con los tiempos de
@@ -167,4 +184,4 @@ la caché de OpenAI.
   `detail_max_tokens`, `detail_verbosity`, `fast_verbosity`, `prewarm`,
   `sd_keyterms`, `verify_enabled`, `verify_stt_model`, `arbiter_model`,
   `verify_wait_s`, `verify_deadline_s`, `diagram_reasoning_effort`,
-  `diagram_max_tokens`.
+  `diagram_max_tokens`, `prewarm_service_tier`.

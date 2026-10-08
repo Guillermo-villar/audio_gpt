@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, Slot, QMutex, QTimer, QRect,
-    QPropertyAnimation, QEasingCurve,
+    QPropertyAnimation, QEasingCurve, QSize
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QFont, QTextCursor, QPalette, QTextDocument,
@@ -136,6 +136,12 @@ _HOOKPROC = ctypes.WINFUNCTYPE(
     ctypes.POINTER(KBDLLHOOKSTRUCT))
 
 
+# Teclas inyectadas (LLKHF_INJECTED) se ignoran: evitan que otro proceso
+# dispare los atajos. Con el backend simulado se aceptan para poder
+# automatizar las pruebas de UI.
+_ACCEPT_INJECTED_KEYS = bool(os.environ.get("AUDIO_GPT_MOCK"))
+
+
 def _install_ll_hook(dispatch):
     """Hotkeys por EVENTO real de tecla (WH_KEYBOARD_LL).
 
@@ -158,7 +164,7 @@ def _install_ll_hook(dispatch):
             if ncode == 0:
                 if wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                     event = lparam.contents
-                    if event.flags & 0x10:
+                    if event.flags & 0x10 and not _ACCEPT_INJECTED_KEYS:
                         return u32.CallNextHookEx(None, ncode, wparam, lparam)
                     vk = event.vkCode
                     swallow = False
@@ -175,7 +181,7 @@ def _install_ll_hook(dispatch):
                         return 1
                 elif wparam in (WM_KEYUP, WM_SYSKEYUP):
                     event = lparam.contents
-                    if event.flags & 0x10:
+                    if event.flags & 0x10 and not _ACCEPT_INJECTED_KEYS:
                         return u32.CallNextHookEx(None, ncode, wparam, lparam)
                     vk = event.vkCode
                     swallow = False
@@ -509,7 +515,7 @@ class DetailSection(QFrame):
         self.separator.setFixedHeight(1)
         self.separator.setStyleSheet("background: #3a3d42; border: none;")
         layout.addWidget(self.separator)
-        self.header = QLabel(self)
+        self.header = _ElidedLabel("", self)
         self._style_header(False)
         layout.addWidget(self.header)
         self.body = _AutoHeightBrowser(self)
@@ -601,7 +607,7 @@ class DetailSection(QFrame):
         else:
             status = self.status_message or self.elapsed_label()
         self._style_header(self.state == "error")
-        self.header.setText(f"{self.model_label} · detalles · {status}")
+        self.header.set_full_text(f"{self.model_label} · detalles · {status}")
 
     def set_status(self, text):
         self.status_message = text or ""
@@ -659,15 +665,36 @@ class DetailSection(QFrame):
 
 
 class _ElidedLabel(QLabel):
+    """Una línea elidida que NUNCA ensancha su contenedor: el QLabel normal
+    exige como mínimo el ancho del texto completo y una pregunta larga
+    hacía la columna más ancha que su visor, cortando la respuesta."""
+
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self._full_text = text
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+    def minimumSizeHint(self):
+        return QSize(40, super().minimumSizeHint().height())
+
+    def sizeHint(self):
+        return QSize(120, super().sizeHint().height())
+
+    def full_text(self):
+        return self._full_text
+
+    def set_full_text(self, text):
+        self._full_text = text
+        self._elide(self.width())
+
+    def _elide(self, width):
+        metrics = QFontMetrics(self.font())
+        self.setText(metrics.elidedText(
+            self._full_text, Qt.ElideRight, max(1, width)))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        metrics = QFontMetrics(self.font())
-        self.setText(metrics.elidedText(
-            self._full_text, Qt.ElideRight, max(1, event.size().width())))
+        self._elide(event.size().width())
 
 
 class AnswerCard(QFrame):
@@ -695,12 +722,12 @@ class AnswerCard(QFrame):
         self.history_layout.setContentsMargins(0, 0, 0, 0)
         self.history_layout.setSpacing(1)
 
-        self.pending_label = QLabel()
+        self.pending_label = _ElidedLabel("")
         self.pending_label.setStyleSheet(
             "color: #8e9297; font-size: 11px; font-weight: normal;")
         self.pending_label.hide()
 
-        self.header_label = QLabel()
+        self.header_label = _ElidedLabel("")
         self.header_label.setStyleSheet(
             "color: #8e9297; font-size: 11px; font-weight: normal;")
 
@@ -779,7 +806,7 @@ class AnswerCard(QFrame):
         self.separator.setFixedWidth(1)
         self.separator.setStyleSheet("background: #3a3d42; border: none;")
         self.right_scroll, self.right_panel, right = self._make_column()
-        self.right_header_label = QLabel()
+        self.right_header_label = _ElidedLabel("")
         self.right_header_label.setStyleSheet(
             "color: #8e9297; font-size: 11px; font-weight: normal;")
         self.right_header_label.hide()
@@ -986,12 +1013,12 @@ class AnswerCard(QFrame):
         status, color = self._version_status(root)
         self.header_label.setStyleSheet(
             f"color: {color}; font-size: 11px; font-weight: normal;")
-        self.header_label.setText(f"{root.model_label} · {status}")
+        self.header_label.set_full_text(f"{root.model_label} · {status}")
         if current is not root:
             status, color = self._version_status(current)
             self.right_header_label.setStyleSheet(
                 f"color: {color}; font-size: 11px; font-weight: normal;")
-            self.right_header_label.setText(
+            self.right_header_label.set_full_text(
                 f"{current.model_label} · {status}")
             self.right_header_label.show()
         else:
@@ -1001,7 +1028,7 @@ class AnswerCard(QFrame):
             status, color = self._version_status(latest)
             self.pending_label.setStyleSheet(
                 f"color: {color}; font-size: 11px; font-weight: normal;")
-            self.pending_label.setText(f"{latest.model_label} · {status}")
+            self.pending_label.set_full_text(f"{latest.model_label} · {status}")
             self.pending_label.show()
         else:
             self.pending_label.hide()
@@ -1032,7 +1059,7 @@ class AnswerCard(QFrame):
                     latest.status_message
                     or (latest.elapsed_label() if latest.done
                         else f"pensando… {latest.elapsed_label()}"))
-            self.pending_label.setText(
+            self.pending_label.set_full_text(
                 f"{latest.model_label} · {pending_status}")
             self.pending_label.show()
             visible = self._content_version
@@ -1051,7 +1078,7 @@ class AnswerCard(QFrame):
                 visible.status_message
                 or (visible.elapsed_label() if visible.done
                     else f"pensando… {visible.elapsed_label()}"))
-        self.header_label.setText(f"{visible.model_label} · {status}")
+        self.header_label.set_full_text(f"{visible.model_label} · {status}")
         for version in self.versions:
             if version is not latest and version.text.strip():
                 self._refresh_version_button(version)
@@ -1472,9 +1499,11 @@ class CompactOverlay(QWidget):
         panel_layout.addWidget(self.status_label)
 
         self.interviewer_live = QLabel("")
+        self.interviewer_live.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.interviewer_live.setStyleSheet("color: #8ab4f8; font-size: 11px;")
         self.interviewer_live.setMaximumHeight(34)
         self.you_live = QLabel("")
+        self.you_live.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.you_live.setStyleSheet("color: #81c995; font-size: 11px;")
         self.you_live.setMaximumHeight(34)
         panel_layout.addWidget(self.interviewer_live)
@@ -2422,6 +2451,10 @@ class WhisperApp(QMainWindow):
         self._prewarm_warned = set()
         self._prewarm_timer = QTimer(self)
         self._prewarm_timer.timeout.connect(self._prewarm_tick)
+        self._overlay_hide_timer = QTimer(self)
+        self._overlay_hide_timer.setSingleShot(True)
+        self._overlay_hide_timer.timeout.connect(
+            lambda: self.overlay.hide())
         self._ping_timer = QTimer(self)
         self._ping_timer.timeout.connect(self._ping_tick)
         self._hide_from_capture = self.settings.get("hide_from_capture", True)
@@ -3225,9 +3258,15 @@ class WhisperApp(QMainWindow):
 
     def _hk_toggle_compact(self):
         """Ctrl+I — ÚNICO control de visibilidad del panel."""
+        if self._overlay_hide_timer.isActive():
+            # Doble pulsación rápida: cancelar el ocultado pendiente en vez
+            # de encadenar otro y acabar con el panel escondido.
+            self._overlay_hide_timer.stop()
+            self.overlay.ack("Ctrl+I · panel visible")
+            return
         if self.overlay.isVisible():
             self.overlay.ack("Ctrl+I · ocultando panel…")
-            QTimer.singleShot(450, self.overlay.hide)
+            self._overlay_hide_timer.start(450)
         else:
             self.overlay.set_listening(self.is_continuous_mode)
             self.overlay.show()
@@ -3621,6 +3660,8 @@ class WhisperApp(QMainWindow):
         config = snap["config"]
         api_key = ApiKeyManager.load_api_key("openai")
         profile = llm.sol_profile(config, snap["brief"])
+        self._prewarm.note_real_call(
+            profile.name, (hash(profile.stable), len(snap["utterances"])))
         verified = cascade.verified
         if not (isinstance(verified, dict) and verified.get("question")):
             verified = None
@@ -3848,8 +3889,11 @@ class WhisperApp(QMainWindow):
                     "GPT necesita una API key de OpenAI (bot\u00f3n API key\u2026)")
                 return
             config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+            profile = llm.luna_profile(config, brief)
+            self._prewarm.note_real_call(
+                profile.name, (hash(profile.stable), len(utterances)))
             kwargs = llm.request_kwargs(
-                llm.luna_profile(config, brief), utterances,
+                profile, utterances,
                 copilot.fast_tail(
                     config, window, self._pinned,
                     second_ear=self._second_ear_lines(utterances, window)

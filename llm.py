@@ -36,6 +36,7 @@ class Profile:
     tools: tuple = ()
     max_output_tokens: int = 2000
     stable: str = ""
+    prewarm_service_tier: str | None = "auto"
 
 
 def stable_text(config, brief):
@@ -51,7 +52,8 @@ def luna_profile(config, brief):
         service_tier=config.get("service_tier"),
         verbosity=config.get("fast_verbosity"),
         max_output_tokens=config.get("max_tokens", 2000),
-        stable=stable_text(config, brief))
+        stable=stable_text(config, brief),
+        prewarm_service_tier=config.get("prewarm_service_tier", "auto"))
 
 
 def sol_profile(config, brief):
@@ -63,7 +65,8 @@ def sol_profile(config, brief):
         service_tier=config.get("smart_service_tier"),
         verbosity=config.get("detail_verbosity"), tools=tools,
         max_output_tokens=config.get("detail_max_tokens", 6000),
-        stable=stable_text(config, brief))
+        stable=stable_text(config, brief),
+        prewarm_service_tier=config.get("prewarm_service_tier", "auto"))
 
 
 def build_input(stable, utterances, tail_items=(),
@@ -102,8 +105,9 @@ def request_kwargs(profile, utterances, tail_items=(), *, prewarm=False,
         "reasoning": {"effort": profile.effort},
         "prompt_cache_options": cache,
     }
-    if profile.service_tier and profile.service_tier != "auto":
-        kwargs["service_tier"] = profile.service_tier
+    tier = profile.prewarm_service_tier if prewarm else profile.service_tier
+    if tier and tier != "auto":
+        kwargs["service_tier"] = tier
     if profile.verbosity:
         kwargs["text"] = {"verbosity": profile.verbosity}
     if profile.tools:

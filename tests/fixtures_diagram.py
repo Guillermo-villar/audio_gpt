@@ -1,4 +1,3 @@
-import os
 
 F1 = """flowchart TD
   user([Usuario]) -->|GET /abc123| cdn[CDN]

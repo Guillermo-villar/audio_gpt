@@ -52,13 +52,13 @@ class AnswerFeedDetailTests(unittest.TestCase):
                                "en cola tras gpt-6-luna…")
         pump()
         self.assertFalse(self.card.detail.isHidden())
-        self.assertEqual(self.card.detail.header.text(),
+        self.assertEqual(self.card.detail.header.full_text(),
                          "gpt-6.1-sol · detalles · en cola tras gpt-6-luna…")
         self.assertTrue(self.card.detail.body.isHidden())
 
         self.feed.begin_detail(self.detail)
         pump(250)
-        self.assertIn("pensando…", self.card.detail.header.text())
+        self.assertIn("pensando…", self.card.detail.header.full_text())
 
         self.feed.update(self.detail, "### Detalles\n\n- uno")
         pump()
@@ -66,9 +66,9 @@ class AnswerFeedDetailTests(unittest.TestCase):
         self.feed.finish(self.detail, True, SOL)
         pump()
         self.assertIn("Réplicas", self.card.detail.body.toPlainText())
-        self.assertTrue(self.card.detail.header.text().startswith(
+        self.assertTrue(self.card.detail.header.full_text().startswith(
             "gpt-6.1-sol · detalles · "))
-        self.assertTrue(self.card.detail.header.text().endswith("s"))
+        self.assertTrue(self.card.detail.header.full_text().endswith("s"))
 
         main_top = self.card.body.mapTo(self.card, QPoint(0, 0)).y()
         detail_top = self.card.detail.mapTo(self.card, QPoint(0, 0)).y()
@@ -83,7 +83,7 @@ class AnswerFeedDetailTests(unittest.TestCase):
         self.feed.status(self.root, "1.4s · 1er token 0.6s · caché 97%")
         pump(250)
         self.assertEqual(
-            self.card.header_label.text(),
+            self.card.header_label.full_text(),
             "gpt-6-luna · 1.4s · 1er token 0.6s · caché 97%")
 
         self.feed.start_detail(self.root, self.detail, "gpt-6.1-sol", "cola")
@@ -92,7 +92,7 @@ class AnswerFeedDetailTests(unittest.TestCase):
         self.feed.finish(self.detail, True, SOL)
         self.feed.status(self.detail, "5.0s · caché 90%")
         pump(250)
-        self.assertEqual(self.card.detail.header.text(),
+        self.assertEqual(self.card.detail.header.full_text(),
                          "gpt-6.1-sol · detalles · 5.0s · caché 90%")
 
     def test_detail_error(self):
@@ -100,7 +100,7 @@ class AnswerFeedDetailTests(unittest.TestCase):
         self.feed.start_detail(self.root, self.detail, "gpt-6.1-sol", "cola")
         self.feed.finish(self.detail, False, "Error: timeout")
         pump()
-        self.assertEqual(self.card.detail.header.text(),
+        self.assertEqual(self.card.detail.header.full_text(),
                          "gpt-6.1-sol · detalles · error: timeout")
         self.assertIn("#e57373", self.card.detail.header.styleSheet())
 

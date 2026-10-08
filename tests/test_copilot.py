@@ -270,3 +270,57 @@ class KeytermTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealCallCountsAsWarmTests(unittest.TestCase):
+    """Ctrl+Q escribe la misma caché que un pre-cacheo: tras la respuesta no
+    hay que recalentar el mismo prefijo, pero sí cuando llega transcript
+    nuevo. Modela también el caso «warm en vuelo + pregunta»."""
+
+    def setUp(self):
+        self.now = 1000.0
+        self.sched = copilot.PrewarmScheduler(
+            debounce_s=1.0, min_interval_s=8.0, min_tokens=100,
+            clock=lambda: self.now)
+
+    def _advance(self, s):
+        self.now += s
+
+    def test_real_call_suppresses_same_prefix(self):
+        self.sched.note_change()
+        self._advance(2)
+        self.assertTrue(self.sched.due("luna", ("s", 10), 5000))
+        self.sched.note_real_call("luna", ("s", 10))
+        self._advance(20)
+        self.assertFalse(self.sched.due("luna", ("s", 10), 5000))
+        self.sched.note_change()
+        self._advance(2)
+        self.assertTrue(self.sched.due("luna", ("s", 12), 5000))
+
+    def test_question_during_inflight_warm_does_not_wait(self):
+        self.sched.note_change()
+        self._advance(2)
+        self.sched.mark_sent("luna", ("s", 10))
+        self.sched.note_real_call("luna", ("s", 11))
+        self.assertFalse(self.sched.due("luna", ("s", 11), 5000))
+        self.sched.mark_done("luna", True)
+        self._advance(20)
+        self.assertFalse(self.sched.due("luna", ("s", 11), 5000),
+                         "la pregunta ya calentó ese prefijo")
+        self.sched.note_change()
+        self._advance(2)
+        self.assertTrue(self.sched.due("luna", ("s", 13), 5000))
+
+    def test_stale_warm_completion_keeps_newer_signature(self):
+        self.sched.mark_sent("luna", ("s", 10))
+        self.sched.note_real_call("luna", ("s", 14))
+        self.sched.mark_done("luna", True)
+        self.assertEqual(
+            self.sched._state("luna").last_signature, ("s", 14))
+
+    def test_models_tracked_independently(self):
+        self.sched.note_change()
+        self._advance(2)
+        self.sched.note_real_call("luna", ("s", 10))
+        self.assertFalse(self.sched.due("luna", ("s", 10), 5000))
+        self.assertTrue(self.sched.due("sol", ("t", 10), 5000))

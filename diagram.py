@@ -7,7 +7,6 @@ coloca nodos, aristas y subgrafos (Sugiyama simplificado) con una función
 """
 
 import functools
-import math
 import re
 from dataclasses import dataclass, field
 
@@ -401,7 +400,6 @@ def _parse(source):
     graph = Graph(direction=direction)
     groups = {}
     stack = []
-    explicit = set()
 
     def add_node(node_id, label, shape):
         node = graph.nodes.get(node_id)
