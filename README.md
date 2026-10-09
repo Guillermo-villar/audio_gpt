@@ -83,6 +83,32 @@ audio_gpt/
 
 MIT.
 
+## Rama: primera llamada exploratoria (recruiter / encaje)
+
+Esta rama (`devin/recruiter-call-copilot`) adapta el copiloto a una llamada
+de 30 min sin prueba técnica (primer contacto con una empresa). El system
+design vive en `devin/system-design-copilot`; el resto de la app (overlay
+Ctrl+I, cascada Luna→Sol, caché, mock) es el mismo.
+
+- `prompts.SYSTEM_PROMPT` describe las fases de la llamada (presentación,
+  «cuéntame de ti», experiencia, motivación, logística, cierre) y obliga a
+  hablar en primera persona, sin inventar métricas ni experiencia.
+- `prompts.DEFAULT_BRIEF` lleva el contexto del candidato, los objetivos de
+  la llamada por prioridad, las líneas rojas y los datos investigados de la
+  empresa. Se carga en «Brief de la entrevista» cuando el campo está vacío
+  (si ya tienes un brief guardado, bórralo y reinicia) y forma parte del
+  prefijo cacheado.
+- Luna (Ctrl+Q): **Di ahora** en tono de conversación + 2-4 viñetas, con
+  **Pregunta:** cuando toca preguntar. Sol añade `### ⚠ Ojo` (línea roja,
+  dato inventado, contradicción), `### Matiz`, `### Datos` (empresa),
+  `### Pregunta` (la siguiente, redactada) y `### Pendiente` (objetivos sin
+  cubrir).
+- Keyterms del STT: nombres propios de la llamada (Orbio, Aida, AXA, UC3M,
+  FDE, RAG…) en vez de la jerga de system design.
+- Mock sin coste: `$env:AUDIO_GPT_MOCK="fast"; .\venv\Scripts\python main.py`
+  reproduce la llamada con Aida (pitch, «¿cuánta gente lo usa?», salario,
+  oficina, siguiente paso) con respuestas enlatadas en el nuevo formato.
+
 ## Uso durante la llamada (modo copiloto)
 
 - **Panel oculto** (`Ctrl+I`, único control de visibilidad): panel oscuro,

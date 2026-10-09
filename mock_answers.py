@@ -1,12 +1,69 @@
 """Respuestas enlatadas del backend simulado (mock_llm). Imitan el formato
 que piden los prompts: Luna = «Di ahora» + viñetas; Sol = secciones ###
-con números, tabla, diagrama mermaid y seguimientos."""
+(llamada exploratoria: Ojo/Matiz/Datos/Pregunta/Pendiente; se conservan
+las de system design para el guion de rate limiter de los tests)."""
 
 import re
 
 import prompts
 
 LUNA = {
+    "intro": (
+        "**Di ahora:** En AXA estoy en el Tech Graduate Program, trabajando "
+        "entre equipos técnicos y de negocio. He construido un agente de HR "
+        "y su pipeline RAG, que están en producción, y testing automatizado "
+        "y self-healing con IA. Quiero dar el siguiente paso construyendo IA "
+        "como parte del producto, con más responsabilidad y un equipo del "
+        "que aprender.\n\n"
+        "- Puente: vuestro HR Agent es el mismo tipo de producto.\n"
+        "- Cierra con: «¿para qué rol me estáis considerando?»"),
+    "built": (
+        "**Di ahora:** Yo construí el pipeline RAG y la integración con los "
+        "equipos de negocio, siempre con el equipo de infraestructura. La "
+        "cifra exacta de usuarios no la tengo; sí sé que está en producción "
+        "y en uso real.\n\n"
+        "- Línea roja: no inventar usuarios ni ahorro.\n"
+        "- Describe alcance: ingesta, chunking, retrieval, evaluación.\n"
+        "- No entres en código ni datos internos de AXA."),
+    "why": (
+        "**Di ahora:** El programa está muy bien para aprender cómo funciona "
+        "una empresa grande, pero quiero que la IA sea el producto, no un "
+        "proyecto interno, y tener más responsabilidad en un equipo "
+        "técnico pequeño.\n\n"
+        "- Puente: «ship fast» y ownership desde el día uno.\n"
+        "- Evita hablar mal de AXA."),
+    "questions": (
+        "**Di ahora:** Sí. ¿Para qué rol y equipo me estáis considerando "
+        "exactamente, y qué tendría que construir los primeros tres meses?"
+        "\n\n"
+        "- Objetivos 1 y 2 del brief en una sola pregunta.\n"
+        "- Luego: perfil early-career y apoyo técnico."),
+    "salary": (
+        "**Di ahora:** Antes de dar una cifra me ayudaría saber la banda que "
+        "tenéis para este rol; en vuestra web decís que lo habláis desde la "
+        "primera conversación.\n\n"
+        "- Línea roja: no cites bandas de agregadores.\n"
+        "- Si insisten: pide banda y equity del rol concreto."),
+    "location": (
+        "**Di ahora:** Sí, estoy en Madrid, sin problema. ¿Cuántos días de "
+        "oficina serían para este rol, y es lo mismo para todo el equipo?"
+        "\n\n"
+        "- La web dice martes y miércoles y también una semana al mes.\n"
+        "- Objetivo 4 cubierto si contesta."),
+    "next": (
+        "**Di ahora:** Perfecto, me encaja. Solo una cosa más: ¿hay sitio "
+        "para un perfil early-career con IA en producción, y con quién "
+        "trabajaría en el día a día? ¿Y para cuándo sería la llamada con "
+        "Antonio?\n\n"
+        "- Cierra con fecha concreta.\n"
+        "- Agradece y resume el encaje en una frase."),
+    "role": (
+        "**Di ahora:** Me cuadra mucho: en AXA el valor estaba justo en "
+        "entender qué necesitaba negocio y convertirlo en algo que "
+        "funcionara. **Pregunta:** ¿cuánto del día a día sería código y "
+        "cuánto cliente?\n\n"
+        "- FDE = puente técnico con cliente.\n"
+        "- Pregunta por los «Deployment Strategists»."),
     "rate": (
         "**Di ahora:** Propongo un token bucket por API key y por IP, "
         "evaluado en el edge con Redis como contador compartido; asumo "
@@ -72,6 +129,18 @@ LUNA = {
 }
 
 TOPICS = [
+    ("intro", r"cuéntame (un poco )?(de|sobre) ti|háblame de ti|"
+              r"tell me about yourself|qué estás haciendo"),
+    ("built", r"qué parte|construiste|cuánta gente|usuarios|métricas|"
+              r"how many|what did you build"),
+    ("why", r"por qué quieres salir|why (do you want to )?leave|"
+            r"motivaci|por qué orbio"),
+    ("questions", r"alguna pregunta|any questions|preguntas para"),
+    ("salary", r"salarial|salario|salary|compensation|expectativas"),
+    ("location", r"ubicación|oficina|presencial|remoto|office|remote|"
+                 r"hybrid|híbrido"),
+    ("next", r"siguiente|next step|cto|algo más|anything else"),
+    ("role", r"te explico|el rol|el puesto|la vacante|the role"),
     ("code", r"write a function|function that|python|sql|complexity|"
              r"escribe (una )?función|código"),
     ("behave", r"tell me about a time|push back|conflict|cuéntame|"
@@ -143,7 +212,55 @@ SOL_FOLLOWUPS = (
     "- **¿Exactitud entre regiones?** Reconciliación asíncrona; acepto "
     "≤ 5 % de sobre-admisión, lo digo como trade-off explícito.")
 
+SOL_CALL = (
+    "### Datos\n"
+    "- Orbio: agentes María (recruiting), Daniel y Claire (onboarding, "
+    "retención); clientes YUM! Brands, Poke House; Serie A 21 M$ (Dawn "
+    "Capital, jun-2026).\n"
+    "- Cultura: algo en producción la semana 1, ownership total el día 90."
+    "\n\n"
+    "### Pregunta\n"
+    "- «¿Qué tendría que haber construido yo a los 90 días?»: cubre el "
+    "objetivo 2 y enlaza con su propia regla.\n\n"
+    "### Pendiente\n"
+    "- Rol concreto · primeros 3 meses · early-career y apoyo · ubicación "
+    "y banda · siguiente paso\n")
+
 SOL = {
+    "intro": (
+        "### Matiz\n"
+        "- Añade el porqué del puente: un agente de HR que resuelve dudas "
+        "de empleados es lo mismo que su HR Agent.\n"
+        "- El intercambio en San Francisco solo si preguntan por inglés."
+        "\n\n" + SOL_CALL),
+    "built": (
+        "### ⚠ Ojo\n"
+        "Si te piden una cifra, no la estimes de memoria: «no tengo el "
+        "dato; el alcance real es X y está en producción».\n\n"
+        "### Matiz\n"
+        "- Tu parte con verbos propios: diseñé la ingesta, elegí el "
+        "chunking, monté la evaluación de respuestas.\n"
+        "- Infra y despliegue: «con el equipo de plataforma», nunca solo."
+        "\n\n" + SOL_CALL),
+    "salary": (
+        "### ⚠ Ojo\n"
+        "No menciones las bandas vistas en portales. Si insiste, pide la "
+        "banda y el equity del rol concreto antes de dar un número.\n\n"
+        "### Datos\n"
+        "- Careers page: «compensation details are discussed openly from "
+        "the first conversation»; equity para todo el equipo.\n\n"
+        "### Pregunta\n"
+        "- «¿Cuál es la banda y el equity para este rol en concreto?»\n\n"
+        "### Pendiente\n"
+        "- Early-career y apoyo · ubicación · siguiente paso\n"),
+    "location": (
+        "### Datos\n"
+        "- La web dice «remote-first, Madrid martes y miércoles» y también "
+        "«una semana al mes juntos en Madrid»; la oferta FDE, 1 día.\n\n"
+        "### Pregunta\n"
+        "- «¿Ese ritmo es el mismo para el equipo técnico?»\n\n"
+        "### Pendiente\n"
+        "- Early-career y apoyo · siguiente paso\n"),
     "default": (
         "### Detalles\n"
         "- Token bucket por `{api_key, endpoint}`; relleno perezoso "

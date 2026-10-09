@@ -2889,7 +2889,9 @@ class WhisperApp(QMainWindow):
                 self.gpt_engine_combo.setCurrentIndex(idx)
         self.keyterms_input.setText(s.get("dg_keyterms", ""))
         self.diarize_checkbox.setChecked(bool(s.get("dg_diarize")))
-        self.brief_input.setPlainText(s.get("interview_brief", ""))
+        # Sin brief guardado se carga el de la rama (prompts.DEFAULT_BRIEF).
+        self.brief_input.setPlainText(
+            s.get("interview_brief") or prompts.DEFAULT_BRIEF)
         # Por defecto envío a GPT SOLO manual: el usuario decide cuándo.
         self.prewarm_checkbox.setChecked(s.get("prewarm", True))
         self.second_ear_checkbox.setChecked(s.get("second_ear", True))

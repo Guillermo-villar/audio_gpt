@@ -1,4 +1,5 @@
-"""Guion de transcripción simulado (AUDIO_GPT_MOCK): sustituye la captura
+"""Guion de transcripción simulado (AUDIO_GPT_MOCK; por defecto, la llamada
+exploratoria con Orbio): sustituye la captura
 de audio y el STT por un QTimer que emite parciales y finales por la misma
 señal `realtime_text` que usan Deepgram/OpenAI Realtime, así la app
 recorre exactamente el mismo camino (_append_transcript → _ctx → prewarm)."""
@@ -12,41 +13,42 @@ E, T = "Entrevistador", "Tú"
 
 # (segundos de espera antes de empezar a hablar, carril, texto)
 DEFAULT_SCRIPT = [
-    (2, E, "Hi, thanks for joining. Let's start with a classic one: design "
-           "a distributed rate limiter for our public API. We have around "
-           "fifty million daily active users and several thousand "
-           "enterprise clients with different quotas. Take it wherever you "
-           "want, but I care about accuracy at the edges and about what "
-           "happens when things fail."),
-    (8, T, "Vale, primero acoto el alcance: límite por API key y por IP, "
-           "ventanas de un segundo y de un minuto, y quiero que la decisión "
-           "se tome en menos de cinco milisegundos."),
-    (6, E, "Fine. What algorithm would you pick and why? Walk me through "
-           "the trade-offs between a sliding window log and a token bucket."),
-    (9, T, "Token bucket en Redis con un script Lua para que la lectura y "
-           "la escritura sean atómicas."),
-    (7, E, "Okay, so now scale it. Redis is a single point of failure and "
-           "you have fifty million users. How do you shard, what happens on "
-           "a hot key like one huge customer hammering a single endpoint, "
-           "and how do you keep the counters consistent across regions?"),
-    (12, T, "Shardeo por API key con hashing consistente y acepto algo de "
-            "sobre-admisión durante un failover."),
-    (6, E, "Let's say Redis goes down completely for thirty seconds. Do you "
-           "fail open or fail closed? Convince me."),
-    (10, T, "Fail open con un límite local conservador en cada nodo."),
-    (6, E, "Good. Switch gears. Write a function that, given a stream of "
-           "request timestamps for one key, returns whether the request is "
-           "allowed under a sliding window of N requests per minute. Python "
-           "is fine, and tell me the complexity."),
-    (14, T, "Uso un deque con los timestamps y voy sacando por la izquierda "
-            "los que ya salieron de la ventana."),
-    (6, E, "Last one before we wrap: tell me about a time you had to push "
-           "back on a product requirement because of a reliability risk. "
-           "What did you do and what was the outcome?"),
-    (10, T, "Fue en un proyecto de pagos, propusimos un feature flag y un "
-            "rollout gradual."),
-    (8, E, "Great. And how would you monitor this rate limiter in "
-           "production — what SLOs and which metrics would page you?"),
+    (2, E, "Hola Guillermo, ¿qué tal? Soy Aida, de Orbio. Gracias por hacer "
+           "un hueco. Te cuento muy rápido quiénes somos y luego me cuentas "
+           "tú, ¿vale?"),
+    (5, E, "Somos una startup de Madrid: construimos agentes de IA para "
+           "equipos de recursos humanos, selección, onboarding, insights. "
+           "Cerramos una Serie A hace poco y estamos creciendo el equipo "
+           "técnico. Cuéntame un poco de ti y qué estás haciendo ahora en "
+           "AXA."),
+    (10, T, "Pues en AXA estoy en el Tech Graduate Program, entre equipos "
+            "técnicos y de negocio. He construido un agente de HR con su "
+            "pipeline RAG que está en producción, y testing automatizado "
+            "con IA."),
+    (6, E, "Interesante lo del agente de HR, encaja mucho con lo nuestro. "
+           "¿Qué parte construiste tú exactamente, y cuánta gente lo está "
+           "usando?"),
+    (10, T, "La parte del pipeline RAG y la integración con los equipos de "
+            "negocio. La cifra exacta de usuarios no la tengo."),
+    (6, E, "Vale. ¿Y por qué quieres salir de AXA ahora? El graduate "
+           "program suena bastante bien."),
+    (9, T, "Quiero construir IA como parte del producto, con más "
+            "responsabilidad y un equipo técnico del que aprender."),
+    (6, E, "Te explico un poco el rol: buscamos gente que esté cerca del "
+           "cliente, desplegando y adaptando nuestros agentes. ¿Tienes "
+           "alguna pregunta hasta aquí?"),
+    (8, T, "Sí: ¿para qué rol concreto me estáis considerando, y qué "
+            "construiría los primeros tres meses?"),
+    (7, E, "Sería un perfil de AI engineer con parte de cliente. Los "
+           "primeros meses, integraciones con el ATS del cliente y ajustar "
+           "los agentes. ¿Cuáles son tus expectativas salariales?"),
+    (9, T, "Prefiero saber primero la banda del rol; así veo si encaja."),
+    (6, E, "Perfecto. Y en cuanto a ubicación, ¿estarías cómodo viniendo a "
+           "la oficina de Madrid?"),
+    (7, T, "Sí, estoy en Madrid. ¿Cuántos días sería, y es lo mismo para "
+            "todo el equipo?"),
+    (6, E, "Genial. Pues lo siguiente sería una llamada técnica con "
+           "Antonio, nuestro CTO. ¿Algo más que quieras saber?"),
 ]
 
 
