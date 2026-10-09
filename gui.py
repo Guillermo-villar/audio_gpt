@@ -4,7 +4,7 @@ Pipeline continuo:
     captura (loopback WASAPI / micrófono / VB-Cable)
       -> VAD (segmentos de habla reales)
       -> transcripción (OpenAI / Groq / local / realtime WebSocket)
-      -> GPT opcional por segmento (respuestas automáticas)
+      -> GPT solo bajo orden explícita (Ctrl+Q / Alt+G / botón)
 
 Se migra de PyQt5 a PySide6 (Qt6) y se elimina la dependencia de VB-Cable.
 """
@@ -30,9 +30,10 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
     QPlainTextEdit, QScrollArea, QTextBrowser, QSizePolicy,
 )
+import shiboken6
 from PySide6.QtCore import (
     Qt, QThread, Signal, Slot, QMutex, QTimer, QRect,
-    QPropertyAnimation, QEasingCurve,
+    QPropertyAnimation, QEasingCurve, QSize
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QFont, QTextCursor, QPalette, QTextDocument,
@@ -44,12 +45,20 @@ import sounddevice as sd
 import soundfile as sf
 
 import capture
+import copilot
+import diagram
+import llm
+import prompts
 import transcriber
 import vad
+import verify
+from audio_ring import PcmRing
+from diagram_view import DiagramStack
 from api_client import (
     ApiKeyManager, TranscriptionThread, WhisperService, GptClient,
-    GptQueryThread, SmartQueryThread, CodexCliThread, looks_like_question,
-    clef_question, CODEX_MODEL, DEFAULT_GPT_CONFIG, build_smart_request,
+    GptQueryThread, SmartQueryThread, CodexCliThread,
+    CODEX_MODEL, DEFAULT_GPT_CONFIG, build_smart_request,
+    needs_web_search,
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,16 +68,17 @@ TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
 # Hotkeys globales de 2 teclas, vía WH_KEYBOARD_LL (eventos reales de
 # tecla, sin admin ni deps). Elegidas porque NO hacen nada en
 # Chrome/Edge/Firefox ni ES-keyboards; las teclas disparadas se consumen.
-# Ctrl+Q responder · Alt+S más a fondo · Ctrl+M auto-GPT · Ctrl+I panel
-# (único control de visibilidad) · Alt+G enviar a GPT · Alt+T start/stop.
+# Ctrl+Q responder · Alt+S más a fondo · Ctrl+I panel
+# (único control de visibilidad) · Alt+G enviar a GPT · Alt+W dibujar la
+# arquitectura · Alt+T start/stop.
 # (Ojo: nunca Ctrl+Alt — AltGr en teclado ES = Ctrl+Alt y escribir «@»
 # dispararía el hotkey.)
 HOTKEYS = {
     "ctrl+q": (0x11, 0x51, "answer_last", "Ctrl+Q · responder última"),
     "alt+s": (0x12, 0x53, "smarter", "Alt+S · más a fondo"),
-    "ctrl+m": (0x11, 0x4D, "toggle_auto", "Ctrl+M · auto-GPT"),
     "ctrl+i": (0x11, 0x49, "toggle_compact", "Ctrl+I · panel"),
     "alt+g": (0x12, 0x47, "send_gpt", "Alt+G · enviar a GPT"),
+    "alt+w": (0x12, 0x57, "draw", "Alt+W · dibujar arquitectura"),
     "alt+t": (0x12, 0x54, "toggle_capture", "Alt+T · start/stop"),
 }
 
@@ -127,6 +137,12 @@ _HOOKPROC = ctypes.WINFUNCTYPE(
     ctypes.POINTER(KBDLLHOOKSTRUCT))
 
 
+# Teclas inyectadas (LLKHF_INJECTED) se ignoran: evitan que otro proceso
+# dispare los atajos. Con el backend simulado se aceptan para poder
+# automatizar las pruebas de UI.
+_ACCEPT_INJECTED_KEYS = bool(os.environ.get("AUDIO_GPT_MOCK"))
+
+
 def _install_ll_hook(dispatch):
     """Hotkeys por EVENTO real de tecla (WH_KEYBOARD_LL).
 
@@ -149,7 +165,7 @@ def _install_ll_hook(dispatch):
             if ncode == 0:
                 if wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                     event = lparam.contents
-                    if event.flags & 0x10:
+                    if event.flags & 0x10 and not _ACCEPT_INJECTED_KEYS:
                         return u32.CallNextHookEx(None, ncode, wparam, lparam)
                     vk = event.vkCode
                     swallow = False
@@ -166,7 +182,7 @@ def _install_ll_hook(dispatch):
                         return 1
                 elif wparam in (WM_KEYUP, WM_SYSKEYUP):
                     event = lparam.contents
-                    if event.flags & 0x10:
+                    if event.flags & 0x10 and not _ACCEPT_INJECTED_KEYS:
                         return u32.CallNextHookEx(None, ncode, wparam, lparam)
                     vk = event.vkCode
                     swallow = False
@@ -204,6 +220,7 @@ def render_markdown(doc, text, font_px=13, color="#d4d6d9"):
         QTextDocument.MarkdownFeature.MarkdownDialectGitHub
         | QTextDocument.MarkdownFeature.MarkdownNoHTML
     )
+    doc.setIndentWidth(16)
     doc.setMarkdown(text or "", features)
     base_format = QTextCharFormat()
     base_format.setForeground(QColor(color))
@@ -237,10 +254,29 @@ def render_markdown(doc, text, font_px=13, color="#d4d6d9"):
             fenced = all_fixed_pitch
 
         cursor = QTextCursor(block)
+        if block_format.headingLevel() > 0:
+            block_format.setTopMargin(6)
+            block_format.setBottomMargin(2)
+            cursor.setBlockFormat(block_format)
+            fmt = QTextCharFormat()
+            fmt.setFontWeight(QFont.Weight.Bold)
+            fmt.setProperty(QTextFormat.Property.FontPixelSize, font_px + 1)
+            fmt.setProperty(QTextFormat.Property.FontSizeAdjustment, 0)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.StartOfBlock)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.EndOfBlock,
+                QTextCursor.MoveMode.KeepAnchor)
+            cursor.mergeCharFormat(fmt)
+            block = block.next()
+            continue
         if fenced:
             block_format.setBackground(QColor("#15171a"))
             block_format.setLeftMargin(8)
             block_format.setRightMargin(8)
+            # El importador de Markdown marca el código como no partible y
+            # las líneas largas se salían de la columna sin scroll.
+            block_format.setNonBreakableLines(False)
             cursor.setBlockFormat(block_format)
             fmt = QTextCharFormat()
             fmt.setFontFamily("Consolas")
@@ -348,6 +384,32 @@ class _VersionHistoryLabel(QLabel):
         super().keyPressEvent(event)
 
 
+_COLUMN_SCROLL_STYLE = (
+    "QScrollArea { background: transparent; border: none; }"
+    "QScrollBar:vertical { background: #202226; width: 8px; }"
+    "QScrollBar::handle:vertical { background: #4a4d53; border-radius: 4px; }"
+    "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical"
+    " { background: none; }"
+    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+    " { height: 0; }")
+
+
+def _accept_diagram(source):
+    return diagram.parse_mermaid(source) is not None
+
+
+def _apply_markdown_and_diagrams(body, stack, text, font_px, color):
+    markdown, sources, has_open = diagram.split_mermaid(
+        text, accept=_accept_diagram)
+    markdown = diagram.drop_empty_headings(markdown)
+    render_markdown(body.document(), markdown, font_px, color=color)
+    body.setVisible(bool(markdown.strip()))
+    graphs = {source: diagram.parse_mermaid(source) for source in sources}
+    if stack is not None:
+        stack.set_sources(graphs, has_open)
+    return graphs, has_open
+
+
 class AnswerVersion:
     def __init__(self, key, model_label, font_px, card):
         self.key = key
@@ -374,7 +436,11 @@ class AnswerVersion:
             card.toggle_version(version_key))
         self.row_layout.addWidget(self.button)
 
-        self.body = _AutoHeightBrowser(self.row)
+        self.content = QWidget(self.row)
+        content_layout = QVBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        self.body = _AutoHeightBrowser(self.content)
         body_font = QFont("Segoe UI")
         body_font.setPixelSize(font_px)
         self.body.setFont(body_font)
@@ -387,8 +453,14 @@ class AnswerVersion:
             "QTextBrowser { background: transparent; border: none; }")
         self.body.document().setDocumentMargin(0)
         self.body.height_changed.connect(card._body_height_changed)
-        self.row_layout.addWidget(self.body)
-        self.body.hide()
+        content_layout.addWidget(self.body)
+        self.stack = DiagramStack(self.content)
+        self.stack.set_caption("Diagrama")
+        self.stack.height_changed.connect(card._body_height_changed)
+        self.diagrams = ({}, False)
+        content_layout.addWidget(self.stack)
+        self.row_layout.addWidget(self.content)
+        self.content.hide()
         self.row.hide()
 
         self._render_timer = QTimer(card)
@@ -421,55 +493,247 @@ class AnswerVersion:
             self.card._render_version(self)
 
 
+class DetailSection(QFrame):
+    """Bloque «detalles» (Sol) bajo la respuesta rápida de una tarjeta."""
+
+    def __init__(self, card, font_px):
+        super().__init__(card)
+        self.card = card
+        self.font_px = font_px
+        self.key = None
+        self.model_label = ""
+        self.pending_text = ""
+        self.text = ""
+        self.state = "idle"
+        self.status_message = ""
+        self.error_text = ""
+        self.started_at = time.monotonic()
+        self.finished_at = None
+        self._last_render = 0.0
+        self._pending_render = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(2)
+        self.separator = QFrame(self)
+        self.separator.setFixedHeight(1)
+        self.separator.setStyleSheet("background: #3a3d42; border: none;")
+        layout.addWidget(self.separator)
+        self.header = _ElidedLabel("", self)
+        self._style_header(False)
+        layout.addWidget(self.header)
+        self.body = _AutoHeightBrowser(self)
+        body_font = QFont("Segoe UI")
+        body_font.setPixelSize(font_px)
+        self.body.setFont(body_font)
+        self.body.setReadOnly(True)
+        self.body.setOpenExternalLinks(False)
+        self.body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.body.setFrameShape(QFrame.NoFrame)
+        self.body.setStyleSheet(
+            "QTextBrowser { background: transparent; border: none; }")
+        self.body.document().setDocumentMargin(0)
+        self.body.height_changed.connect(card._body_height_changed)
+        layout.addWidget(self.body)
+        self.body.hide()
+        self.stack = DiagramStack(self)
+        self.stack.set_caption("Diagrama")
+        self.stack.height_changed.connect(card._body_height_changed)
+        self.diagrams = ({}, False)
+        layout.addWidget(self.stack)
+        self.hide()
+
+        self._render_timer = QTimer(card)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_pending)
+
+    def _style_header(self, error):
+        color = "#e57373" if error else "#8e9297"
+        self.header.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-weight: normal;")
+
+    @property
+    def active(self):
+        return self.state in ("pending", "running")
+
+    def elapsed_label(self):
+        end = self.finished_at or time.monotonic()
+        return f"{max(0.0, end - self.started_at):.1f}s"
+
+    def begin(self, key, model_label, pending_text):
+        self._render_timer.stop()
+        self._pending_render = False
+        self.key = key
+        self.model_label = model_label
+        self.pending_text = pending_text
+        self.text = ""
+        self.status_message = ""
+        self.error_text = ""
+        self.finished_at = None
+        self.started_at = time.monotonic()
+        self.state = "pending"
+        self.body.hide()
+        self.body.document().clear()
+        self.stack.set_sources({}, False)
+        self.diagrams = ({}, False)
+        self.show()
+        self.refresh_header()
+
+    def run(self):
+        if self.state == "pending":
+            self.state = "running"
+            self.started_at = time.monotonic()
+            self.refresh_header()
+
+    def cancel(self):
+        self._render_timer.stop()
+        self._pending_render = False
+        self.state = "idle"
+        self.key = None
+        self.hide()
+
+    def hide_section(self):
+        self._render_timer.stop()
+        self._pending_render = False
+        self.hide()
+
+    def refresh_header(self):
+        if self.state == "idle":
+            return
+        if self.state == "error":
+            status = f"error: {self.error_text}"
+        elif self.state == "pending":
+            status = self.pending_text
+        elif self.state == "running":
+            status = (self.status_message
+                      or f"pensando… {self.elapsed_label()}")
+        else:
+            status = self.status_message or self.elapsed_label()
+        self._style_header(self.state == "error")
+        self.header.set_full_text(f"{self.model_label} · detalles · {status}")
+
+    def set_status(self, text):
+        self.status_message = text or ""
+        self.refresh_header()
+
+    def set_text(self, text, final=False, ok=True):
+        if not ok:
+            self.state = "error"
+            self.finished_at = time.monotonic()
+            self.status_message = ""
+            self.error_text = (text or "Error").removeprefix("Error:").strip()
+            self._render_timer.stop()
+            self._pending_render = False
+            self.refresh_header()
+            return
+        self.run()
+        self.text = text or ""
+        self.status_message = ""
+        if final:
+            self.state = "done"
+            self.finished_at = time.monotonic()
+        self.refresh_header()
+        self.queue_render(final)
+
+    def queue_render(self, final=False):
+        if not final and self._last_render:
+            remaining = 0.05 - (time.monotonic() - self._last_render)
+            if remaining > 0:
+                self._pending_render = True
+                if not self._render_timer.isActive():
+                    self._render_timer.start(
+                        max(1, int(remaining * 1000) + 1))
+                return
+        self._render_timer.stop()
+        self._pending_render = False
+        self.render()
+
+    def _render_pending(self):
+        if self._pending_render:
+            self._pending_render = False
+            self.render()
+
+    def render(self):
+        self.diagrams = _apply_markdown_and_diagrams(
+            self.body, None if self.card.side_by_side else self.stack,
+            self.text, self.font_px, "#d4d6d9")
+        self.card._refresh_side_diagrams()
+        self._last_render = time.monotonic()
+        self.body.recompute_height()
+        self.body.updateGeometry()
+        self.card._body_height_changed()
+
+    def visible_text(self):
+        return self.text if not self.isHidden() else ""
+
+
 class _ElidedLabel(QLabel):
+    """Una línea elidida que NUNCA ensancha su contenedor: el QLabel normal
+    exige como mínimo el ancho del texto completo y una pregunta larga
+    hacía la columna más ancha que su visor, cortando la respuesta."""
+
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self._full_text = text
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+    def minimumSizeHint(self):
+        return QSize(40, super().minimumSizeHint().height())
+
+    def sizeHint(self):
+        return QSize(120, super().sizeHint().height())
+
+    def full_text(self):
+        return self._full_text
+
+    def set_full_text(self, text):
+        self._full_text = text
+        self._elide(self.width())
+
+    def _elide(self, width):
+        metrics = QFontMetrics(self.font())
+        self.setText(metrics.elidedText(
+            self._full_text, Qt.ElideRight, max(1, width)))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        metrics = QFontMetrics(self.font())
-        self.setText(metrics.elidedText(
-            self._full_text, Qt.ElideRight, max(1, event.size().width())))
+        self._elide(event.size().width())
 
 
 class AnswerCard(QFrame):
     content_changed = Signal()
 
     def __init__(self, kind, model_label, question, font_px=13, parent=None,
-                 key=None):
+                 key=None, side_by_side=False):
         super().__init__(parent)
+        self.side_by_side = side_by_side
+        self._root_placed = False
         self.kind = kind
         self.font_px = font_px
         self.question = question or "(transcript completo)"
         self.versions = []
         self._versions_by_key = {}
         self._content_version = None
-        self._main_body = None
+        self._main_content = None
         self.setObjectName("AnswerCard")
         self.setStyleSheet(
             "QFrame#AnswerCard { background: transparent; border: none; }"
             "QLabel { background: transparent; }")
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(3, 3, 3, 3)
-        layout.setSpacing(2)
         self.history_container = QWidget(self)
         self.history_layout = QVBoxLayout(self.history_container)
         self.history_layout.setContentsMargins(0, 0, 0, 0)
         self.history_layout.setSpacing(1)
-        layout.addWidget(self.history_container)
 
-        self.pending_label = QLabel()
+        self.pending_label = _ElidedLabel("")
         self.pending_label.setStyleSheet(
             "color: #8e9297; font-size: 11px; font-weight: normal;")
         self.pending_label.hide()
-        layout.addWidget(self.pending_label)
 
-        self.header_label = QLabel()
+        self.header_label = _ElidedLabel("")
         self.header_label.setStyleSheet(
             "color: #8e9297; font-size: 11px; font-weight: normal;")
-        layout.addWidget(self.header_label)
 
         self.question_label = _ElidedLabel(
             f"«…» {self.question.strip()}")
@@ -477,7 +741,31 @@ class AnswerCard(QFrame):
         self.question_label.setStyleSheet(
             f"color: #8e9297; font-style: italic; "
             f"font-size: {11 if font_px <= 13 else 12}px;")
-        layout.addWidget(self.question_label)
+
+        self.verify_label = QLabel()
+        self.verify_label.setWordWrap(True)
+        self.verify_label.setTextFormat(Qt.PlainText)
+        self.verify_label.setMaximumHeight(32)
+        self.verify_label.hide()
+
+        self.main_slot = QVBoxLayout()
+        self.main_slot.setContentsMargins(0, 0, 0, 0)
+        self.main_slot.setSpacing(0)
+        self.detail = DetailSection(self, font_px)
+
+        if side_by_side:
+            self._build_columns()
+        else:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(3, 3, 3, 3)
+            layout.setSpacing(2)
+            layout.addWidget(self.history_container)
+            layout.addWidget(self.pending_label)
+            layout.addWidget(self.header_label)
+            layout.addWidget(self.question_label)
+            layout.addWidget(self.verify_label)
+            layout.addLayout(self.main_slot)
+            layout.addWidget(self.detail)
 
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._refresh_status_lines)
@@ -486,6 +774,111 @@ class AnswerCard(QFrame):
         self.body = initial.body
         self._refresh_version_layout()
         self._elapsed_timer.start(100)
+
+    def _make_column(self):
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(_COLUMN_SCROLL_STYLE)
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setMinimumWidth(120)
+        panel = QWidget()
+        panel.setObjectName("ColumnPanel")
+        panel.setStyleSheet("QWidget#ColumnPanel { background: transparent; }")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 6, 0)
+        layout.setSpacing(2)
+        scroll.setWidget(panel)
+        return scroll, panel, layout
+
+    def _build_columns(self):
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(3, 3, 3, 3)
+        outer.setSpacing(8)
+        self.left_scroll, self.left_panel, left = self._make_column()
+        left.addWidget(self.header_label)
+        left.addWidget(self.question_label)
+        left.addWidget(self.verify_label)
+        left.addLayout(self.main_slot)
+        self.side_stack = DiagramStack(self)
+        self.side_stack.set_caption("Diagrama")
+        self.side_stack.height_changed.connect(self._body_height_changed)
+        left.addWidget(self.side_stack)
+        left.addStretch(1)
+        self.separator = QFrame(self)
+        self.separator.setFixedWidth(1)
+        self.separator.setStyleSheet("background: #3a3d42; border: none;")
+        self.right_scroll, self.right_panel, right = self._make_column()
+        self.right_header_label = _ElidedLabel("")
+        self.right_header_label.setStyleSheet(
+            "color: #8e9297; font-size: 11px; font-weight: normal;")
+        self.right_header_label.hide()
+        self.right_slot = QVBoxLayout()
+        self.right_slot.setContentsMargins(0, 0, 0, 0)
+        self.right_slot.setSpacing(0)
+        right.addWidget(self.history_container)
+        right.addWidget(self.pending_label)
+        right.addWidget(self.right_header_label)
+        right.addLayout(self.right_slot)
+        right.addWidget(self.detail)
+        right.addStretch(1)
+        outer.addWidget(self.left_scroll, 2)
+        outer.addWidget(self.separator)
+        outer.addWidget(self.right_scroll, 3)
+        self.right_scroll.hide()
+        self.separator.hide()
+
+    @property
+    def two_columns(self):
+        return (self.side_by_side
+                and (len(self.versions) > 1 or not self.detail.isHidden()))
+
+    def streaming(self):
+        return (any(v.finished_at is None for v in self.versions)
+                or self.detail.active)
+
+    def _refresh_side_diagrams(self):
+        if not self.side_by_side:
+            return
+        root = self.versions[0]
+        current = self._content_version
+        if current is not root:
+            section = current
+        elif not self.detail.isHidden():
+            section = self.detail
+        else:
+            section = None
+        graphs, drawing = section.diagrams if section else ({}, False)
+        label = section.model_label if section else ""
+        self.side_stack.set_caption(
+            f"Diagrama · {label}" if label else "Diagrama")
+        self.side_stack.set_sources(graphs, drawing)
+
+    def _update_columns(self):
+        two = self.two_columns
+        self.right_scroll.setVisible(two)
+        self.separator.setVisible(two)
+
+    def _column_height(self, scroll, panel):
+        layout = panel.layout()
+        width = scroll.viewport().width()
+        if width > 40 and layout.hasHeightForWidth():
+            return layout.totalHeightForWidth(width)
+        return layout.sizeHint().height()
+
+    def content_height(self):
+        if not self.side_by_side:
+            return self.sizeHint().height()
+        heights = [self._column_height(self.left_scroll, self.left_panel)]
+        if self.two_columns:
+            heights.append(
+                self._column_height(self.right_scroll, self.right_panel))
+        return max(heights) + 6
+
+    def _is_primary(self, version):
+        return (version is self._content_version
+                or (self.side_by_side and version is self.versions[0]))
 
     @property
     def current_version(self):
@@ -510,41 +903,94 @@ class AnswerCard(QFrame):
         self._refresh_status_lines()
         return version
 
+    def _refresh_side_layout(self):
+        while self.history_layout.count():
+            item = self.history_layout.takeAt(0)
+            if item.widget():
+                item.widget().hide()
+
+        root = self.versions[0]
+        current = self._content_version
+        if not self._root_placed:
+            root.row_layout.removeWidget(root.content)
+            root.content.setParent(self)
+            self.main_slot.addWidget(root.content)
+            self._root_placed = True
+        root.content.show()
+        right = current if current is not root else None
+        for version in self.versions[1:]:
+            if version is right:
+                continue
+            if version.content.parent() is not version.row:
+                self.right_slot.removeWidget(version.content)
+                version.content.setParent(version.row)
+                version.row_layout.addWidget(version.content)
+        if right is not None:
+            if right.content.parent() is not self.right_panel:
+                right.row_layout.removeWidget(right.content)
+                right.content.setParent(self)
+                self.right_slot.addWidget(right.content)
+            right.content.show()
+        self.body = current.body
+        current_index = self.versions.index(current)
+        if current_index > 0:
+            self.detail.hide_section()
+        for version in self.versions[1:current_index]:
+            if not version.text.strip():
+                version.row.hide()
+                continue
+            self._refresh_version_button(version)
+            version.button.show()
+            version.content.setVisible(version.expanded)
+            self.history_layout.addWidget(version.row)
+            version.row.show()
+        self.history_container.setVisible(bool(self.history_layout.count()))
+        self._update_columns()
+        self._refresh_side_diagrams()
+        self._refresh_status_lines()
+        self.updateGeometry()
+        self.content_changed.emit()
+
     def _refresh_version_layout(self):
+        if self.side_by_side:
+            self._refresh_side_layout()
+            return
         while self.history_layout.count():
             item = self.history_layout.takeAt(0)
             if item.widget():
                 item.widget().hide()
 
         current = self._content_version
-        if self._main_body is not current.body:
+        if self._main_content is not current.content:
             previous = next(
                 (version for version in self.versions
-                 if version.body is self._main_body),
+                 if version.content is self._main_content),
                 None)
             if previous is not None:
-                self.layout().removeWidget(previous.body)
-                previous.body.setParent(previous.row)
-                previous.row_layout.addWidget(previous.body)
-            current.row_layout.removeWidget(current.body)
-            current.body.setParent(self)
-            self.layout().addWidget(current.body)
-            self._main_body = current.body
-        current.body.show()
+                self.main_slot.removeWidget(previous.content)
+                previous.content.setParent(previous.row)
+                previous.row_layout.addWidget(previous.content)
+            current.row_layout.removeWidget(current.content)
+            current.content.setParent(self)
+            self.main_slot.addWidget(current.content)
+            self._main_content = current.content
+        current.content.show()
         self.body = current.body
+        if self.versions.index(current) > 0:
+            self.detail.hide_section()
 
         current_index = self.versions.index(current)
         for version in self.versions[:current_index]:
             if not version.text.strip():
                 version.row.hide()
                 continue
-            if version.body.parent() is not version.row:
-                self.layout().removeWidget(version.body)
-                version.body.setParent(version.row)
-                version.row_layout.addWidget(version.body)
+            if version.content.parent() is not version.row:
+                self.main_slot.removeWidget(version.content)
+                version.content.setParent(version.row)
+                version.row_layout.addWidget(version.content)
             self._refresh_version_button(version)
             version.button.show()
-            version.body.setVisible(version.expanded)
+            version.content.setVisible(version.expanded)
             self.history_layout.addWidget(version.row)
             version.row.show()
 
@@ -559,7 +1005,54 @@ class AnswerCard(QFrame):
             f"{arrow} Anterior · {version.model_label} · "
             f"{version.elapsed_label()}")
 
+    @staticmethod
+    def _version_status(version):
+        if version.error_text:
+            return f"error: {version.error_text}", "#e57373"
+        status = (version.status_message
+                  or (version.elapsed_label() if version.done
+                      else f"pensando… {version.elapsed_label()}"))
+        return status, "#8e9297"
+
+    def _refresh_side_status_lines(self):
+        root = self.versions[0]
+        latest = self.latest_version
+        current = self._content_version
+        status, color = self._version_status(root)
+        self.header_label.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-weight: normal;")
+        self.header_label.set_full_text(f"{root.model_label} · {status}")
+        if current is not root:
+            status, color = self._version_status(current)
+            self.right_header_label.setStyleSheet(
+                f"color: {color}; font-size: 11px; font-weight: normal;")
+            self.right_header_label.set_full_text(
+                f"{current.model_label} · {status}")
+            self.right_header_label.show()
+        else:
+            self.right_header_label.hide()
+        if (latest is not root and latest is not current
+                and not latest.text.strip()):
+            status, color = self._version_status(latest)
+            self.pending_label.setStyleSheet(
+                f"color: {color}; font-size: 11px; font-weight: normal;")
+            self.pending_label.set_full_text(f"{latest.model_label} · {status}")
+            self.pending_label.show()
+        else:
+            self.pending_label.hide()
+        for version in self.versions:
+            if version is not latest and version.text.strip():
+                self._refresh_version_button(version)
+        if not self.detail.isHidden():
+            self.detail.refresh_header()
+        if (not any(not version.done for version in self.versions)
+                and not (self.detail.active and not self.detail.isHidden())):
+            self._elapsed_timer.stop()
+
     def _refresh_status_lines(self):
+        if self.side_by_side:
+            self._refresh_side_status_lines()
+            return
         latest = self.latest_version
         pending = latest is not self._content_version and not latest.text.strip()
         if pending:
@@ -574,7 +1067,7 @@ class AnswerCard(QFrame):
                     latest.status_message
                     or (latest.elapsed_label() if latest.done
                         else f"pensando… {latest.elapsed_label()}"))
-            self.pending_label.setText(
+            self.pending_label.set_full_text(
                 f"{latest.model_label} · {pending_status}")
             self.pending_label.show()
             visible = self._content_version
@@ -593,14 +1086,72 @@ class AnswerCard(QFrame):
                 visible.status_message
                 or (visible.elapsed_label() if visible.done
                     else f"pensando… {visible.elapsed_label()}"))
-        self.header_label.setText(f"{visible.model_label} · {status}")
+        self.header_label.set_full_text(f"{visible.model_label} · {status}")
         for version in self.versions:
             if version is not latest and version.text.strip():
                 self._refresh_version_button(version)
-        if not any(not version.done for version in self.versions):
+        if not self.detail.isHidden():
+            self.detail.refresh_header()
+        if (not any(not version.done for version in self.versions)
+                and not (self.detail.active and not self.detail.isHidden())):
             self._elapsed_timer.stop()
 
+    def set_verified(self, result):
+        label = self.verify_label
+        if not result:
+            label.hide()
+            label.setToolTip("")
+        else:
+            question = result.get("question") or ""
+            tooltip = ""
+            if result.get("skipped") or not result.get("changed"):
+                text, color = "✓ transcripción verificada", "#6f7378"
+            elif not result.get("material"):
+                text, color = f"✓ verificada: «{question}»", "#9aa0a6"
+            else:
+                text = (f"⚠ Luna pudo oír mal — Sol responde a: "
+                        f"«{question}»")
+                color = "#fdd663"
+                tooltip = "\n".join(result.get("corrections") or [])
+            label.setStyleSheet(
+                f"color: {color}; font-size: 11px; font-weight: normal;")
+            label.setText(text)
+            label.setToolTip(tooltip)
+            label.show()
+        self.updateGeometry()
+        self.content_changed.emit()
+
+    def _is_detail(self, key):
+        return self.detail.key is not None and key == self.detail.key
+
+    def start_detail(self, key, model_label, pending_text):
+        self.detail.begin(key, model_label, pending_text)
+        if self.side_by_side:
+            self._update_columns()
+            self._refresh_side_diagrams()
+        self._elapsed_timer.start(100)
+        self.updateGeometry()
+        self.content_changed.emit()
+
+    def begin_detail(self, key):
+        if self._is_detail(key):
+            self.detail.run()
+            self.updateGeometry()
+            self.content_changed.emit()
+
+    def cancel_detail(self, key):
+        if self._is_detail(key):
+            self.detail.cancel()
+            if self.side_by_side:
+                self._update_columns()
+                self._refresh_side_diagrams()
+            self.updateGeometry()
+            self.content_changed.emit()
+
     def set_status(self, key, text):
+        if self._is_detail(key):
+            self.detail.set_status(text)
+            return
         version = self._versions_by_key.get(key)
         if version is None:
             return
@@ -608,6 +1159,11 @@ class AnswerCard(QFrame):
         self._refresh_status_lines()
 
     def set_stream_text(self, key, text, final=False, ok=True):
+        if self._is_detail(key):
+            self.detail.set_text(text, final=final, ok=ok)
+            self.updateGeometry()
+            self.content_changed.emit()
+            return
         version = self._versions_by_key.get(key)
         if version is None:
             return
@@ -652,11 +1208,12 @@ class AnswerCard(QFrame):
     def toggle_version(self, key):
         version = self._versions_by_key.get(key)
         if (version is None or version is self._content_version
-                or not version.text.strip()):
+                or not version.text.strip()
+                or (self.side_by_side and version is self.versions[0])):
             return
         version.expanded = not version.expanded
         self._refresh_version_button(version)
-        version.body.setVisible(version.expanded)
+        version.content.setVisible(version.expanded)
         version.row.updateGeometry()
         self.history_container.updateGeometry()
         self.updateGeometry()
@@ -664,9 +1221,12 @@ class AnswerCard(QFrame):
 
     def _render_version(self, version):
         color = (
-            "#d4d6d9" if version is self._content_version else "#8e9297")
-        render_markdown(
-            version.body.document(), version.text, self.font_px, color=color)
+            "#d4d6d9" if self._is_primary(version) else "#8e9297")
+        own_stack = not (self.side_by_side and version is not self.versions[0])
+        version.diagrams = _apply_markdown_and_diagrams(
+            version.body, version.stack if own_stack else None,
+            version.text, self.font_px, color)
+        self._refresh_side_diagrams()
         version._last_render = time.monotonic()
         version.body.recompute_height()
         version.body.updateGeometry()
@@ -677,17 +1237,34 @@ class AnswerCard(QFrame):
         self.updateGeometry()
         self.content_changed.emit()
 
+    def _visible_code_texts(self):
+        texts = [version.text for version in self._visible_code_versions()]
+        detail_text = self.detail.visible_text()
+        if detail_text:
+            texts.append(detail_text)
+        return [diagram.split_mermaid(text, accept=_accept_diagram)[0]
+                for text in texts]
+
+    def diagram_width(self):
+        widths = [version.stack.natural_width()
+                  for version in self._visible_code_versions()]
+        if not self.detail.isHidden():
+            widths.append(self.detail.stack.natural_width())
+        if self.side_by_side:
+            widths.append(self.side_stack.natural_width())
+        return max(widths, default=0.0)
+
     def has_code_block(self):
         return any(
-            re.search(r"```[^\n]*\n", version.text)
-            for version in self._visible_code_versions())
+            re.search(r"```[^\n]*\n", text)
+            for text in self._visible_code_texts())
 
     def longest_code_line(self):
         blocks = [
             block
-            for version in self._visible_code_versions()
+            for text in self._visible_code_texts()
             for block in re.findall(
-                r"```[^\n]*\n(.*?)(?:```|$)", version.text, re.S)
+                r"```[^\n]*\n(.*?)(?:```|$)", text, re.S)
         ]
         return max(
             (len(line) for block in blocks for line in block.splitlines()),
@@ -702,10 +1279,12 @@ class AnswerCard(QFrame):
 
 class AnswerFeed(QScrollArea):
     content_changed = Signal()
+    answer_started = Signal()
 
-    def __init__(self, font_px=13, parent=None):
+    def __init__(self, font_px=13, parent=None, side_by_side=False):
         super().__init__(parent)
         self.font_px = font_px
+        self.side_by_side = side_by_side
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -713,6 +1292,10 @@ class AnswerFeed(QScrollArea):
             "QScrollArea { background: transparent; border: none; }"
             "QScrollBar:vertical { background: #202226; width: 8px; }"
             "QScrollBar::handle:vertical { background: #4a4d53; border-radius: 4px; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical"
+            " { background: none; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            " { height: 0; }"
         )
         self.container = QWidget()
         self.container.setStyleSheet("background: transparent;")
@@ -735,12 +1318,13 @@ class AnswerFeed(QScrollArea):
         self.clear()
         card = AnswerCard(
             kind, model_label, question, self.font_px, parent=self.container,
-            key=key)
+            key=key, side_by_side=self.side_by_side)
         card.content_changed.connect(self._schedule_content_changed)
         self._cards.append((key, card))
         self._by_key[key] = card
         self.layout.insertWidget(self.layout.count() - 1, card)
         self._anchor = card
+        self.answer_started.emit()
         self._schedule_content_changed()
         return card
 
@@ -751,8 +1335,37 @@ class AnswerFeed(QScrollArea):
         card.add_version(key, model_label)
         self._by_key[key] = card
         self._anchor = card
+        self.answer_started.emit()
         self._schedule_content_changed()
         return card
+
+    def set_verified(self, key, result):
+        card = self._by_key.get(key)
+        if card:
+            card.set_verified(result)
+            self._schedule_content_changed()
+
+    def start_detail(self, parent_key, key, model_label, pending_text):
+        card = self._by_key.get(parent_key)
+        if not isinstance(card, AnswerCard):
+            return None
+        card.start_detail(key, model_label, pending_text)
+        self._by_key[key] = card
+        self.answer_started.emit()
+        self._schedule_content_changed()
+        return card
+
+    def begin_detail(self, key):
+        card = self._by_key.get(key)
+        if card:
+            card.begin_detail(key)
+            self._schedule_content_changed()
+
+    def cancel_detail(self, key):
+        card = self._by_key.get(key)
+        if card:
+            card.cancel_detail(key)
+            self._schedule_content_changed()
 
     def update(self, key, text):
         card = self._by_key.get(key)
@@ -781,7 +1394,27 @@ class AnswerFeed(QScrollArea):
         self._schedule_content_changed()
 
     def content_height(self):
+        if self.side_by_side:
+            return sum(card.content_height() for _, card in self._cards)
         return self.container.sizeHint().height()
+
+    def two_columns(self):
+        return any(card.two_columns for _, card in self._cards)
+
+    def streaming(self):
+        return any(card.streaming() for _, card in self._cards)
+
+    def _fit_side_cards(self):
+        if not self.side_by_side:
+            return
+        viewport_height = self.viewport().height()
+        for _, card in self._cards:
+            height = card.content_height()
+            if viewport_height > 0:
+                height = min(height, viewport_height)
+            height = max(1, height)
+            if card.minimumHeight() != height or card.maximumHeight() != height:
+                card.setFixedHeight(height)
 
     def _schedule_content_changed(self):
         if self._content_change_pending:
@@ -791,12 +1424,17 @@ class AnswerFeed(QScrollArea):
 
     def _emit_content_changed(self):
         self._content_change_pending = False
+        if not shiboken6.isValid(self):
+            return  # el feed se cerró con un aviso diferido pendiente
+        self._fit_side_cards()
         self.container.updateGeometry()
         self.content_changed.emit()
         QTimer.singleShot(0, self._emit_layout_content_changed)
         QTimer.singleShot(0, self._apply_anchor)
 
     def _emit_layout_content_changed(self):
+        if not shiboken6.isValid(self):
+            return
         self.container.updateGeometry()
         self.content_changed.emit()
 
@@ -818,6 +1456,10 @@ class AnswerFeed(QScrollArea):
         self._anchor = None
         super().wheelEvent(event)
 
+    def diagram_width(self):
+        return max((card.diagram_width() for _, card in self._cards),
+                   default=0.0)
+
     def has_code_block(self):
         return any(card.has_code_block() for _, card in self._cards)
 
@@ -829,6 +1471,10 @@ class AnswerFeed(QScrollArea):
         super().showEvent(event)
         QTimer.singleShot(0, self._apply_anchor)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_side_cards()
+
 
 class CompactOverlay(QWidget):
     """Panel compacto de respuestas que solo se muestra con Ctrl+I."""
@@ -836,6 +1482,9 @@ class CompactOverlay(QWidget):
     WIDTH = 460
     MIN_H = 200
     MIN_OPACITY = 0.30
+    # Al pulsar Ctrl+Q el panel reserva de golpe una altura de lectura en
+    # vez de ir creciendo token a token detrás de Luna.
+    RESERVE_FRACTION = 0.60
 
     def __init__(self):
         super().__init__(
@@ -872,20 +1521,24 @@ class CompactOverlay(QWidget):
         panel_layout.addWidget(self.status_label)
 
         self.interviewer_live = QLabel("")
+        self.interviewer_live.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.interviewer_live.setStyleSheet("color: #8ab4f8; font-size: 11px;")
         self.interviewer_live.setMaximumHeight(34)
         self.you_live = QLabel("")
+        self.you_live.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.you_live.setStyleSheet("color: #81c995; font-size: 11px;")
         self.you_live.setMaximumHeight(34)
         panel_layout.addWidget(self.interviewer_live)
         panel_layout.addWidget(self.you_live)
 
-        self.feed = AnswerFeed(font_px=13, parent=panel)
+        self.feed = AnswerFeed(font_px=13, parent=panel, side_by_side=True)
         panel_layout.addWidget(self.feed, 1)
         self.feed.content_changed.connect(self._schedule_resize)
+        self.feed.answer_started.connect(self._reserve_for_answer)
+        self._last_final_height = None
 
         legend = QLabel(
-            "Ctrl+Q responder · Alt+S más a fondo · Alt+G enviar · Ctrl+M auto "
+            "Ctrl+Q responder · Alt+S más a fondo · Alt+W dibujar · Alt+G enviar "
             "· Alt+T start/stop · Ctrl+←↑→↓ mover · Ctrl+± opacidad "
             "· Ctrl+I ocultar")
         legend.setWordWrap(True)
@@ -924,6 +1577,14 @@ class CompactOverlay(QWidget):
         self.status_label.setStyleSheet("color: #fdd663; font-size: 11px;")
         self._ack_timer.start(1400)
 
+    def clear_live(self):
+        """Borra las líneas en directo (finales y parciales) — «Limpiar»
+        y los reinicios de transcripción también vacían el panel."""
+        self._live_lines = {"Entrevistador": [], "Tú": []}
+        self._live_partial.clear()
+        self.interviewer_live.setText("")
+        self.you_live.setText("")
+
     def set_live(self, lane, text, final=False):
         lane = lane if lane in self._live_lines else "Entrevistador"
         text = (text or "").strip()
@@ -957,10 +1618,10 @@ class CompactOverlay(QWidget):
     def _schedule_resize(self, *_):
         self._resize_timer.start(120)
 
-    def _resize_to_content(self):
-        screen = self.screen() or QApplication.primaryScreen()
-        available = screen.availableGeometry()
-        max_height = int(available.height() * 0.85)
+    def _desired_size(self, available):
+        two_columns = self.feed.two_columns()
+        height_cap = int(round(available.height() * (
+            0.92 if two_columns else 0.85)))
         if self.isVisible() and self.feed.height() > 0:
             chrome = self.height() - self.feed.height()
         else:
@@ -968,26 +1629,88 @@ class CompactOverlay(QWidget):
                 self.layout().sizeHint().height()
                 - self.feed.sizeHint().height())
         target_height = int(max(
-            self.MIN_H, min(chrome + self.feed.content_height(), max_height)))
-        self.feed.setMaximumHeight(max(32, target_height - chrome))
-        longest = self.feed.longest_code_line() if self.feed.has_code_block() else 0
+            self.MIN_H,
+            min(chrome + self.feed.content_height(), height_cap)))
+        if two_columns:
+            desired_width = max(900, int(round(available.width() * 0.72)))
+            desired_width = min(desired_width, 1600, available.width() - 16)
+            return desired_width, target_height, chrome
+        longest = (self.feed.longest_code_line()
+                   if self.feed.has_code_block() else 0)
         desired_width = 460
         if longest:
             desired_width = int(max(460, min(780, longest * 8.5 + 110)))
-        desired_width = min(desired_width, available.width())
+        diagram_width = self.feed.diagram_width()
+        if diagram_width:
+            desired_width = int(max(
+                desired_width, min(780, diagram_width + 60)))
+        return min(desired_width, available.width()), target_height, chrome
+
+    def _height_cap(self, available):
+        return int(round(available.height() * (
+            0.92 if self.feed.two_columns() else 0.85)))
+
+    def reserve_height(self, available):
+        """Altura que se reserva al empezar una respuesta: la de la última
+        respuesta completa (si la hubo) o una fracción de la pantalla."""
+        cap = self._height_cap(available)
+        reserve = int(round(cap * self.RESERVE_FRACTION))
+        if self._last_final_height:
+            reserve = max(reserve, self._last_final_height)
+        return max(self.MIN_H, min(reserve, cap))
+
+    def _reserve_for_answer(self):
+        if not self.isVisible():
+            return
+        self._resize_timer.stop()
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        desired_width, _, chrome = self._desired_size(available)
+        target_height = max(self.height(), self.reserve_height(available))
+        self._apply_geometry(available, desired_width, target_height,
+                             chrome, animate=False)
+
+    def _apply_geometry(self, available, desired_width, target_height,
+                        chrome, animate):
+        self.feed.setMaximumHeight(max(32, target_height - chrome))
         x = min(max(self.x(), available.left()),
                 available.right() - desired_width + 1)
         y = min(max(self.y(), available.top()),
                 available.bottom() - target_height + 1)
+        self._resize_animation.stop()
+        rect = QRect(x, y, desired_width, target_height)
+        if not animate:
+            self.setGeometry(rect)
+            return
         if (abs(target_height - self.height()) < 8
                 and abs(desired_width - self.width()) < 8
                 and (x, y) == (self.x(), self.y())):
             return
-        self._resize_animation.stop()
         self._resize_animation.setStartValue(self.geometry())
-        self._resize_animation.setEndValue(
-            QRect(x, y, desired_width, target_height))
+        self._resize_animation.setEndValue(rect)
         self._resize_animation.start()
+
+    def _resize_to_content(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        desired_width, target_height, chrome = self._desired_size(available)
+        if self.feed.streaming():
+            # Mientras llega texto el panel solo crece, y sin animación: lo
+            # que ya se está leyendo no debe moverse ni esperar al layout.
+            target_height = max(target_height, self.height())
+            self._apply_geometry(available, desired_width, target_height,
+                                 chrome, animate=False)
+            return
+        if self.feed.content_height() > 0 and self.feed.two_columns():
+            self._last_final_height = target_height
+        self._apply_geometry(available, desired_width, target_height,
+                             chrome, animate=True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_live_lines"):
+            for lane in ("Entrevistador", "Tú"):
+                self._render_live(lane)
 
     def nudge(self, dx, dy):
         screen = self.screen().availableGeometry()
@@ -1473,8 +2196,9 @@ class ContinuousCaptureThread(QThread):
     error_occurred = Signal(str)
 
     def __init__(self, source="loopback", device_index=None, realtime=None,
-                 realtimes=None):
+                 realtimes=None, rings=None):
         super().__init__()
+        self.rings = rings or {}        # {carril: PcmRing} para la 2.ª transcripción
         self.source = source
         self.device_index = device_index
         self.realtime = realtime        # transcriptor streaming único, o None
@@ -1557,10 +2281,12 @@ class ContinuousCaptureThread(QThread):
 
                     rt = self.realtimes.get(name) or self.realtime
                     if rt is not None:
-                        rt.send_audio(
-                            transcriber.pcm16_for_realtime(
-                                block, self.samplerate, rt.sample_rate)
-                        )
+                        pcm = transcriber.pcm16_for_realtime(
+                            block, self.samplerate, rt.sample_rate)
+                        rt.send_audio(pcm)
+                        ring = self.rings.get(name)
+                        if ring is not None:
+                            ring.append(pcm)
                         if commit_driven:
                             audio16 = vad.resample_linear(
                                 block, self.samplerate, vad.VAD_SAMPLE_RATE)
@@ -1593,6 +2319,85 @@ class ContinuousCaptureThread(QThread):
 
     def stop(self):
         self.running = False
+
+
+class LlmStreamThread(QThread):
+    """Petición OpenAI en streaming vía llm.stream (cache explícito)."""
+
+    query_delta = Signal(str)
+    query_status = Signal(str)
+    query_complete = Signal(bool, str)
+
+    def __init__(self, api_key, kwargs, kind=""):
+        super().__init__()
+        self.api_key = api_key
+        self.kwargs = kwargs
+        self.kind = kind
+        self.result = None
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+
+    def run(self):
+        try:
+            self.result = llm.stream(
+                llm.get_client(self.api_key), self.kwargs,
+                on_delta=self.query_delta.emit,
+                on_status=self.query_status.emit,
+                cancel=self._cancel, kind=self.kind)
+        except Exception as e:
+            self.result = llm.CallResult(
+                error=str(e) or type(e).__name__, kind=self.kind)
+        if self.result.ok:
+            self.query_complete.emit(True, self.result.text)
+        else:
+            self.query_complete.emit(
+                False, self.result.error or "sin texto")
+
+
+def _strip_lane(line):
+    prefix = "Entrevistador:"
+    return line[len(prefix):].strip() if line.startswith(prefix) else line
+
+
+class VerifyThread(QThread):
+    """Espera la 2.ª transcripción de la ventana y la concilia con Luna."""
+
+    verified = Signal(object)
+
+    def __init__(self, second_ear, ids, lines, metas, context_lines,
+                 api_key, config):
+        super().__init__()
+        self.second_ear = second_ear
+        self.ids = ids
+        self.lines = lines
+        self.metas = metas
+        self.context_lines = context_lines
+        self.api_key = api_key
+        self.config = config
+
+    def run(self):
+        result = None
+        try:
+            self.second_ear.wait(
+                self.ids, self.config.get("verify_wait_s", 2.0))
+            pairs = []
+            for utt_id, line, meta in zip(self.ids, self.lines, self.metas):
+                plain = _strip_lane(line)
+                pairs.append({
+                    "a": verify.mark_low_confidence(
+                        plain, (meta or {}).get("words")),
+                    "a_plain": plain,
+                    "b": self.second_ear.result(utt_id),
+                })
+            result = verify.reconcile(
+                pairs, self.context_lines,
+                lambda text: verify.call_arbiter(
+                    self.api_key, self.config, text))
+        except Exception:
+            result = None
+        self.verified.emit(result)
 
 
 class AudioTranscriptionWorker(QThread):
@@ -1668,9 +2473,8 @@ class AudioTranscriptionWorker(QThread):
 
 class WhisperApp(QMainWindow):
     # Las señales se emiten desde hilos auxiliares y llegan encoladas a la UI.
-    realtime_text = Signal(str, bool, str)   # (texto, final, carril)
+    realtime_text = Signal(str, bool, str, object)   # (texto, final, carril, meta)
     realtime_error = Signal(str)
-    gate_fired = Signal(str, str, str)       # (texto, carril, modo)
     hotkey_requested = Signal(str)
 
     CAPTURE_SOURCES = [
@@ -1696,11 +2500,28 @@ class WhisperApp(QMainWindow):
         self._gpt_threads = []
         self._dying_threads = []
         self._ctx = deque()               # transcript completo «Carril: texto»
-        self._draft_state = {}            # carril -> interim ya respondido
         self._answers = []
         self._live_buffers = {}           # carril -> texto parcial acumulado
-        self._gate_pending = set()        # carriles con gate clef en vuelo
         self._pinned = []                 # hechos fijados a mano, siempre en contexto
+        self._cascades = {}               # clave de respuesta rápida -> Cascade
+        self._second_ear = None           # verify.SecondEar mientras haya streaming
+        self._rings = {}                  # carril crudo -> PcmRing
+        self._ear_meta = {}               # idx de _ctx -> meta de Deepgram
+        self._ear_session = 0
+        self._verify_threads = []
+        self._prewarm = copilot.PrewarmScheduler()
+        self._prewarm_cfg = {}
+        self._prewarm_key = ""
+        self._prewarm_errors = {}
+        self._prewarm_warned = set()
+        self._prewarm_timer = QTimer(self)
+        self._prewarm_timer.timeout.connect(self._prewarm_tick)
+        self._overlay_hide_timer = QTimer(self)
+        self._overlay_hide_timer.setSingleShot(True)
+        self._overlay_hide_timer.timeout.connect(
+            lambda: self.overlay.hide())
+        self._ping_timer = QTimer(self)
+        self._ping_timer.timeout.connect(self._ping_tick)
         self._hide_from_capture = self.settings.get("hide_from_capture", True)
         self._initial_splitter_sized = False
 
@@ -1712,7 +2533,6 @@ class WhisperApp(QMainWindow):
         self._apply_capture_setting()
         self.realtime_text.connect(self._append_transcript)
         self.realtime_error.connect(self.handle_continuous_error)
-        self.gate_fired.connect(self._on_gate_fired)
         self._apply_settings()
 
         # Comandos por hook de teclado (eventos reales, sin falsos
@@ -1836,15 +2656,23 @@ class WhisperApp(QMainWindow):
         self.transcribe_button.setEnabled(False)
         self.transcribe_button.clicked.connect(self.transcribe_audio)
         manual_layout.addWidget(self.transcribe_button)
-        self.auto_gpt_checkbox = QCheckBox("Responder con GPT automáticamente")
-        manual_layout.addWidget(self.auto_gpt_checkbox)
-        self.manual_gpt_checkbox = QCheckBox("GPT solo bajo demanda")
-        self.manual_gpt_checkbox.setToolTip(
-            "Nada se envía a GPT salvo orden tuya: botón «Enviar a GPT», "
-            "Ctrl+Q o Alt+G. Con esto activo el modo automático queda "
-            "apagado y deshabilitado.")
-        self.manual_gpt_checkbox.toggled.connect(self._on_manual_only_changed)
-        manual_layout.addWidget(self.manual_gpt_checkbox)
+        self.prewarm_checkbox = QCheckBox("Pre-cachear transcript (Luna/Sol)")
+        self.prewarm_checkbox.setToolTip(
+            "Mientras hablan, envía el transcript a OpenAI con prewarm de la "
+            "caché de prompts. Nunca genera ni muestra respuestas (solo se "
+            "responde con Ctrl+Q, Alt+G o el botón «Enviar a GPT»); solo hace "
+            "que Ctrl+Q arranque ~4× más rápido.")
+        self.prewarm_checkbox.toggled.connect(self._on_prewarm_toggled)
+        manual_layout.addWidget(self.prewarm_checkbox)
+        self.second_ear_checkbox = QCheckBox(
+            "Segunda transcripción (gpt-transcribe)")
+        self.second_ear_checkbox.setToolTip(
+            "Cada turno del entrevistador se vuelve a transcribir en segundo "
+            "plano con gpt-transcribe de OpenAI (el audio también se envía a "
+            "OpenAI). Al pedir una respuesta, un árbitro Luna rápido concilia "
+            "ambas transcripciones y Sol responde a la pregunta verificada. "
+            "Solo con Deepgram streaming.")
+        manual_layout.addWidget(self.second_ear_checkbox)
         self.diarize_checkbox = QCheckBox("Diarizar (panel)")
         self.diarize_checkbox.setToolTip(
             "Deepgram nova-3: etiqueta voces distintas dentro del mismo carril "
@@ -1928,7 +2756,8 @@ class WhisperApp(QMainWindow):
         self.clear_button.clicked.connect(self.clear_text)
         self.pin_button.clicked.connect(self.pin_selection)
         hk_hint = QLabel(
-            "Ctrl+I panel · Alt+G / Ctrl+Q enviar · Alt+S más a fondo")
+            "Ctrl+I panel · Alt+G / Ctrl+Q enviar · Alt+S más a fondo "
+            "· Alt+W dibujar")
         hk_hint.setStyleSheet("color: #888; font-size: 11px;")
         self.send_to_gpt_button = QPushButton("Enviar a GPT")
         self.send_to_gpt_button.setStyleSheet(
@@ -1950,6 +2779,13 @@ class WhisperApp(QMainWindow):
             "QPushButton:hover { background: #34303f; }"
         )
         self.smarter_button.clicked.connect(self._hk_smarter)
+        self.draw_button = QPushButton("Dibujar")
+        self.draw_button.setMinimumSize(140, 44)
+        self.draw_button.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        self.draw_button.setToolTip(
+            "Alt+W — dibuja la arquitectura de la entrevista hasta ahora")
+        self.draw_button.setStyleSheet(self.smarter_button.styleSheet())
+        self.draw_button.clicked.connect(self._hk_draw)
         text_buttons.addWidget(self.copy_button)
         text_buttons.addWidget(self.save_button)
         text_buttons.addWidget(self.clear_button)
@@ -1970,6 +2806,7 @@ class WhisperApp(QMainWindow):
         text_buttons.addWidget(self.gpt_engine_combo)
         text_buttons.addWidget(self.send_to_gpt_button)
         text_buttons.addWidget(self.smarter_button)
+        text_buttons.addWidget(self.draw_button)
         out_layout.addLayout(text_buttons)
         bottom_layout.addWidget(out_group, 2)
 
@@ -2054,7 +2891,8 @@ class WhisperApp(QMainWindow):
         self.diarize_checkbox.setChecked(bool(s.get("dg_diarize")))
         self.brief_input.setPlainText(s.get("interview_brief", ""))
         # Por defecto envío a GPT SOLO manual: el usuario decide cuándo.
-        self.manual_gpt_checkbox.setChecked(s.get("manual_gpt_only", True))
+        self.prewarm_checkbox.setChecked(s.get("prewarm", True))
+        self.second_ear_checkbox.setChecked(s.get("second_ear", True))
         self.hide_capture_checkbox.setChecked(
             s.get("hide_from_capture", True))
         self._hide_from_capture = self.hide_capture_checkbox.isChecked()
@@ -2070,7 +2908,8 @@ class WhisperApp(QMainWindow):
             "dg_keyterms": self.keyterms_input.text().strip(),
             "dg_diarize": self.diarize_checkbox.isChecked(),
             "interview_brief": self.brief_input.toPlainText().strip(),
-            "manual_gpt_only": self.manual_gpt_checkbox.isChecked(),
+            "prewarm": self.prewarm_checkbox.isChecked(),
+            "second_ear": self.second_ear_checkbox.isChecked(),
             "hide_from_capture": self.hide_capture_checkbox.isChecked(),
         })
 
@@ -2086,12 +2925,6 @@ class WhisperApp(QMainWindow):
         self._apply_capture_setting()
         if hasattr(self, "hide_capture_checkbox"):
             self._persist_settings()
-
-    def _on_manual_only_changed(self, on):
-        """Modo manual: el envío a GPT solo ocurre bajo orden explícita."""
-        self.auto_gpt_checkbox.setEnabled(not on)
-        if on:
-            self.auto_gpt_checkbox.setChecked(False)
 
     # ------------------------- proveedor / api key -------------------------
 
@@ -2236,6 +3069,7 @@ class WhisperApp(QMainWindow):
             )
             return
 
+        self._reset_second_ear_state()
         self._set_controls_enabled(False)
         self.continuous_button.setText("DETENER TRANSCRIPCIÓN CONTINUA")
         self._style_continuous_button(start=False)
@@ -2270,6 +3104,7 @@ class WhisperApp(QMainWindow):
 
         self.is_continuous_mode = True
         self.overlay.set_listening(True)
+        self._start_prewarm()
         self.status_bar.showMessage("Transcripción continua iniciada")
 
     def _start_realtime(self, language, model):
@@ -2277,14 +3112,19 @@ class WhisperApp(QMainWindow):
         provider = self._current_provider()
         source = self._current_source()
 
-        keyterms = [t.strip() for t in self.keyterms_input.text().split(",")
-                    if t.strip()]
+        user_terms = [t.strip() for t in self.keyterms_input.text().split(",")
+                      if t.strip()]
+        cfg = GptClient.load_config() or {}
+        keyterms = copilot.merge_keyterms(
+            user_terms, prompts.SD_KEYTERMS if cfg.get("sd_keyterms", True)
+            else [])
         diarize = (self.diarize_checkbox.isChecked()
                    and provider == "deepgram"
                    and model.startswith("nova"))
 
         def make_rt(lane=""):
-            cb = (lambda t, fin, l=lane: self.realtime_text.emit(t, fin, l))
+            cb = (lambda t, fin, meta=None, l=lane:
+                  self.realtime_text.emit(t, fin, l, meta))
             err = (lambda m: self.realtime_error.emit(m))
             if provider == "deepgram":
                 lane_model = model
@@ -2298,7 +3138,8 @@ class WhisperApp(QMainWindow):
                 return transcriber.DeepgramRealtime(
                     self.api_key, model=lane_model, language=language,
                     on_transcript=cb, on_error=err,
-                    diarize=lane_diarize, keyterms=keyterms)
+                    diarize=lane_diarize, keyterms=keyterms,
+                    with_meta=True)
             return transcriber.RealtimeTranscriber(
                 self.api_key, model=model, language=language,
                 prompt=transcriber.DEFAULT_PROMPT,
@@ -2321,20 +3162,122 @@ class WhisperApp(QMainWindow):
             QMessageBox.critical(self, "Error", f"No se pudo abrir la sesión streaming: {e}")
             return False
 
+        self._setup_second_ear(provider, cfg, user_terms)
         if source == "duo":
             self.capture_thread = ContinuousCaptureThread(
                 source=source, device_index=self.selected_input_device,
-                realtimes=self.realtimes)
+                realtimes=self.realtimes, rings=self._rings)
         else:
             self.realtime = next(iter(self.realtimes.values()))
             self.capture_thread = ContinuousCaptureThread(
                 source=source, device_index=self.selected_input_device,
-                realtime=self.realtime)
+                realtime=self.realtime, rings=self._rings)
         self.capture_thread.update_level.connect(self.level_monitor.set_level)
         self.capture_thread.status_update.connect(self.status_bar.showMessage)
         self.capture_thread.error_occurred.connect(self.handle_continuous_error)
         self.capture_thread.start()
         return True
+
+    def _second_ear_effective(self, cfg):
+        return (self.second_ear_checkbox.isChecked()
+                and bool(cfg.get("verify_enabled", True))
+                and self._current_provider() == "deepgram"
+                and bool(ApiKeyManager.load_api_key("openai")))
+
+    def _setup_second_ear(self, provider, cfg, user_terms):
+        self._rings = {}
+        if provider != "deepgram" or not self._second_ear_effective(cfg):
+            return
+        rings = {raw: PcmRing(rt.sample_rate)
+                 for raw, rt in self.realtimes.items()
+                 if self._lane_key(raw) == "Entrevistador"}
+        if not rings:
+            return
+        self._rings = rings
+        self._second_ear = verify.SecondEar(
+            ApiKeyManager.load_api_key("openai"),
+            model=cfg.get("verify_stt_model", "gpt-transcribe"),
+            keywords=verify.sanitize_keywords(
+                prompts.SD_STT_KEYWORDS + user_terms[:15]),
+            languages=verify.stt_languages(self._current_language()))
+
+    def _reset_second_ear_state(self, keep_ear=False):
+        self._ear_session += 1
+        self._ear_meta.clear()
+        if self._second_ear is not None:
+            if keep_ear:
+                self._second_ear.reset()
+            else:
+                self._shutdown_second_ear()
+
+    def _shutdown_second_ear(self):
+        if self._second_ear is not None:
+            self._second_ear.shutdown()
+        self._second_ear = None
+        self._rings = {}
+
+    def _submit_second_ear(self, raw_lane, lane, meta):
+        ring = self._rings.get(raw_lane)
+        if (self._second_ear is None or ring is None or not meta
+                or lane != "Entrevistador"):
+            return
+        idx = len(self._ctx) - 1
+        previous = list(self._ctx)[max(0, idx - 4):idx]
+        self._ear_meta[idx] = meta
+        self._second_ear.submit(
+            (self._ear_session, idx), ring, meta, " / ".join(previous))
+
+    def _window_ear_ids(self, utterances, window):
+        ear = self._second_ear
+        if ear is None or len(utterances) != len(self._ctx):
+            return []
+        base = len(utterances) - len(window)
+        if base < 0:
+            return []
+        return [(self._ear_session, i)
+                for i in range(base, len(utterances))
+                if not utterances[i].startswith("Tú:")
+                and ear.has((self._ear_session, i))]
+
+    def _second_ear_lines(self, utterances, window):
+        lines = []
+        for utt_id in self._window_ear_ids(utterances, window):
+            b = self._second_ear.result(utt_id)
+            if b and not verify.equivalent(
+                    _strip_lane(utterances[utt_id[1]]), b):
+                lines.append("Entrevistador: " + b)
+        return lines
+
+    def _start_verify(self, cascade, utterances, window, ids, config):
+        base = len(utterances) - len(window)
+        thread = VerifyThread(
+            self._second_ear, ids,
+            [utterances[i] for _, i in ids],
+            [self._ear_meta.get(i) for _, i in ids],
+            utterances[max(0, base - 8):base],
+            ApiKeyManager.load_api_key("openai"), config)
+        thread.verified.connect(
+            lambda result, c=cascade: self._on_verified(c, result))
+        thread.finished.connect(
+            lambda t=thread: self._verify_threads.remove(t)
+            if t in self._verify_threads else None)
+        self._verify_threads.append(thread)
+        thread.start()
+        QTimer.singleShot(
+            int(cascade.verify_deadline_s * 1000) + 50,
+            lambda c=cascade: self._maybe_start_detail(c))
+
+    def _on_verified(self, cascade, result):
+        if cascade.cancelled:
+            return
+        cascade.verify_finished(result)
+        for feed in (self.gpt_output, self.overlay.feed):
+            feed.set_verified(cascade.fast_key, result)
+        self._maybe_start_detail(cascade)
+
+    def _maybe_start_detail(self, cascade):
+        if cascade.take_detail_start():
+            self._start_detail(cascade)
 
     # ------------------------- hotkeys globales / overlay ------------------
 
@@ -2373,39 +3316,30 @@ class WhisperApp(QMainWindow):
             self.toast.show_ack(text)
 
     def _hk_answer_last(self):
-        """Rescate: responder la última intervención del entrevistador aunque
-        el gate no la haya pillado."""
-        self._ack("Ctrl+Q · responder última intervención")
-        last = next((x for x in reversed(self._ctx)
-                     if not x.startswith("Tú:")), None)
-        if not last:
-            self._ack("Ctrl+Q · nada que responder todavía")
-            return
-        text = last.split(":", 1)[1].strip() if ":" in last else last
-        self._fire_gpt(text, "Entrevistador", kind="Manual",
-                       effort=self._review_effort("medium"))
+        """Ctrl+Q — respuesta rápida de Luna y, debajo, detalles de Sol.
+        Igual que Alt+G/Enviar."""
+        self._ack("Ctrl+Q · Luna → Sol…")
+        self.send_to_gpt()
 
     def _hk_toggle_compact(self):
         """Ctrl+I — ÚNICO control de visibilidad del panel."""
+        if self._overlay_hide_timer.isActive():
+            # Doble pulsación rápida: cancelar el ocultado pendiente en vez
+            # de encadenar otro y acabar con el panel escondido.
+            self._overlay_hide_timer.stop()
+            self.overlay.ack("Ctrl+I · panel visible")
+            return
         if self.overlay.isVisible():
             self.overlay.ack("Ctrl+I · ocultando panel…")
-            QTimer.singleShot(450, self.overlay.hide)
+            self._overlay_hide_timer.start(450)
         else:
             self.overlay.set_listening(self.is_continuous_mode)
             self.overlay.show()
             self.overlay.raise_()
             self.overlay.ack("Ctrl+I · panel visible")
 
-    def _hk_toggle_auto(self):
-        if self.manual_gpt_checkbox.isChecked():
-            self._ack("Ctrl+M · auto-GPT bloqueado (modo manual activo)")
-            return
-        self.auto_gpt_checkbox.toggle()
-        self._ack(
-            f"Ctrl+M · auto-GPT {'ON' if self.auto_gpt_checkbox.isChecked() else 'OFF'}")
-
     def _hk_send_gpt(self):
-        self._ack("Alt+G · enviando a GPT…")
+        self._ack("Alt+G · Luna → Sol…")
         self.send_to_gpt()
 
     def _hk_smarter(self):
@@ -2416,15 +3350,54 @@ class WhisperApp(QMainWindow):
         self._ack("Alt+S · más a fondo con gpt-6.1-sol…")
         self._launch_smarter(target)
 
+    def _hk_draw(self):
+        self._ack("Alt+W · dibujando arquitectura…")
+        self._draw_architecture()
+
+    def _draw_architecture(self):
+        utterances = self._utterances()
+        if not utterances:
+            self.status_bar.showMessage("Nada que dibujar todavía")
+            return
+        api_key = ApiKeyManager.load_api_key("openai")
+        if not api_key:
+            self.status_bar.showMessage(
+                "Dibujar necesita una API key de OpenAI")
+            return
+        config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+        brief = self.brief_input.toPlainText().strip()
+        window = copilot.question_window(utterances)
+        profile = llm.luna_profile(config, brief)
+        kwargs = llm.request_kwargs(
+            profile, utterances,
+            copilot.diagram_tail(config, window, self._pinned),
+            effort_override=config["diagram_reasoning_effort"],
+            max_output_tokens=config["diagram_max_tokens"])
+        thread = LlmStreamThread(api_key, kwargs, kind="diagram")
+        self._cancel_cascades()
+        self._start_answer(
+            thread, "Diagrama", profile.model, "Arquitectura hasta ahora",
+            self._build_context())
+        self._gpt_threads.append(thread)
+        thread.start()
+
     def _launch_smarter(self, target):
         config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+        if (isinstance(target["key"], copilot.Cascade)
+                and not target["key"].started):
+            target = self._answer_for_key(target["parent"]) or target
+        cascade = self._cascades.get(target["key"])
+        if cascade is not None and not cascade.started:
+            self._drop_cascade(cascade)
+
         question = target["question"]
         previous = []
         current = target
         while current is not None:
-            previous.append((
-                current["model"], current["text"],
-                current.get("parent") is not None))
+            if current["text"].strip():
+                previous.append((
+                    current["model"], current["text"],
+                    current.get("parent") is not None))
             current = (self._answer_for_key(current["parent"])
                        if current.get("parent") is not None else None)
         previous.reverse()
@@ -2437,36 +3410,35 @@ class WhisperApp(QMainWindow):
         brief = self.brief_input.toPlainText().strip()
         effort = ("high" if "sol" in target["model"].lower()
                   else config.get("smart_reasoning_effort", "medium"))
-        instructions, user_input = build_smart_request(
-            question, previous, context, mine, brief, config)
+        openai_key = ApiKeyManager.load_api_key("openai")
 
         if engine == "codex":
+            instructions, user_input = build_smart_request(
+                question, previous, context, mine, brief, config)
             model = config.get("smart_model", "gpt-6.1-sol")
             thread = CodexCliThread(
                 question, model=model,
                 full_prompt=instructions + "\n\n" + user_input, search=True)
-        elif engine == "cloudflare":
-            openai_key = ApiKeyManager.load_api_key("openai")
-            if openai_key:
-                model = config.get("smart_model", "gpt-6.1-sol")
-                thread = SmartQueryThread(
-                    openai_key, question, previous, context, mine, brief,
-                    effort=effort)
-            else:
-                model = config.get("cf_model", DEFAULT_GPT_CONFIG["cf_model"])
-                thread = SmartQueryThread(
-                    None, question, previous, context, mine, brief,
-                    effort=effort, engine="cloudflare")
+        elif engine == "cloudflare" and not openai_key:
+            model = config.get("cf_model", DEFAULT_GPT_CONFIG["cf_model"])
+            thread = SmartQueryThread(
+                None, question, previous, context, mine, brief,
+                effort=effort, engine="cloudflare")
         else:
-            openai_key = ApiKeyManager.load_api_key("openai")
             if not openai_key:
                 self.status_bar.showMessage(
                     "Más a fondo necesita una API key de OpenAI")
                 return
-            model = config.get("smart_model", "gpt-6.1-sol")
-            thread = SmartQueryThread(
-                openai_key, question, previous, context, mine, brief,
-                effort=effort)
+            profile = llm.sol_profile(config, brief)
+            tail = copilot.deeper_tail(
+                config, question, mine, previous, self._pinned)
+            kwargs = llm.request_kwargs(
+                profile, self._utterances(), tail,
+                tool_choice="auto" if profile.tools else None,
+                effort_override=effort,
+                max_output_tokens=config.get("smart_max_tokens", 6000))
+            model = profile.model
+            thread = LlmStreamThread(openai_key, kwargs, kind="deeper")
 
         model_label = model + (
             " · web" if config.get("smart_web_search", True) else "")
@@ -2481,15 +3453,18 @@ class WhisperApp(QMainWindow):
                   else "Alt+T · deteniendo…")
         self.toggle_continuous_mode()
 
-    @Slot(str, bool, str)
-    def _append_transcript(self, text, is_final, lane=""):
+    @Slot(str, bool, str, object)
+    def _append_transcript(self, text, is_final, lane="", meta=None):
+        raw_lane = lane
         lane = self._lane_key(lane)
         if is_final:
             self._live_buffers.pop(lane, None)
             self._set_live_transcript(lane, "")
             self.overlay.set_live(lane, text, final=True)
-            self._draft_state.pop(lane, None)   # turno cerrado: próximo borrador
+            before = len(self._ctx)
             self._on_new_segment(text, lane)
+            if len(self._ctx) > before:
+                self._submit_second_ear(raw_lane, lane, meta)
             return
 
         if self._current_provider() == "openai-realtime":
@@ -2497,42 +3472,6 @@ class WhisperApp(QMainWindow):
         self._live_buffers[lane] = text
         self._set_live_transcript(lane, text)
         self.overlay.set_live(lane, text)
-        # Interim: borrador anticipado mientras la persona sigue hablando.
-        if lane == "T\u00fa" or not self.auto_gpt_checkbox.isChecked():
-            return
-        prev = self._draft_state.get(lane)
-        if prev is not None and prev in text:
-            return                                # mismo turno, ya disparado
-        self._gate_async(text, lane, "Borrador")
-
-    # ------------------------- gate clef-flash ----------------------------
-
-    def _gate_async(self, text, lane, kind):
-        """Decide el disparo en hilo: clef-flash con creds CF, heurística
-        local como fallback. _gate_pending evita llamadas por interim."""
-        if lane in self._gate_pending:
-            return
-        self._gate_pending.add(lane)
-
-        def run():
-            try:
-                verdict = clef_question(text)
-                ok = verdict[0] if verdict else looks_like_question(text)
-                if ok:
-                    self.gate_fired.emit(text, lane, kind)
-            finally:
-                self._gate_pending.discard(lane)
-
-        threading.Thread(target=run, daemon=True).start()
-
-    @Slot(str, str, str)
-    def _on_gate_fired(self, text, lane, kind):
-        if kind == "Borrador":
-            self._draft_state[lane] = text
-            self._fire_gpt(text, lane, kind=kind)
-        else:  # Revisión
-            self._fire_gpt(text, lane, kind=kind,
-                           effort=self._review_effort("medium"))
 
     def _retire_thread(self, thread):
         """Detiene un QThread sin destruirlo mientras siga corriendo.
@@ -2561,6 +3500,8 @@ class WhisperApp(QMainWindow):
         self._retire_thread(self.transcription_worker)
         self.transcription_worker = None
 
+        self._stop_prewarm()
+        self._rings = {}
         self._set_controls_enabled(True)
         self.continuous_button.setText("INICIAR TRANSCRIPCIÓN CONTINUA")
         self._style_continuous_button(start=True)
@@ -2609,8 +3550,7 @@ class WhisperApp(QMainWindow):
         self.you_output.clear()
         self._live_buffers.clear()
         if hasattr(self, "overlay"):
-            self.overlay.set_live("Entrevistador", "")
-            self.overlay.set_live("Tú", "")
+            self.overlay.clear_live()
         self.interviewer_live.setText("En directo: \u2014")
         self.you_live.setText("En directo: \u2014")
 
@@ -2624,19 +3564,8 @@ class WhisperApp(QMainWindow):
             self.interviewer_output.append(_format_transcript_html(text))
         if not text.strip():
             return
-        if self.auto_gpt_checkbox.isChecked() and lane != "Tú":
-            # Revisión sobre el final: mismo gate, esfuerzo mayor.
-            self._gate_async(display, lane, "Revisión")
         self._ctx.append(display)
-
-    def _review_effort(self, base):
-        """Revisión al menos a «medium» salvo que el usuario pida más."""
-        order = ("none", "minimal", "low", "medium", "high", "max")
-        cfg = (GptClient.load_config() or {}).get("reasoning_effort") or "low"
-        try:
-            return base if order.index(base) > order.index(cfg) else cfg
-        except ValueError:
-            return base
+        self._prewarm.note_change()
 
     def _build_context(self):
         """Contexto = transcript COMPLETO de la llamada + hechos fijados.
@@ -2649,47 +3578,6 @@ class WhisperApp(QMainWindow):
         if convo:
             parts.append("Conversación completa:\n" + "\n".join(convo))
         return "\n\n".join(parts)
-
-    def _fire_gpt(self, text, lane, kind, effort=None):
-        """Lanza una consulta GPT (borrador o revisión) con contexto."""
-        engine = self.gpt_engine_combo.currentData()
-        context = self._build_context()
-        gpt_input = f"{lane}: {text}" if lane and not text.startswith(lane) else text
-        if effort == "medium":
-            effort = self._review_effort("medium")
-        # Borradores: boceto corto y rápido (~3s en CF a ~55 tok/s);
-        # revisiones: respuesta completa.
-        max_tokens = 200 if kind == "Borrador" else None
-
-        brief = self.brief_input.toPlainText().strip()
-        if engine == "codex":
-            thread = CodexCliThread(gpt_input, context=context, brief=brief)
-        elif engine == "cloudflare":
-            thread = GptQueryThread(
-                None, gpt_input, engine="cloudflare",
-                context=context, effort=effort, max_tokens=max_tokens,
-                brief=brief, allow_web=(kind != "Borrador"),
-                fast=(kind == "Borrador"))
-        else:
-            gpt_key = ApiKeyManager.load_api_key("openai")
-            if not gpt_key:
-                self.status_bar.showMessage(
-                    "Auto-GPT necesita una API key de OpenAI (botón «API key…»)"
-                )
-                return
-            thread = GptQueryThread(
-                gpt_key, gpt_input, context=context, effort=effort,
-                max_tokens=max_tokens, brief=brief,
-                allow_web=(kind != "Borrador"),
-                fast=(kind == "Borrador"))
-
-        question = text
-        if lane and question.startswith(lane + ":"):
-            question = question.split(":", 1)[1].strip()
-        model_label = self._model_label(engine, kind)
-        self._start_answer(thread, kind, model_label, question, context)
-        self._gpt_threads.append(thread)
-        thread.start()
 
     def _model_label(self, engine, kind):
         config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
@@ -2758,12 +3646,217 @@ class WhisperApp(QMainWindow):
         answer["done"] = True
         answer["ok"] = success
         answer["text"] = result if success else f"Error: {result}"
+        if isinstance(key, copilot.Cascade) and key.cancelled:
+            return
         self.gpt_output.finish(key, success, answer["text"])
         self.overlay.feed.finish(key, success, answer["text"])
+        thread = key.thread if isinstance(key, copilot.Cascade) else key
+        call = getattr(thread, "result", None)
+        label = call.metrics_label() if isinstance(
+            thread, LlmStreamThread) and call is not None else ""
+        if label:
+            self.gpt_output.status(key, label)
+            self.overlay.feed.status(key, label)
         if answer.get("manual"):
             self.send_to_gpt_button.setEnabled(True)
         self.status_bar.showMessage(
             "Respuesta GPT recibida" if success else f"GPT: {result}")
+        cascade = self._cascades.get(key)
+        if cascade is not None:
+            cascade.fast_finished(success, result if success else "")
+            self._maybe_start_detail(cascade)
+
+    # ------------------------- cascada Luna → Sol -------------------------
+
+    def _utterances(self):
+        if self._ctx:
+            return list(self._ctx)
+        lines = []
+        for lane, widget in (("Entrevistador", self.interviewer_output),
+                             ("Tú", self.you_output)):
+            for line in widget.toPlainText().splitlines():
+                if line.strip():
+                    lines.append(f"{lane}: {line.strip()}")
+        return lines
+
+    def _maybe_cascade(self, answer, engine, utterances, window, question):
+        config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+        if (not config.get("detail_enabled")
+                or engine not in ("openai", "cloudflare")
+                or not ApiKeyManager.load_api_key("openai")):
+            return None
+        key = answer["key"]
+        ear_ids = self._window_ear_ids(utterances, window)
+        verifying = bool(ear_ids) and bool(config.get("verify_enabled", True))
+        cascade = copilot.Cascade(
+            key, verify_required=verifying,
+            verify_deadline_s=config.get("verify_deadline_s", 3.5))
+        cascade.snapshot = {
+            "config": config,
+            "utterances": list(utterances),
+            "window": list(window),
+            "pinned": list(self._pinned),
+            "brief": self.brief_input.toPlainText().strip(),
+            "question": question,
+            "fast_model": answer["model"],
+        }
+        self._cascades[key] = cascade
+        self._answers.append({
+            "key": cascade,
+            "kind": "Detalle",
+            "model": config["detail_model"],
+            "question": question,
+            "ctx_index": answer["ctx_index"],
+            "text": "",
+            "done": False,
+            "ok": True,
+            "parent": key,
+            "manual": False,
+        })
+        pending = f"en cola tras {answer['model']}…"
+        for feed in (self.gpt_output, self.overlay.feed):
+            feed.start_detail(key, cascade, config["detail_model"], pending)
+        if verifying:
+            self._start_verify(cascade, utterances, window, ear_ids, config)
+        return cascade
+
+    def _start_detail(self, cascade):
+        snap = cascade.snapshot
+        config = snap["config"]
+        api_key = ApiKeyManager.load_api_key("openai")
+        profile = llm.sol_profile(config, snap["brief"])
+        self._prewarm.note_real_call(
+            profile.name, (hash(profile.stable), len(snap["utterances"])))
+        verified = cascade.verified
+        if not (isinstance(verified, dict) and verified.get("question")):
+            verified = None
+        tail = copilot.detail_tail(
+            config, snap["window"], snap["pinned"], snap["fast_model"],
+            cascade.fast_text, cascade.fast_ok, verified)
+        tool_choice = None
+        if profile.tools:
+            tool_choice = ("auto" if needs_web_search(snap["question"])
+                           else "none")
+        kwargs = llm.request_kwargs(
+            profile, snap["utterances"], tail, tool_choice=tool_choice)
+        thread = LlmStreamThread(api_key, kwargs, kind="detail")
+        cascade.thread = thread
+        for feed in (self.gpt_output, self.overlay.feed):
+            feed.begin_detail(cascade)
+        thread.query_delta.connect(
+            lambda text, key=cascade: self._update_answer(key, text))
+        thread.query_status.connect(
+            lambda text, key=cascade: self._status_answer(key, text))
+        thread.query_complete.connect(
+            lambda ok, result, key=cascade:
+            self._finish_answer(key, ok, result))
+        thread.query_complete.connect(
+            lambda *args, t=thread:
+            self._gpt_threads.remove(t) if t in self._gpt_threads else None)
+        self._gpt_threads.append(thread)
+        thread.start()
+
+    def _drop_cascade(self, cascade):
+        cascade.cancel()
+        if cascade.thread is not None and cascade.thread.isRunning():
+            cascade.thread.cancel()
+        for feed in (self.gpt_output, self.overlay.feed):
+            feed.cancel_detail(cascade)
+        self._cascades.pop(cascade.fast_key, None)
+        self._answers[:] = [a for a in self._answers
+                            if a["key"] is not cascade]
+
+    def _cancel_cascades(self):
+        for cascade in self._cascades.values():
+            cascade.cancel()
+            if cascade.thread is not None and cascade.thread.isRunning():
+                cascade.thread.cancel()
+        self._cascades.clear()
+
+    # ------------------------- prewarm de la caché -------------------------
+
+    def _prewarm_enabled(self):
+        return (self.prewarm_checkbox.isChecked()
+                and bool(self._prewarm_cfg.get("prewarm", True))
+                and bool(self._prewarm_key))
+
+    def _on_prewarm_toggled(self, on):
+        if not self.is_continuous_mode:
+            return
+        if on and self._prewarm_enabled():
+            self._prewarm.note_change()
+            self._prewarm_timer.start(400)
+        else:
+            self._prewarm_timer.stop()
+
+    def _start_prewarm(self):
+        self._prewarm.reset()
+        self._prewarm_errors.clear()
+        self._prewarm_warned.clear()
+        self._prewarm_cfg = GptClient.load_config() or dict(
+            DEFAULT_GPT_CONFIG)
+        self._prewarm_key = ApiKeyManager.load_api_key("openai")
+        if not self._prewarm_key:
+            return
+        self._ping_tick()
+        self._ping_timer.start(30000)
+        if self._prewarm_enabled():
+            self._prewarm.note_change()
+            self._prewarm_timer.start(400)
+
+    def _stop_prewarm(self):
+        self._prewarm_timer.stop()
+        self._ping_timer.stop()
+
+    def _ping_tick(self):
+        engine = self.gpt_engine_combo.currentData()
+        if (not self.is_continuous_mode or not self._prewarm_key
+                or engine == "codex"):
+            return
+        cfg = self._prewarm_cfg
+        model = (cfg.get("model", DEFAULT_GPT_CONFIG["model"])
+                 if engine == "openai"
+                 else cfg.get("detail_model", DEFAULT_GPT_CONFIG["detail_model"]))
+        threading.Thread(
+            target=llm.ping, args=(self._prewarm_key, model),
+            daemon=True).start()
+
+    def _prewarm_tick(self):
+        if not self.is_continuous_mode or not self._prewarm_enabled():
+            return
+        cfg = self._prewarm_cfg
+        engine = self.gpt_engine_combo.currentData()
+        brief = self.brief_input.toPlainText().strip()
+        utterances = list(self._ctx)
+        profiles = []
+        if engine == "openai":
+            profiles.append(llm.luna_profile(cfg, brief))
+        if cfg.get("detail_enabled") and engine != "codex":
+            profiles.append(llm.sol_profile(cfg, brief))
+        for profile in profiles:
+            name = profile.name
+            if self._prewarm.disabled(name):
+                if name not in self._prewarm_warned:
+                    self._prewarm_warned.add(name)
+                    self.status_bar.showMessage(
+                        f"Pre-caché de {profile.model} desactivada: "
+                        f"{self._prewarm_errors.get(name, 'error')}")
+                continue
+            signature = (hash(profile.stable), len(utterances))
+            estimate = llm.estimate_tokens(
+                profile.stable + "".join(utterances))
+            if self._prewarm.due(name, signature, estimate):
+                self._prewarm.mark_sent(name, signature)
+                threading.Thread(
+                    target=self._prewarm_worker,
+                    args=(self._prewarm_key, profile, list(utterances)),
+                    daemon=True).start()
+
+    def _prewarm_worker(self, api_key, profile, utterances):
+        result = llm.prewarm(api_key, profile, utterances)
+        if not result.ok:
+            self._prewarm_errors[profile.name] = result.error[:160]
+        self._prewarm.mark_done(profile.name, result.ok)
 
     def handle_continuous_error(self, error_msg):
         if not self.is_continuous_mode:
@@ -2828,27 +3921,26 @@ class WhisperApp(QMainWindow):
         self._clear_transcript_views()
         self.gpt_output.clear()
         self.overlay.feed.clear()
+        self._cancel_cascades()
+        self._prewarm.reset()
+        self._reset_second_ear_state(keep_ear=True)
         self._ctx.clear()            # estado oculto no sobrevive al «Limpiar»
-        self._draft_state.clear()
         self._pinned.clear()
         self._answers.clear()
         self.status_bar.showMessage("Transcripción y contexto borrados")
 
-    def _latest_interviewer_question(self):
-        for line in reversed(self._ctx):
-            if not line.startswith("Tú:"):
-                return line.split(":", 1)[1].strip() if ":" in line else line
-        return "(transcript completo)"
-
     def send_to_gpt(self):
-        transcription = self._transcript_text()
-        if not transcription:
+        utterances = self._utterances()
+        if not utterances:
             self.status_bar.showMessage("No hay texto para enviar a GPT")
             return
 
         engine = self.gpt_engine_combo.currentData()
         brief = self.brief_input.toPlainText().strip()
         context = self._build_context()
+        window = copilot.question_window(utterances)
+        question = copilot.latest_interviewer(utterances)
+        transcription = "\n".join(window)
         if engine == "codex":
             thread = CodexCliThread(transcription, context=context, brief=brief)
         elif engine == "cloudflare":
@@ -2861,12 +3953,23 @@ class WhisperApp(QMainWindow):
                 self.status_bar.showMessage(
                     "GPT necesita una API key de OpenAI (bot\u00f3n API key\u2026)")
                 return
-            thread = GptQueryThread(gpt_key, transcription,
-                                    context=context, brief=brief, allow_web=True)
+            config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
+            profile = llm.luna_profile(config, brief)
+            self._prewarm.note_real_call(
+                profile.name, (hash(profile.stable), len(utterances)))
+            kwargs = llm.request_kwargs(
+                profile, utterances,
+                copilot.fast_tail(
+                    config, window, self._pinned,
+                    second_ear=self._second_ear_lines(utterances, window)
+                    or None))
+            thread = LlmStreamThread(gpt_key, kwargs, kind="fast")
 
-        self._start_answer(
+        self._cancel_cascades()
+        answer = self._start_answer(
             thread, "Manual", self._model_label(engine, "Borrador"),
-            self._latest_interviewer_question(), context, manual=True)
+            question, context, manual=True)
+        self._maybe_cascade(answer, engine, utterances, window, question)
         self._gpt_threads.append(thread)
         self.send_to_gpt_button.setEnabled(False)
         self.status_bar.showMessage("Enviando a GPT\u2026")
@@ -2887,6 +3990,9 @@ class WhisperApp(QMainWindow):
             self.realtimes = {}
             self.realtime = None
             self._retire_thread(self.transcription_worker)
+            self._shutdown_second_ear()
+            for thread in list(self._verify_threads):
+                thread.wait(500)
 
             temp_dir = os.path.join(os.getcwd(), "temp_audio")
             if os.path.exists(temp_dir):

@@ -17,6 +17,7 @@ import urllib.request
 from dotenv import load_dotenv
 from PySide6.QtCore import QThread, Signal
 
+import prompts
 import transcriber
 
 load_dotenv()
@@ -62,51 +63,6 @@ _MARKER_RE = re.compile(
     r"\b(" + "|".join(re.escape(w) for w in _QUESTION_MARKERS) + r")\b")
 
 
-def clef_question(text, timeout=4.0):
-    """Gate real con @cf/cloudflare/clef-flash (Workers AI, neuronas).
-
-    Devuelve (es_pregunta, probabilidad) o None sin creds/error — en ese
-    caso el llamante cae a la heurística looks_like_question.
-    """
-    token, account = cloudflare_creds()
-    if not token or not account:
-        return None
-    url = (f"https://api.cloudflare.com/client/v4/accounts/{account}"
-           "/ai/run/@cf/cloudflare/clef-flash")
-    body = {
-        "model": "clef-flash",
-        "state": text,
-        "questions": {
-            "is_question": {
-                "type": "choice",
-                "instructions": (
-                    "Is this utterance a question or a task directed at the "
-                    "listener? yes only for real questions or requests "
-                    "(technical or behavioral), no for small talk, filler, "
-                    "ads, or statements not asking anything."),
-                "criteria": {
-                    "yes": "genuine question or request to answer",
-                    "no": "small talk, filler, or no question asked",
-                },
-            }
-        },
-    }
-    try:
-        req = urllib.request.Request(
-            url, data=json.dumps(body).encode(), method="POST",
-            headers={"Authorization": f"Bearer {token}",
-                     "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            answers = json.loads(r.read())["result"]["answers"]
-        a = answers.get("is_question", {})
-        probs = a.get("probabilities") or {}
-        p_yes = float(probs.get(
-            "yes", 1.0 if a.get("choice") == "yes" else 0.0))
-        return (a.get("choice") == "yes" or p_yes > 0.5), p_yes
-    except Exception:
-        return None
-
-
 def looks_like_question(text, min_words=4):
     """Puerta local: ¿esto suena a pregunta/encargo técnico? Heurística,
     sin LLM — sólo evita quemar llamadas en muletillas y charla.
@@ -146,11 +102,18 @@ def exa_api_key():
         return ""
 
 
+_WEB_SEARCH_RE = re.compile(
+    r"(?<!\w)(?:"
+    + "|".join(re.escape(h) for h in sorted(_WEB_SEARCH_HINTS, key=len,
+                                            reverse=True))
+    + r")(?!\w)|\b20\d{2}\b",
+    re.IGNORECASE)
+
+
 def needs_web_search(text):
-    """Gate barato: solo busca si la pregunta pide datos externos/actuales."""
-    t = text.lower()
-    return (any(h in t for h in _WEB_SEARCH_HINTS)
-            or bool(re.search(r"\b20\d{2}\b", t)))
+    """Gate barato: solo busca si la pregunta pide datos externos/actuales
+    (pistas como palabra o frase completa, no como subcadena)."""
+    return bool(_WEB_SEARCH_RE.search(text or ""))
 
 
 def exa_search(query, max_results=3, timeout=4):
@@ -278,65 +241,34 @@ class WhisperService:
 
 DEFAULT_GPT_CONFIG = {
     "model": "gpt-6-luna",   # ~7x más barato que 5.4-mini; effort dial: low->hard
-    "system_prompt": (
-        "Eres un asistente virtual experto que ayuda a los usuarios a responder "
-        "preguntas sobre conceptos técnicos y resolver problemas de programación "
-        "típicos de entrevistas técnicas. Analiza el texto proporcionado (que viene "
-        "de una transcripción de audio, por lo que puede tener errores) y busca en "
-        "la transcripción preguntas, aunque no estén explícitamente formuladas. "
-        "Por ejemplo, si el texto trata de un problema típico de entrevistas "
-        "técnicas estilo leetcode, interpreta que es una pregunta técnica y "
-        "devuelve código en Python que lo resuelva.\n\n"
-        "1. PREGUNTAS CONCEPTUALES:\n"
-        "- Explicaciones claras y concisas de estadística, machine learning o "
-        "programación.\n"
-        "- Definición, puntos clave y ejemplos cuando sea apropiado.\n"
-        "- Responde directamente, sin introducciones largas.\n\n"
-        "2. PREGUNTAS DE PROGRAMACIÓN:\n"
-        "- Si la pregunta es sobre Python (o no especifica lenguaje), código en "
-        "Python limpio y bien comentado.\n"
-        "- Si la pregunta es claramente sobre SQL y se pide una consulta, código "
-        "SQL optimizado.\n"
-        "- Explica brevemente la lógica del código.\n\n"
-        "Responde en el mismo idioma de la pregunta (español o inglés). Ignora "
-        "texto en otros idiomas por posibles fallos de transcripción. Sé preciso "
-        "y directo."
-    ),
+    "system_prompt": prompts.SYSTEM_PROMPT,
     "temperature": None,          # los modelos de razonamiento (gpt-5/6) no admiten temperature
     "reasoning_effort": "none",   # borradores rápidos; la revisión sube a "medium"
     "service_tier": "fast",       # Fast mode (~2.5x menos latencia, ~2x precio); "auto"/"flex" alternativas
     "max_tokens": 2000,
-    "format_prompt": (
-        "FORMATO DE RESPUESTA (se muestra en un panel pequeño que el candidato lee de un vistazo mientras habla):\n"
-        "- Responde SIEMPRE en Markdown.\n"
-        "- Primera línea: la respuesta directa en **negrita**, una o dos frases que el candidato pueda decir en voz alta tal cual.\n"
-        "- Después, solo si aporta, 2-5 viñetas cortas con los puntos clave (nada de párrafos largos).\n"
-        "- Código siempre en bloques ``` con el lenguaje (```python, ```sql), con líneas de como mucho ~80 caracteres.\n"
-        "- Tablas solo para comparaciones breves. Sin encabezados grandes: como mucho ###.\n"
-        "- Sin introducciones, sin despedidas y sin repetir la pregunta."
-    ),
-    "smart_prompt": (
-        "MODO «MÁS A FONDO»: un modelo rápido (gpt-6-luna) ya respondió a esta "
-        "intervención y al candidato no le ha servido (pulsó «más a fondo» en "
-        "mitad de la entrevista). Tu respuesta SUSTITUYE a la anterior en "
-        "pantalla: escribe la versión buena y completa, lista para usar, no un "
-        "comentario sobre la anterior.\n"
-        "- Antes de escribir, diagnostica en silencio por qué se quedó corta: "
-        "¿malinterpretó la pregunta por errores de transcripción?, ¿fue "
-        "superficial o genérica?, ¿le faltó código, un ejemplo concreto, datos "
-        "actuales o el trade-off clave?, ¿no encajaba con lo que el candidato "
-        "ya ha dicho o con el brief?\n"
-        "- Razona más a fondo que el modelo rápido. Si la pregunta depende de "
-        "datos recientes, de una empresa/producto concreto o de algo verificable, "
-        "usa la búsqueda web y cita la fuente en una línea al final.\n"
-        "- Conserva lo que la respuesta anterior tenía bien, pero no la "
-        "menciones ni escribas cosas como «a diferencia de la respuesta "
-        "anterior».\n"
-        "- Ten en cuenta lo que el candidato ya ha dicho en voz alta (carril "
-        "«Tú») para que pueda continuar con naturalidad sin contradecirse.\n"
-        "- Si la intervención es ambigua, responde a la interpretación más "
-        "probable y añade la alternativa en una sola línea."
-    ),
+    "format_prompt": prompts.PANEL_FORMAT,
+    "fast_prompt": prompts.FAST_MODE,
+    "smart_prompt": prompts.DEEPER_MODE,
+    "diagram_prompt": prompts.DIAGRAM_MODE,
+    "diagram_reasoning_effort": "low",
+    "diagram_max_tokens": 1500,
+    "verify_enabled": True,
+    "verify_stt_model": "gpt-transcribe",
+    "arbiter_model": "gpt-6-luna",
+    "arbiter_prompt": prompts.ARBITER_PROMPT,
+    "verify_wait_s": 2.0,
+    "verify_deadline_s": 3.5,
+    "detail_prompt": prompts.DETAIL_MODE,
+    "detail_alone_prompt": prompts.DETAIL_MODE_ALONE,
+    "detail_enabled": True,
+    "detail_model": "gpt-6.1-sol",
+    "detail_reasoning_effort": "medium",
+    "detail_max_tokens": 6000,
+    "fast_verbosity": "low",
+    "detail_verbosity": "medium",
+    "prewarm": True,
+    "prewarm_service_tier": "auto",  # los pre-cacheos no corren prisa: sin recargo Fast
+    "sd_keyterms": True,
     "smart_model": "gpt-6.1-sol",
     "smart_reasoning_effort": "medium",
     "smart_service_tier": "fast",
@@ -350,18 +282,14 @@ DEFAULT_GPT_CONFIG = {
 }
 
 
+def brief_block(brief):
+    return prompts.BRIEF_BLOCK.format(brief=brief) if brief else ""
+
+
 def build_smart_request(question, previous, context, mine, brief, config):
     instructions = config.get("system_prompt", "Eres un asistente útil.")
     if brief:
-        instructions += (
-            "\n\nContexto de la entrevista — experiencia APROBADA del "
-            "candidato y límites; úsala para adaptar cada respuesta:\n"
-            + brief +
-            "\nNunca conviertas requisitos del puesto ni notas de empresa "
-            "en experiencia del candidato ni inventes métricas o historias "
-            "que el brief no respalde; ante falta de evidencia, responde "
-            "en hipotético."
-        )
+        instructions += "\n\n" + brief_block(brief)
     format_prompt = config.get("format_prompt", "")
     if format_prompt:
         instructions += "\n\n" + format_prompt
@@ -465,18 +393,13 @@ class GptClient:
         if brief:
             # El brief es identidad/política (system), no contenido (input):
             # experiencia aprobada + límites explícitos contra fabricación.
-            instructions += (
-                "\n\nContexto de la entrevista — experiencia APROBADA del "
-                "candidato y límites; úsala para adaptar cada respuesta:\n"
-                + brief +
-                "\nNunca conviertas requisitos del puesto ni notas de empresa "
-                "en experiencia del candidato ni inventes métricas o historias "
-                "que el brief no respalde; ante falta de evidencia, responde "
-                "en hipotético."
-            )
+            instructions += "\n\n" + brief_block(brief)
         format_prompt = config.get("format_prompt", "")
         if format_prompt and instructions_override is None:
             instructions += "\n\n" + format_prompt
+            fast_prompt = config.get("fast_prompt", "")
+            if fast_prompt:
+                instructions += "\n\n" + fast_prompt
 
         web_context = ""
         if allow_web and config.get("web_search") in (True, "auto", "exa"):
@@ -862,17 +785,11 @@ class CodexCliThread(QThread):
             config = GptClient.load_config() or dict(DEFAULT_GPT_CONFIG)
             prompt = config.get("system_prompt", "Eres un asistente útil.")
             if self.brief:
-                prompt += (
-                    "\n\nContexto de la entrevista — experiencia APROBADA del "
-                    "candidato y límites; úsala para adaptar cada respuesta:\n"
-                    + self.brief +
-                    "\nNunca conviertas requisitos del puesto ni notas de empresa "
-                    "en experiencia del candidato ni inventes métricas o historias "
-                    "que el brief no respalde; ante falta de evidencia, responde "
-                    "en hipotético."
-                )
+                prompt += "\n\n" + brief_block(self.brief)
             if config.get("format_prompt"):
                 prompt += "\n\n" + config["format_prompt"]
+                if config.get("fast_prompt"):
+                    prompt += "\n\n" + config["fast_prompt"]
             if self.context:
                 prompt += f"\n\nContexto de la conversación:\n{self.context}"
             prompt += "\n\nTranscription: " + self.transcription
