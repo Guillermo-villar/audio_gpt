@@ -307,6 +307,14 @@ DEEPER_HEADER = (
     "**Di ahora:** Voy a estructurarlo mejor: requisitos, cifras, "
     "algoritmo, escalado y fallos, en ese orden.\n\n")
 
+CALL_TOPICS = {"intro", "built", "why", "questions", "salary", "location",
+               "next", "role"}
+
+DEEPER_HEADER_CALL = (
+    "**Di ahora:** Déjame concretarlo: qué hice yo exactamente, con quién, "
+    "y qué está hoy en producción.\n\n")
+
+
 DIAGRAM_ONLY = (
     "**Di ahora:** Esta es la arquitectura que llevamos hasta ahora.\n\n"
     + SOL_DIAGRAM)
@@ -329,7 +337,9 @@ def answer_for(kind, kwargs):
             detail = LUNA.get(topic, LUNA["generic"]) + "\n\n" + detail
         return detail
     if kind == "deeper":
-        return DEEPER_HEADER + LUNA.get(topic, LUNA["generic"]).split(
+        header = (DEEPER_HEADER_CALL if topic in CALL_TOPICS
+                  else DEEPER_HEADER)
+        return header + LUNA.get(topic, LUNA["generic"]).split(
             "\n\n", 1)[-1] + "\n\n" + detail
     return detail
 

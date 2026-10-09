@@ -2686,7 +2686,8 @@ class WhisperApp(QMainWindow):
         keyterm_layout.addWidget(QLabel("Términos clave:"))
         self.keyterms_input = QLineEdit()
         self.keyterms_input.setPlaceholderText(
-            "python, kubernetes, pytorch… (Deepgram nova-3 los escucha mejor)")
+            "Orbio, Aida, AXA, UC3M, RAG… (se suman a los de la rama; "
+            "Deepgram nova-3 los escucha mejor)")
         keyterm_layout.addWidget(self.keyterms_input, 1)
         tr_layout.addLayout(keyterm_layout)
 
