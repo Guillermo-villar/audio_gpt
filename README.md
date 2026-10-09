@@ -88,8 +88,11 @@ MIT.
 - **Panel oculto** (`Ctrl+I`, único control de visibilidad): panel oscuro,
   sin foco y siempre encima, con el transcript reciente por carriles y las
   respuestas en una sola tarjeta Markdown: una respuesta de Luna reemplaza la
-  anterior al enviar una nueva. Se ancla al inicio de cada respuesta o
-  ampliación, crece hasta un 85 % de la pantalla y se ensancha para código.
+  anterior al enviar una nueva. Al pulsar `Ctrl+Q` reserva de golpe la altura
+  de lectura (un 60 % de la pantalla o la de la última respuesta completa)
+  para que el texto de Luna se lea directo sin esperar a que el panel crezca;
+  mientras llega texto solo crece, sin animación, hasta un 92 % de la
+  pantalla (85 % con una sola columna) y se ensancha para código.
   `Ctrl+flechas` lo mueve, `Ctrl+±` ajusta su opacidad y también se arrastra.
 - **Hotkeys globales** (2 teclas, funcionan con otra app enfocada - elegidas
   para no interferir con el navegador; las teclas disparadas se consumen y no

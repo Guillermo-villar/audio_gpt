@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFrame, QSplitter, QCheckBox,
     QPlainTextEdit, QScrollArea, QTextBrowser, QSizePolicy,
 )
+import shiboken6
 from PySide6.QtCore import (
     Qt, QThread, Signal, Slot, QMutex, QTimer, QRect,
     QPropertyAnimation, QEasingCurve, QSize
@@ -833,6 +834,10 @@ class AnswerCard(QFrame):
         return (self.side_by_side
                 and (len(self.versions) > 1 or not self.detail.isHidden()))
 
+    def streaming(self):
+        return (any(v.finished_at is None for v in self.versions)
+                or self.detail.active)
+
     def _refresh_side_diagrams(self):
         if not self.side_by_side:
             return
@@ -1274,6 +1279,7 @@ class AnswerCard(QFrame):
 
 class AnswerFeed(QScrollArea):
     content_changed = Signal()
+    answer_started = Signal()
 
     def __init__(self, font_px=13, parent=None, side_by_side=False):
         super().__init__(parent)
@@ -1318,6 +1324,7 @@ class AnswerFeed(QScrollArea):
         self._by_key[key] = card
         self.layout.insertWidget(self.layout.count() - 1, card)
         self._anchor = card
+        self.answer_started.emit()
         self._schedule_content_changed()
         return card
 
@@ -1328,6 +1335,7 @@ class AnswerFeed(QScrollArea):
         card.add_version(key, model_label)
         self._by_key[key] = card
         self._anchor = card
+        self.answer_started.emit()
         self._schedule_content_changed()
         return card
 
@@ -1343,6 +1351,7 @@ class AnswerFeed(QScrollArea):
             return None
         card.start_detail(key, model_label, pending_text)
         self._by_key[key] = card
+        self.answer_started.emit()
         self._schedule_content_changed()
         return card
 
@@ -1392,6 +1401,9 @@ class AnswerFeed(QScrollArea):
     def two_columns(self):
         return any(card.two_columns for _, card in self._cards)
 
+    def streaming(self):
+        return any(card.streaming() for _, card in self._cards)
+
     def _fit_side_cards(self):
         if not self.side_by_side:
             return
@@ -1412,6 +1424,8 @@ class AnswerFeed(QScrollArea):
 
     def _emit_content_changed(self):
         self._content_change_pending = False
+        if not shiboken6.isValid(self):
+            return  # el feed se cerró con un aviso diferido pendiente
         self._fit_side_cards()
         self.container.updateGeometry()
         self.content_changed.emit()
@@ -1419,6 +1433,8 @@ class AnswerFeed(QScrollArea):
         QTimer.singleShot(0, self._apply_anchor)
 
     def _emit_layout_content_changed(self):
+        if not shiboken6.isValid(self):
+            return
         self.container.updateGeometry()
         self.content_changed.emit()
 
@@ -1466,6 +1482,9 @@ class CompactOverlay(QWidget):
     WIDTH = 460
     MIN_H = 200
     MIN_OPACITY = 0.30
+    # Al pulsar Ctrl+Q el panel reserva de golpe una altura de lectura en
+    # vez de ir creciendo token a token detrás de Luna.
+    RESERVE_FRACTION = 0.60
 
     def __init__(self):
         super().__init__(
@@ -1515,6 +1534,8 @@ class CompactOverlay(QWidget):
         self.feed = AnswerFeed(font_px=13, parent=panel, side_by_side=True)
         panel_layout.addWidget(self.feed, 1)
         self.feed.content_changed.connect(self._schedule_resize)
+        self.feed.answer_started.connect(self._reserve_for_answer)
+        self._last_final_height = None
 
         legend = QLabel(
             "Ctrl+Q responder · Alt+S más a fondo · Alt+W dibujar · Alt+G enviar "
@@ -1625,24 +1646,65 @@ class CompactOverlay(QWidget):
                 desired_width, min(780, diagram_width + 60)))
         return min(desired_width, available.width()), target_height, chrome
 
-    def _resize_to_content(self):
+    def _height_cap(self, available):
+        return int(round(available.height() * (
+            0.92 if self.feed.two_columns() else 0.85)))
+
+    def reserve_height(self, available):
+        """Altura que se reserva al empezar una respuesta: la de la última
+        respuesta completa (si la hubo) o una fracción de la pantalla."""
+        cap = self._height_cap(available)
+        reserve = int(round(cap * self.RESERVE_FRACTION))
+        if self._last_final_height:
+            reserve = max(reserve, self._last_final_height)
+        return max(self.MIN_H, min(reserve, cap))
+
+    def _reserve_for_answer(self):
+        if not self.isVisible():
+            return
+        self._resize_timer.stop()
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry()
-        desired_width, target_height, chrome = self._desired_size(available)
+        desired_width, _, chrome = self._desired_size(available)
+        target_height = max(self.height(), self.reserve_height(available))
+        self._apply_geometry(available, desired_width, target_height,
+                             chrome, animate=False)
+
+    def _apply_geometry(self, available, desired_width, target_height,
+                        chrome, animate):
         self.feed.setMaximumHeight(max(32, target_height - chrome))
         x = min(max(self.x(), available.left()),
                 available.right() - desired_width + 1)
         y = min(max(self.y(), available.top()),
                 available.bottom() - target_height + 1)
+        self._resize_animation.stop()
+        rect = QRect(x, y, desired_width, target_height)
+        if not animate:
+            self.setGeometry(rect)
+            return
         if (abs(target_height - self.height()) < 8
                 and abs(desired_width - self.width()) < 8
                 and (x, y) == (self.x(), self.y())):
             return
-        self._resize_animation.stop()
         self._resize_animation.setStartValue(self.geometry())
-        self._resize_animation.setEndValue(
-            QRect(x, y, desired_width, target_height))
+        self._resize_animation.setEndValue(rect)
         self._resize_animation.start()
+
+    def _resize_to_content(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        desired_width, target_height, chrome = self._desired_size(available)
+        if self.feed.streaming():
+            # Mientras llega texto el panel solo crece, y sin animación: lo
+            # que ya se está leyendo no debe moverse ni esperar al layout.
+            target_height = max(target_height, self.height())
+            self._apply_geometry(available, desired_width, target_height,
+                                 chrome, animate=False)
+            return
+        if self.feed.content_height() > 0 and self.feed.two_columns():
+            self._last_final_height = target_height
+        self._apply_geometry(available, desired_width, target_height,
+                             chrome, animate=True)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

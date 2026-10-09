@@ -348,7 +348,8 @@ class OverlaySizingTests(unittest.TestCase):
         overlay = self.overlay_with(True)
         overlay.move(available.right() - 100, available.bottom() - 100)
         overlay._resize_to_content()
-        end = overlay._resize_animation.endValue()
+        # Con un stream en curso el ajuste es inmediato (sin animación).
+        end = overlay._resize_animation.endValue() or overlay.geometry()
         self.assertGreaterEqual(end.left(), available.left())
         self.assertLessEqual(end.right(), available.right())
         self.assertLessEqual(end.bottom(), available.bottom())
@@ -440,3 +441,92 @@ class LongQuestionWidthTests(unittest.TestCase):
                              if overlay.interviewer_live.sizePolicy()
                              .horizontalPolicy() != gui.QSizePolicy.Ignored
                              else 0, 600)
+
+
+class OverlayReserveHeightTests(unittest.TestCase):
+    """Ctrl+Q reserva la altura de lectura de golpe: el panel no debe ir
+    creciendo token a token detrás de Luna ni moverse mientras se lee."""
+
+    def make_overlay(self):
+        overlay = gui.CompactOverlay()
+        self.addCleanup(overlay.close)
+        overlay.show()
+        pump()
+        overlay._resize_animation.stop()
+        return overlay
+
+    def test_start_reserves_height_before_first_token(self):
+        overlay = self.make_overlay()
+        available = APP.primaryScreen().availableGeometry()
+        small = overlay.height()
+        root = object()
+        overlay.feed.start(root, "Manual", "gpt-6-luna", "¿?")
+        overlay.feed.start_detail(root, object(), "gpt-6.1-sol", "cola")
+        # Sin pump(): la reserva es síncrona, antes de cualquier texto.
+        self.assertGreaterEqual(overlay.height(),
+                                overlay.reserve_height(available))
+        self.assertGreater(overlay.height(), small)
+        self.assertNotEqual(overlay._resize_animation.state(),
+                            overlay._resize_animation.State.Running)
+        self.assertLessEqual(overlay.geometry().bottom(), available.bottom())
+
+    def test_streaming_never_shrinks_and_does_not_animate(self):
+        overlay = self.make_overlay()
+        root = object()
+        overlay.feed.start(root, "Manual", "gpt-6-luna", "¿?")
+        overlay.feed.start_detail(root, object(), "gpt-6.1-sol", "cola")
+        reserved = overlay.height()
+        for i in range(1, 6):
+            overlay.feed.update(root, "Di ahora: " + "palabra " * (4 * i))
+            pump(200)
+            self.assertTrue(overlay.feed.streaming())
+            self.assertGreaterEqual(overlay.height(), reserved)
+            self.assertNotEqual(overlay._resize_animation.state(),
+                                overlay._resize_animation.State.Running)
+
+    def test_streaming_grows_instantly_past_reserve(self):
+        overlay = self.make_overlay()
+        root = object()
+        overlay.feed.start(root, "Manual", "gpt-6-luna", "¿?")
+        overlay.feed.start_detail(root, object(), "gpt-6.1-sol", "cola")
+        reserved = overlay.height()
+        overlay.feed.update(root, LONG)
+        pump(250)
+        self.assertGreater(overlay.height(), reserved)
+        self.assertNotEqual(overlay._resize_animation.state(),
+                            overlay._resize_animation.State.Running)
+
+    def test_next_answer_reuses_last_final_height(self):
+        overlay = self.make_overlay()
+        available = APP.primaryScreen().availableGeometry()
+        root = object()
+        detail = object()
+        overlay.feed.start(root, "Manual", "gpt-6-luna", "¿?")
+        overlay.feed.start_detail(root, detail, "gpt-6.1-sol", "cola")
+        overlay.feed.update(root, LONG)
+        overlay.feed.finish(root, True, LONG)
+        overlay.feed.begin_detail(detail)
+        overlay.feed.finish(detail, True, SOL)
+        pump(400)
+        self.assertFalse(overlay.feed.streaming())
+        self.assertIsNotNone(overlay._last_final_height)
+        final = overlay._last_final_height
+        self.assertGreater(final, round(
+            overlay._height_cap(available) * overlay.RESERVE_FRACTION))
+
+        again = object()
+        overlay.feed.start(again, "Manual", "gpt-6-luna", "¿otra?")
+        overlay.feed.start_detail(again, object(), "gpt-6.1-sol", "cola")
+        self.assertGreaterEqual(overlay.height(), final)
+
+    def test_hidden_overlay_sizes_on_show(self):
+        overlay = gui.CompactOverlay()
+        self.addCleanup(overlay.close)
+        root = object()
+        overlay.feed.start(root, "Manual", "gpt-6-luna", "¿?")
+        overlay.feed.start_detail(root, object(), "gpt-6.1-sol", "cola")
+        overlay.show()
+        pump(300)
+        available = APP.primaryScreen().availableGeometry()
+        self.assertLessEqual(overlay.geometry().bottom(), available.bottom())
+        self.assertGreaterEqual(overlay.height(), overlay.MIN_H)
