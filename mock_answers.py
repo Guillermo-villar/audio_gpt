@@ -242,6 +242,12 @@ SOL = {
         "chunking, monté la evaluación de respuestas.\n"
         "- Infra y despliegue: «con el equipo de plataforma», nunca solo."
         "\n\n" + SOL_CALL),
+    "why": (
+        "### Matiz\n"
+        "- Motivo en positivo (IA como producto, equipo técnico del que "
+        "aprender), no en negativo sobre AXA.\n"
+        "- Enlaza con su careers page: algo en producción la semana 1."
+        "\n\n" + SOL_CALL),
     "salary": (
         "### ⚠ Ojo\n"
         "No menciones las bandas vistas en portales. Si insiste, pide la "
@@ -326,7 +332,8 @@ def answer_for(kind, kwargs):
         return LUNA.get(topic, LUNA["generic"])
     if kind == "diagram":
         return DIAGRAM_ONLY
-    detail = SOL.get(topic, SOL["default"])
+    detail = SOL.get(topic, SOL_CALL if topic in CALL_TOPICS
+                     else SOL["default"])
     if kind == "detail":
         full_tail = _tail_text(kwargs)
         if prompts.VERIFIED_MATERIAL_NOTE[:30] in full_tail:
